@@ -131,10 +131,9 @@ async def surface_by_importance(importance_min: int, max_tokens: int, tag_filter
     budget_blocked = False
     for b in filtered:
         try:
-            imp = b["metadata"].get("importance", 0)
             rendered, entry_tokens = render_stored_bucket(
                 b,
-                f"[importance:{imp}] [bucket_id:{b['id']}]",
+                f"[bucket_id:{b['id']}]",
             )
             if token_used + entry_tokens > max_tokens:
                 budget_blocked = True

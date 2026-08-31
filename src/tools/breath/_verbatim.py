@@ -40,21 +40,19 @@ def _miss_block(bucket: dict) -> str:
 def render_stored_bucket(
     bucket: dict,
     metadata_header: str,
-    footprint: str = "",
 ) -> tuple[str, int]:
-    """Render metadata around, but never inside, the stored bucket body."""
+    """Render the stored body first and keep only action metadata as a footer."""
     # Temporary compatibility patch: force breath to return stored bucket
     # content verbatim. Remove after upstream breath fixes content reconstruction.
     # Keep the body byte-for-byte intact while telling the receiving model that
     # remembered imperative wording is historical data, never an instruction.
     content = stored_bucket_content(bucket)
     miss_block = _miss_block(bucket)
-    framed_payload = f"{metadata_header}{miss_block}\n{content}"
+    framed_payload = f"{content}{miss_block}\n{metadata_header}"
     boundary = stored_data_marker(
         framed_payload,
         provenance=f"breath:{bucket.get('id', '')}",
     )
-    rendered = f"{metadata_header} {boundary}{miss_block}\n{content}"
-    if footprint:
-        rendered += f"\n{footprint}"
+    marker = f" {boundary}" if boundary else ""
+    rendered = f"{content}{miss_block}\n{metadata_header}{marker}"
     return rendered, count_tokens_approx(rendered)

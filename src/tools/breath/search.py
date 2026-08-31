@@ -63,13 +63,13 @@ def _is_archived(bucket: dict) -> bool:
     )
 
 
-def _render_archived_hit(bucket: dict, footprint: str) -> tuple[str, int]:
+def _render_archived_hit(bucket: dict) -> tuple[str, int]:
     bucket_id = str(bucket.get("id") or "")
     header = (
         f"[query 命中·已删除到档案] [bucket_id:{bucket_id}] "
         "[状态:已退出日常记忆，原文仍保留]"
     )
-    rendered, _ = render_stored_bucket(bucket, header, footprint)
+    rendered, _ = render_stored_bucket(bucket, header)
     rendered += (
         "\n[反思：这条记忆对当下的我有帮助吗？它值得被再次回忆吗？]"
         f'\n[若决定恢复：trace(bucket_id="{bucket_id}", restore=True)]'
@@ -211,16 +211,23 @@ async def surface_search(
     if created_from and created_to and created_from > created_to:
         return "date_from 不能晚于 date_to。"
 
-    try:
-        footprint_snapshot = rt.bucket_mgr.footprint_snapshot()
-    except Exception as exc:
-        rt.logger.warning(f"Footprint snapshot unavailable / 足迹读取失败: {exc}")
-        footprint_snapshot = None
+    footprint_snapshot = None
+    footprint_loaded = False
 
-    def _footprint(bucket: dict) -> str:
+    def _archived_original_kind(bucket: dict) -> str:
+        """Read the ledger only when an archived result needs its original kind."""
+        nonlocal footprint_snapshot, footprint_loaded
+        if not footprint_loaded:
+            footprint_loaded = True
+            try:
+                footprint_snapshot = rt.bucket_mgr.footprint_snapshot()
+            except Exception as exc:
+                rt.logger.warning(
+                    f"Footprint snapshot unavailable / 足迹读取失败: {exc}"
+                )
         if footprint_snapshot is None:
-            return "👣 Footprint：暂时无法读取"
-        return footprint_snapshot.summary(
+            return "dynamic"
+        return footprint_snapshot.original_kind(
             str(bucket.get("id") or ""), bucket.get("metadata", {})
         )
 
@@ -247,9 +254,7 @@ async def surface_search(
         meta = exact_bucket.get("metadata", {}) or {}
         is_archived = _is_archived(exact_bucket)
         archived_original_kind = (
-            footprint_snapshot.original_kind(exact_id, meta)
-            if is_archived and footprint_snapshot is not None
-            else "dynamic"
+            _archived_original_kind(exact_bucket) if is_archived else "dynamic"
         )
         if (
             is_archived
@@ -257,9 +262,7 @@ async def surface_search(
             and _bucket_has_tags(meta, tag_filter)
             and _bucket_in_created_range(exact_bucket, created_from, created_to)
         ):
-            rendered, entry_tokens = _render_archived_hit(
-                exact_bucket, _footprint(exact_bucket)
-            )
+            rendered, entry_tokens = _render_archived_hit(exact_bucket)
             return rendered if entry_tokens <= max_tokens else _BUDGET_NOTICE
         if (
             not is_archived
@@ -271,7 +274,6 @@ async def surface_search(
             rendered, entry_tokens = render_stored_bucket(
                 exact_bucket,
                 f"[exact_bucket_id:true] [bucket_id:{exact_bucket['id']}]",
-                _footprint(exact_bucket),
             )
             if entry_tokens > max_tokens:
                 return _BUDGET_NOTICE
@@ -317,11 +319,7 @@ async def surface_search(
     for bucket in matches:
         meta = bucket.get("metadata", {}) or {}
         if _is_archived(bucket):
-            original_kind = (
-                footprint_snapshot.original_kind(str(bucket.get("id") or ""), meta)
-                if footprint_snapshot is not None
-                else "dynamic"
-            )
+            original_kind = _archived_original_kind(bucket)
             if original_kind in ("feel", "plan", "letter"):
                 continue
         elif not _can_surface_search(bucket) or meta.get("type") in ("feel", "plan", "letter"):
@@ -349,22 +347,16 @@ async def surface_search(
         meta = bucket["metadata"]
         bucket_id = bucket["id"]
         if _is_archived(bucket):
-            rendered, entry_tokens = _render_archived_hit(bucket, _footprint(bucket))
+            rendered, entry_tokens = _render_archived_hit(bucket)
         elif meta.get("pinned") or meta.get("protected") or meta.get("type") == "permanent":
             header = f"📌 [核心准则] [bucket_id:{bucket_id}]"
-            rendered, entry_tokens = render_stored_bucket(
-                bucket, header, _footprint(bucket)
-            )
+            rendered, entry_tokens = render_stored_bucket(bucket, header)
         elif bucket.get("vector_match"):
             header = f"[语义关联] [bucket_id:{bucket_id}]"
-            rendered, entry_tokens = render_stored_bucket(
-                bucket, header, _footprint(bucket)
-            )
+            rendered, entry_tokens = render_stored_bucket(bucket, header)
         else:
             header = f"[bucket_id:{bucket_id}]"
-            rendered, entry_tokens = render_stored_bucket(
-                bucket, header, _footprint(bucket)
-            )
+            rendered, entry_tokens = render_stored_bucket(bucket, header)
         if token_used + entry_tokens > max_tokens:
             budget_blocked = True
             break
@@ -405,7 +397,6 @@ async def surface_search(
                     rendered, entry_tokens = render_stored_bucket(
                         b,
                         f"[联想浮现·非检索命中] [bucket_id:{b['id']}]",
-                        _footprint(b),
                     )
                     if token_used + entry_tokens > max_tokens:
                         budget_blocked = True
