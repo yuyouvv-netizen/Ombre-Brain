@@ -22,6 +22,7 @@ tools/breath/importance.py — importance_min 模式
 """
 
 from .. import _runtime as rt
+from .._common import is_importance_audit_candidate
 from ._verbatim import render_stored_bucket
 
 _BUDGET_NOTICE = "token 预算不足：下一条重要记忆未被截断或摘要，请提高 max_tokens 后重试。"
@@ -50,6 +51,20 @@ def _importance_sort_key(bucket: dict):
     )
 
 
+def _deduplicate_buckets(buckets: list[dict]) -> list[dict]:
+    """Keep BucketManager's first canonical physical row for each logical ID."""
+    unique: list[dict] = []
+    seen_ids: set[str] = set()
+    for bucket in buckets:
+        bucket_id = str(bucket.get("id") or "").strip()
+        if bucket_id:
+            if bucket_id in seen_ids:
+                continue
+            seen_ids.add(bucket_id)
+        unique.append(bucket)
+    return unique
+
+
 def _select_importance_buckets(buckets: list[dict], importance_min: int, limit: int = 20) -> list[dict]:
     """Keep high-importance results useful even when one level fills the cap.
 
@@ -59,7 +74,11 @@ def _select_importance_buckets(buckets: list[dict], importance_min: int, limit: 
     eligible importance level first, then fill the rest by normal ranking.
     """
     limit = max(1, int(limit or 20))
-    ordered = sorted(buckets, key=_importance_sort_key, reverse=True)
+    # list_all() can expose historical/manual duplicate files with one logical
+    # bucket ID. Match BucketManager's first canonical row before limiting so
+    # both short and long result sets remain auditable against quota counts.
+    unique = _deduplicate_buckets(buckets)
+    ordered = sorted(unique, key=_importance_sort_key, reverse=True)
     if len(ordered) <= limit:
         return ordered
 
@@ -96,11 +115,12 @@ async def surface_by_importance(importance_min: int, max_tokens: int, tag_filter
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
         return f"记忆系统暂时无法访问: {e}"
+    canonical_buckets = _deduplicate_buckets(all_buckets)
     filtered = [
-        b for b in all_buckets
-        if int(b.get("metadata", {}).get("importance") or 0) >= importance_min
-        and b.get("metadata", {}).get("type") not in ("feel", "plan", "letter")
-        and not b.get("metadata", {}).get("dont_surface", False)
+        b for b in canonical_buckets
+        if is_importance_audit_candidate(
+            b.get("metadata", {}), importance_min
+        )
         and _bucket_has_tags(b.get("metadata", {}), tag_filter)
     ]
     filtered = _select_importance_buckets(filtered, importance_min, limit=20)
@@ -111,10 +131,9 @@ async def surface_by_importance(importance_min: int, max_tokens: int, tag_filter
     budget_blocked = False
     for b in filtered:
         try:
-            imp = b["metadata"].get("importance", 0)
             rendered, entry_tokens = render_stored_bucket(
                 b,
-                f"[importance:{imp}] [bucket_id:{b['id']}]",
+                f"[bucket_id:{b['id']}]",
             )
             if token_used + entry_tokens > max_tokens:
                 budget_blocked = True

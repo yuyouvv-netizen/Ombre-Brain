@@ -18,15 +18,23 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # 版本控制与 IDE
 .git/
 .gitignore
 .vscode/
 .idea/
+.claude/
+.github/
 
 # 运行期数据 / 持久卷（不该进镜像；含用户记忆，也避免泄密）
 buckets/
+test_buckets*/
+backup_*/
 *.db
 *.sqlite
 
@@ -47,6 +55,8 @@ docs/**/*
 !docs/MULTI_OWNER.md
 !docs/OPERATIONS.md
 tests/
+tools/
+kernel/
 deploy/
 # 例外：构建期需要它下载 cloudflared（见 Dockerfile 的 COPY），必须进构建上下文
 !deploy/fetch_cloudflared.py

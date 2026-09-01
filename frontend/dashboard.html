@@ -3,13 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
 <title>Ombre Brain</title>
 <meta name="theme-color" content="#B85C3C">
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <link rel="apple-touch-icon" href="/static/icon.svg">
 <link rel="manifest" href="/static/manifest.json">
 <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@300;400;500;600&family=Noto+Sans+SC:wght@400;500&family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&family=Share+Tech+Mono&family=VT323&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
+<script src="https://unpkg.com/lucide@1.24.0/dist/umd/lucide.min.js"
+        integrity="sha384-mooE85Luwgx+AyykX7e90VcN8/QCFTSIwPuHLmvcsLVoA0en7lKYb9XlOzn5G2co"
+        crossorigin="anonymous" defer></script>
 <style>
   :root {
     /* === 复古掌机 retro-handheld palette — warm cream plastic + pale LCD + gold === */
@@ -220,13 +223,17 @@
   }
 
   .bucket-list { display: flex; flex-direction: column; gap: 8px; }
+  .bucket-viewbar { display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0;color:var(--text-dim);font-size:12px; }
+  .bucket-sort-control { display:inline-flex;align-items:center;gap:7px; }
+  .bucket-sort-control select { min-height:32px;height:auto;padding:5px 28px 5px 10px !important;border:1px solid var(--border-strong);border-radius:10px;background:var(--surface-solid);color:var(--text);font:inherit;line-height:1.4;cursor:pointer; }
+  .bucket-sort-note { color:var(--text-light);font-size:11px; }
   .bucket-bulkbar { display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0;padding:10px 14px;border:none;border-radius:14px;background:var(--surface-solid);box-shadow:4px 4px 11px var(--shadow-dark-subtle), -3px -3px 8px var(--shadow-light); }
   .bucket-bulkbar-actions { display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-left:auto; }
   .bucket-select { width:17px;height:17px;accent-color:var(--accent);flex:0 0 auto; }
   .developer-only { display:none; }
   body.developer-mode .developer-only { display:inline-flex; }
   /* 记忆桶翻页器 / bucket pager */
-  .bucket-pager { display: flex; align-items: center; justify-content: center; gap: 14px; margin: 18px 0 4px; }
+  .bucket-pager { display: flex; align-items: center; justify-content: center; flex-wrap:wrap; gap: 8px; margin: 18px 0 4px; }
   .pager-btn {
     padding: 6px 14px; font-size: 12.5px; border-radius: 10px; cursor: pointer; font-family: inherit;
     border: 1px solid var(--border-strong); background: var(--surface-solid); color: var(--text);
@@ -235,6 +242,8 @@
   .pager-btn:hover:not(:disabled) { color: var(--accent); }
   .pager-btn:disabled { opacity: .4; cursor: default; box-shadow: inset 2px 2px 5px var(--shadow-dark-subtle); }
   .pager-info { font-family: 'Share Tech Mono', monospace; font-size: 12px; color: var(--text-dim); }
+  .pager-jump { display:inline-flex;align-items:center;gap:5px;color:var(--text-dim);font-size:12px; }
+  .pager-input { width:58px;height:30px;padding:0 6px;text-align:center;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface);color:var(--text);font-family:'Share Tech Mono',monospace; }
   .bucket-row {
     display: flex;
     flex-direction: column;
@@ -300,7 +309,7 @@
     position: fixed;
     right: 12px;
     top: 12px;
-    width: 440px;
+    width: min(440px, calc(100vw - 24px));
     height: calc(100vh - 24px);
     background: var(--surface-solid);
     border: none;
@@ -381,6 +390,34 @@
     overflow-y: auto;
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
+  .meaning-block {
+    margin: 8px 0 16px;
+    padding: 10px 14px;
+    border-left: 3px solid var(--accent);
+    background: var(--surface-solid);
+    color: var(--accent);
+    font-family: 'Cormorant Garamond', 'Noto Serif SC', serif;
+    line-height: 1.7;
+  }
+  .meaning-block-label {
+    margin-bottom: 5px;
+    color: var(--text-dim);
+    font-family: 'Share Tech Mono', 'Noto Sans SC', sans-serif;
+    font-size: 10px;
+    font-style: normal;
+    letter-spacing: 0.4px;
+  }
+  .meaning-quote {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-style: italic;
+  }
+  .meaning-quote + .meaning-quote {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
 
   .config-section {
     margin-bottom: 28px;
@@ -442,43 +479,6 @@
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-glow), inset 2px 2px 4px var(--shadow-dark-subtle);
-  }
-
-  /* 日期「按钮」：一个拟态化凸起的 <button>，点它由 JS 唤起原生日期选择器。
-     里面藏一个 <input type="date"> 只用来存值（id=letter-date，sendLetter 读它），
-     不负责点击，也不显示任何原生控件——彻底告别小图标重叠。
-     按钮上的文字由 #letter-date-label 显示「请选择日期」或已选日期。 */
-  .config-row button.date-pill {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    box-sizing: border-box;
-    height: 39px;
-    padding: 0 14px;
-    border: none;
-    border-radius: 8px;
-    cursor: pointer;
-    font-family: inherit;
-    font-size: 13px;
-    text-align: left;
-    color: var(--text);
-    background: var(--bg);
-    box-shadow: 4px 4px 8px var(--shadow-dark-subtle), -4px -4px 8px var(--shadow-light);
-    transition: all 0.2s ease;
-  }
-  .config-row button.date-pill:hover {
-    box-shadow: 5px 5px 10px var(--shadow-dark), -5px -5px 10px var(--shadow-light);
-  }
-  .config-row button.date-pill:active {
-    box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
-  }
-  .config-row button.date-pill:focus-visible {
-    outline: none;
-    box-shadow: 0 0 0 3px var(--accent-glow), 4px 4px 8px var(--shadow-dark-subtle), -4px -4px 8px var(--shadow-light);
-  }
-  #letter-date-label {
-    pointer-events: none;
-    color: var(--text-dim);
   }
 
   .btn-primary {
@@ -795,7 +795,6 @@
     .bucket-row { padding: 12px 14px; gap: 4px; }
     .bucket-row-tags { display: none; }
     .bucket-row .time { display: none; }
-    .detail-panel { width: calc(100vw - 16px); right: 8px; top: 8px; height: calc(100vh - 16px); }
 
     /* ── Settings forms ── */
     .config-row, .form-row { flex-wrap: wrap; }
@@ -1689,7 +1688,7 @@
     position: fixed;
     right: 0;
     top: 0;
-    width: 460px;
+    width: min(460px, calc(100vw - 16px));
     height: 100vh;
     background: var(--surface-solid);
     z-index: 300;
@@ -1740,6 +1739,7 @@
     justify-content: center;
     transition: all 0.18s;
     flex-shrink: 0;
+    margin-left: auto;
   }
   .self-panel-close:hover { background: var(--accent-glow); color: var(--accent); }
 
@@ -1899,11 +1899,12 @@
   <div class="tab" data-tab="letters"><span>信</span><span class="tab-en">Letters</span></div>
   <div class="tab" data-tab="anchors"><span>锚点</span><span class="tab-en">Anchors</span></div>
   <div class="tab" data-tab="import"><span>导入</span><span class="tab-en">Import</span></div>
+  <div class="tab" data-tab="faq"><span>帮助</span><span class="tab-en">FAQ</span></div>
   <div class="tab" data-tab="logs"><span>日志</span><span class="tab-en">Logs</span></div>
   <div class="tab" data-tab="settings"><span>设置</span><span class="tab-en">Settings</span></div>
   <!-- v3-debug tab 暂时隐藏：后端 /api/v3/debug/* 路由已就位（只读、不写数据），
        但 v3_runtime 尚未接入（src/ombrebrain/ 架构核心未挂载到 server.py），
-       现在打开只会看到空列表，不报错但没数据。见 docs/TODO_V3_DEBUG_SYNC.md。
+       现在打开只会看到空列表，不报错但没数据。
        v3_runtime 接入后，取消下一行注释即可恢复入口。
   <div class="tab" data-tab="v3-debug"><span>2.4.0 Debug</span><span class="tab-en">Replay</span></div>
   -->
@@ -1932,8 +1933,20 @@
 
 <div class="content" id="list-view">
   <div class="filters" id="filters"></div>
+  <div class="bucket-viewbar">
+    <label class="bucket-sort-control" for="bucket-sort">
+      <i data-lucide="clock" style="width:14px;height:14px;"></i>
+      时间顺序
+      <select id="bucket-sort" onchange="setBucketSort(this.value)" aria-label="记忆桶排序方式">
+        <option value="score">综合分优先</option>
+        <option value="created_desc">最新创建优先</option>
+        <option value="created_asc">最早创建优先</option>
+      </select>
+    </label>
+    <span class="bucket-sort-note" id="bucket-sort-note">按综合衰减分排列</span>
+  </div>
   <div class="bucket-bulkbar">
-    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);height:32px;"><input id="bucket-select-all" type="checkbox" onchange="selectAllFiltered(this.checked)" style="accent-color:var(--accent);cursor:pointer;"> 全选当前筛选</label>
+    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);height:32px;"><input id="bucket-select-all" type="checkbox" onchange="selectAllCurrentPage(this.checked)" style="accent-color:var(--accent);cursor:pointer;"> 全选当前页</label>
     <span id="bucket-selected-count" style="color:var(--text-dim);font-size:12px;">已选 0</span>
     <div class="bucket-bulkbar-actions">
       <button onclick="runBucketBatch('forget')" style="height:32px;padding:0 12px;font-size:12px;display:inline-flex;align-items:center;gap:5px;"><i data-lucide="eye-off"></i> 主动遗忘</button>
@@ -2084,6 +2097,25 @@
   <div id="detail-content"></div>
 </div>
 
+<!-- FAQ Tab View -->
+<div class="content" id="faq-view" style="display:none">
+  <div style="max-width:920px;margin:0 auto;">
+    <div class="config-section" id="faq-section">
+      <h3>使用须知与常见问题 <span class="en">FAQ &amp; Usage Guide</span></h3>
+      <p style="font-size:12px;color:var(--text-dim);line-height:1.7;margin:4px 0 12px;">
+        部署、持久盘、GitHub 备份、MCP/OAuth、API 与向量化常见问题集中整理在 FAQ。遇到连接失败、401、更新后记忆为空或向量化异常时，请先查看这里。
+      </p>
+      <a
+        class="btn-secondary"
+        href="https://docs.qq.com/doc/DRHp6UW9oYmd3QW5Z"
+        target="_blank"
+        rel="noopener noreferrer"
+        style="display:inline-flex;align-items:center;gap:6px;padding:8px 14px;font-size:12px;text-decoration:none;"
+      ><i data-lucide="book-open"></i> 打开 Ombre Brain 使用须知与 FAQ</a>
+    </div>
+  </div>
+</div>
+
 <!-- Logs Tab View (iter 1.6 §3) -->
 <div class="content" id="logs-view" style="display:none">
   <div style="max-width:920px;margin:0 auto;">
@@ -2192,11 +2224,7 @@
           <option value="ai">AI</option>
         </select>
         <input type="text" id="letter-username" placeholder="署名 name（可选）" />
-        <button type="button" class="date-pill" style="flex:0 0 180px;" onclick="openDatePicker()">
-          <span id="letter-date-label">请选择日期 / Pick a date</span>
-          <input type="date" id="letter-date" onchange="syncDateLabel()" oninput="syncDateLabel()"
-                 style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;left:14px;bottom:0;" />
-        </button>
+        <input type="date" id="letter-date" style="flex:0 0 180px;" />
       </div>
       <div class="config-row">
         <label>标题 <span class="en">Title</span></label>
@@ -2571,7 +2599,7 @@
         <div class="config-row" style="align-items:center;">
           <label>API Key</label>
           <input type="password" id="cfg-emb-api-key" placeholder="当前: 加载中…" style="flex:1;" />
-          <button type="button" onclick="saveEmbedKey()" title="保存 Key / Save key" style="margin-left:8px;padding:0 10px;height:32px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="key"></i> 保存 Save</button>
+          <button type="button" onclick="saveEmbedKey()" title="保存完整向量配置 / Save embedding provider" style="margin-left:8px;padding:0 10px;height:32px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="key"></i> 保存 Save</button>
           <button type="button" onclick="testEmbeddingKey()" title="测试向量化连接 / Test embedding connection" style="margin-left:4px;padding:0 10px;height:32px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="zap"></i> 测试</button>
           <span id="emb-key-msg" style="margin-left:8px;font-size:11px;"></span>
         </div>
@@ -2819,7 +2847,7 @@
     <div class="config-section" id="sec-mcp" data-sgroup="advanced">
       <h3>MCP 配置 <span class="sec-en">MCP Setup</span></h3>
       <div style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.7;">
-        生成 Claude Desktop / claude.ai 的 MCP 连接配置。12 个工具全在一个端点 /mcp 上，只需连这一条。
+        生成 Claude Desktop / claude.ai 的 MCP 连接配置。14 个工具全在一个端点 /mcp 上，只需连这一条。
       </div>
       <div style="margin-bottom:16px;padding:12px 14px;border:1px solid var(--border);border-radius:11px;background:var(--surface-solid);font-size:12px;line-height:1.7;">
         不确定 OAuth、端口和持久目录怎么选？
@@ -2836,6 +2864,7 @@
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
             <input type="radio" name="mcp-mode" value="public" onchange="onMcpModeChange()" /> 公网模式
           </label>
+          <button type="button" onclick="saveMcpAddress()" title="保存连接模式与公网地址 / Save connection mode and public address" style="margin-left:auto;padding:0 12px;height:30px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="save"></i> 保存连接地址</button>
         </div>
         <div style="margin-top:6px;font-size:11px;color:var(--text-light);">
           本地模式使用当前页面域名（<code id="mcp-local-origin"></code>）；公网模式可填入自定义域名（Cloudflare Tunnel 等）。
@@ -2850,8 +2879,9 @@
             style="flex:1;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:2px;font-family:monospace;font-size:12px;"
             oninput="renderMcpUrls()" />
         </div>
-        <div style="margin-top:4px;font-size:11px;color:var(--text-light);">填域名或完整 URL，末尾斜杠可省略。</div>
+        <div style="margin-top:4px;font-size:11px;color:var(--text-light);">填域名或完整的 HTTPS /mcp URL；保存后会统一为 HTTPS 域名。</div>
       </div>
+      <div id="mcp-address-msg" style="margin:-10px 0 12px;font-size:11px;min-height:16px;"></div>
 
       <!-- 生成的链接预览 -->
       <div style="margin-bottom:16px;">
@@ -2863,7 +2893,7 @@
             <button onclick="copyMcpUrl('main')" title="复制 / Copy" style="padding:3px 8px;font-size:11px;white-space:nowrap;background:none;border:1px solid var(--border);border-radius:3px;cursor:pointer;color:var(--text-dim);"><i data-lucide="copy"></i></button>
           </div>
         </div>
-        <div style="margin-top:6px;font-size:11px;color:var(--text-light);">12 个工具已合并到单一连接器 /mcp，只需连这一条。</div>
+        <div style="margin-top:6px;font-size:11px;color:var(--text-light);">14 个工具已合并到单一连接器 /mcp，只需连这一条。</div>
         <div id="mcp-copy-msg" style="margin-top:4px;font-size:11px;color:var(--positive);min-height:16px;"></div>
       </div>
 
@@ -2978,7 +3008,7 @@
         <input type="password" id="gh-token" placeholder="ghp_xxxx…（Fine-grained 或 Classic，需 repo 权限）" style="flex:1;" />
       </div>
       <div style="margin-top:-6px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">
-        Token 仅写入 .env，不进 config.yaml。推荐创建 Fine-grained token，只给目标仓库 Contents 读写权限。
+        Token 会写入 config.yaml 落盘保存。推荐创建 Fine-grained token，只给目标仓库 Contents 读写权限。
       </div>
 
       <div class="config-row">
@@ -3217,23 +3247,129 @@ function setHwSwitch(cbId, state) {
 // ========================================
 // Auth system / 认证系统
 // ========================================
+var _dashboardAuthGeneration = 0;
+var _authenticatedDashboardInitPromise = null;
+var _authenticatedDashboardInitGeneration = -1;
+var _heartbeatPollTimer = null;
+var _anchorPollTimer = null;
+var _errorAlertTimer = null;
+
+function waitForDashboardDOM() {
+  if (document.readyState !== 'loading') return Promise.resolve();
+  return new Promise(function(resolve) {
+    document.addEventListener('DOMContentLoaded', resolve, { once: true });
+  });
+}
+
+function startAuthenticatedDashboardPolling() {
+  if (_heartbeatPollTimer === null) {
+    _heartbeatPollTimer = setInterval(pollHeartbeat, 15000);
+  }
+  if (_anchorPollTimer === null) {
+    _anchorPollTimer = setInterval(refreshAnchorCounter, 30000);
+  }
+  if (_errorAlertTimer === null) {
+    _errorAlertTimer = setInterval(pollCriticalErrors, 60000);
+  }
+}
+
+function stopAuthenticatedDashboardPolling() {
+  if (_heartbeatPollTimer !== null) clearInterval(_heartbeatPollTimer);
+  if (_anchorPollTimer !== null) clearInterval(_anchorPollTimer);
+  if (_errorAlertTimer !== null) clearInterval(_errorAlertTimer);
+  _heartbeatPollTimer = null;
+  _anchorPollTimer = null;
+  _errorAlertTimer = null;
+}
+
+function invalidateAuthenticatedDashboardSession() {
+  _dashboardAuthGeneration += 1;
+  stopAuthenticatedDashboardPolling();
+}
+
+function initializeAuthenticatedDashboard(generation) {
+  if (generation === undefined) generation = _dashboardAuthGeneration;
+  if (
+    _authenticatedDashboardInitPromise
+    && _authenticatedDashboardInitGeneration === generation
+  ) return _authenticatedDashboardInitPromise;
+
+  var previous = _authenticatedDashboardInitPromise;
+  var ready = previous
+    ? previous.catch(function() { return null; })
+    : Promise.resolve();
+  var run = ready.then(waitForDashboardDOM).then(function() {
+    if (generation !== _dashboardAuthGeneration) return [];
+    startAuthenticatedDashboardPolling();
+    var tasks = [
+      loadBuckets(),
+      loadStatusBanner(),
+      syncRestartRequirement(),
+      refreshAnchorCounter(),
+      checkEmptyMemoryBanner(),
+      loadOwnerBadge(),
+      pollHeartbeat(),
+      pollCriticalErrors(),
+      maybeShowOnboarding(),
+    ];
+    if (typeof initSelfFab === 'function') tasks.push(initSelfFab());
+    if (typeof refreshAuthenticatedActiveView === 'function') {
+      tasks.push(Promise.resolve().then(refreshAuthenticatedActiveView));
+    }
+    return Promise.allSettled(tasks);
+  });
+  _authenticatedDashboardInitPromise = run;
+  _authenticatedDashboardInitGeneration = generation;
+  run.then(function() {
+    if (_authenticatedDashboardInitPromise === run) {
+      _authenticatedDashboardInitPromise = null;
+      _authenticatedDashboardInitGeneration = -1;
+    }
+  }, function() {
+    if (_authenticatedDashboardInitPromise === run) {
+      _authenticatedDashboardInitPromise = null;
+      _authenticatedDashboardInitGeneration = -1;
+    }
+  });
+  return run;
+}
+
+function beginAuthenticatedDashboardSession() {
+  _dashboardAuthGeneration += 1;
+  return initializeAuthenticatedDashboard(_dashboardAuthGeneration);
+}
+
+async function finishDashboardAuthentication() {
+  document.getElementById('auth-overlay').style.display = 'none';
+  await beginAuthenticatedDashboardSession();
+}
+
 async function checkAuth() {
+  var requestedGeneration = _dashboardAuthGeneration;
   try {
-    const resp = await fetch('/auth/status');
+    const resp = await fetch('/auth/status', { cache: 'no-store' });
     const data = await resp.json();
+    if (requestedGeneration !== _dashboardAuthGeneration) return false;
     if (data.setup_needed) {
+      invalidateAuthenticatedDashboardSession();
       document.getElementById('auth-subtitle').textContent = '首次设置 / First-time setup';
       document.getElementById('auth-setup-form').style.display = 'block';
+      document.getElementById('auth-login-form').style.display = 'none';
+      document.getElementById('auth-recovery-form').style.display = 'none';
+      document.getElementById('auth-overlay').style.display = 'flex';
       return false;
     } else if (data.authenticated) {
       document.getElementById('auth-overlay').style.display = 'none';
       return true;
     } else {
+      invalidateAuthenticatedDashboardSession();
       document.getElementById('auth-subtitle').textContent = '请输入访问密码 / Enter access password';
       document.getElementById('auth-login-form').style.display = 'block';
+      document.getElementById('auth-overlay').style.display = 'flex';
       return false;
     }
   } catch {
+    if (requestedGeneration !== _dashboardAuthGeneration) return false;
     document.getElementById('auth-overlay').style.display = 'none';
     return true;
   }
@@ -3259,9 +3395,11 @@ async function doSetup() {
   const q = (document.getElementById('auth-setup-q')?.value || '').trim();
   const a = (document.getElementById('auth-setup-a')?.value || '').trim();
   if (q && a) {
-    await fetch('/auth/security-question', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({question: q, answer: a}) });
+    try {
+      await fetch('/auth/security-question', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({question: q, answer: a}) });
+    } catch (_) { /* 会话已经建立；可选安全问题保存失败不应卡住 Dashboard。 */ }
   }
-  document.getElementById('auth-overlay').style.display = 'none';
+  await finishDashboardAuthentication();
 }
 
 function showLogin() {
@@ -3288,7 +3426,7 @@ async function doRecover() {
   if (newPwd.length < 6) return showAuthError('新密码至少6位');
   const resp = await fetch('/auth/recover', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({answer, new_password: newPwd}) });
   if (resp.ok) {
-    document.getElementById('auth-overlay').style.display = 'none';
+    await finishDashboardAuthentication();
   } else {
     const d = await resp.json().catch(() => ({}));
     showAuthError(d.error || '验证失败');
@@ -3299,7 +3437,7 @@ async function doLogin() {
   const pwd = document.getElementById('auth-login-pwd').value;
   const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
   if (resp.ok) {
-    document.getElementById('auth-overlay').style.display = 'none';
+    await finishDashboardAuthentication();
   } else {
     const d = await resp.json().catch(() => ({}));
     showAuthError(d.detail || '密码错误');
@@ -3308,6 +3446,7 @@ async function doLogin() {
 
 async function doLogout() {
   await fetch('/auth/logout', { method: 'POST' });
+  invalidateAuthenticatedDashboardSession();
   document.getElementById('auth-setup-form').style.display = 'none';
   document.getElementById('auth-login-form').style.display = 'none';
   document.getElementById('auth-login-form').style.display = 'block';
@@ -4177,8 +4316,38 @@ async function readJsonSafe(resp) {
 const BASE = location.origin;
 let allBuckets = [];
 let currentFilter = 'all';
+var BUCKET_SORT_MODES = ['score', 'created_desc', 'created_asc'];
+var bucketSort = 'score';
+try {
+  var storedBucketSort = localStorage.getItem('ombreBucketSort');
+  if (BUCKET_SORT_MODES.includes(storedBucketSort)) bucketSort = storedBucketSort;
+} catch (_) { /* localStorage unavailable: keep the compatible score default */ }
+var bucketLoadGeneration = 0;
 var selectedBucketIds = new Set();
 var developerMode = localStorage.getItem('ombreDeveloperMode') === 'true';
+
+function syncBucketSortControl() {
+  var control = document.getElementById('bucket-sort');
+  if (control) control.value = bucketSort;
+  var note = document.getElementById('bucket-sort-note');
+  if (!note) return;
+  note.textContent = bucketSort === 'created_desc'
+    ? '按首次记录时间倒序；最新记忆在前，未知时间排末尾'
+    : bucketSort === 'created_asc'
+      ? '按首次记录时间正序；最早记忆在前，未知时间排末尾'
+      : '按综合衰减分排列';
+}
+
+async function setBucketSort(value) {
+  var normalized = BUCKET_SORT_MODES.includes(value) ? value : 'score';
+  bucketSort = normalized;
+  try { localStorage.setItem('ombreBucketSort', bucketSort); } catch (_) {}
+  bucketPage = 1;
+  syncBucketSortControl();
+  await loadBuckets();
+}
+
+syncBucketSortControl();
 
 function setDeveloperMode(enabled) {
   developerMode = !!enabled;
@@ -4193,17 +4362,31 @@ document.addEventListener('DOMContentLoaded', function() {
   setDeveloperMode(developerMode);
 });
 
+function _currentBucketPageItems() {
+  var visible = (_curBuckets || []).filter(function(b) { return !b.dont_surface; });
+  if (!visible.length) return [];
+  var totalPages = Math.ceil(visible.length / BUCKETS_PER_PAGE);
+  var page = _normalizeBucketPage(bucketPage, totalPages, 1);
+  var startIdx = (page - 1) * BUCKETS_PER_PAGE;
+  return visible.slice(startIdx, startIdx + BUCKETS_PER_PAGE);
+}
+
+function _currentBucketPageIds() {
+  return _currentBucketPageItems().map(function(b) { return b.id; });
+}
+
 function syncBucketSelectionUi() {
   var count = document.getElementById('bucket-selected-count');
   if (count) count.textContent = '已选 ' + selectedBucketIds.size;
   document.querySelectorAll('.bucket-select').forEach(function(box) {
     box.checked = selectedBucketIds.has(box.dataset.id);
   });
-  var visibleIds = (_curBuckets || []).filter(function(b) { return !b.dont_surface; }).map(function(b) { return b.id; });
+  var pageIds = _currentBucketPageIds();
   var all = document.getElementById('bucket-select-all');
   if (all) {
-    all.checked = !!visibleIds.length && visibleIds.every(function(id) { return selectedBucketIds.has(id); });
-    all.indeterminate = visibleIds.some(function(id) { return selectedBucketIds.has(id); }) && !all.checked;
+    all.checked = !!pageIds.length && pageIds.every(function(id) { return selectedBucketIds.has(id); });
+    all.indeterminate = pageIds.some(function(id) { return selectedBucketIds.has(id); }) && !all.checked;
+    all.disabled = !pageIds.length;
   }
 }
 
@@ -4212,9 +4395,9 @@ function toggleBucketSelection(id, checked) {
   syncBucketSelectionUi();
 }
 
-function selectAllFiltered(checked) {
-  (_curBuckets || []).filter(function(b) { return !b.dont_surface; }).forEach(function(b) {
-    if (checked) selectedBucketIds.add(b.id); else selectedBucketIds.delete(b.id);
+function selectAllCurrentPage(checked) {
+  _currentBucketPageIds().forEach(function(id) {
+    if (checked) selectedBucketIds.add(id); else selectedBucketIds.delete(id);
   });
   syncBucketSelectionUi();
 }
@@ -4254,16 +4437,17 @@ async function hardDeleteSelectedTests() {
   await loadBuckets();
 }
 
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => {
+function activateDashboardTab(tab) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     const target = tab.dataset.tab;
+    const pending = [];
     document.getElementById('list-view').style.display = target === 'list' ? '' : 'none';
     document.getElementById('breath-view').style.display = target === 'breath' ? '' : 'none';
     document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
     document.getElementById('plan-view').style.display = target === 'plan' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
+    document.getElementById('faq-view').style.display = target === 'faq' ? '' : 'none';
     document.getElementById('logs-view').style.display = target === 'logs' ? '' : 'none';
     document.getElementById('v3-debug-view').style.display = target === 'v3-debug' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
@@ -4271,31 +4455,39 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('anchors-view').style.display = target === 'anchors' ? '' : 'none';
     document.getElementById('about-view').style.display = target === 'about' ? '' : 'none';
     if (target !== 'network' && _netRAF) { cancelAnimationFrame(_netRAF); _netRAF = null; }
-    if (target === 'network') loadNetwork();
-    if (target === 'plan') loadPlans();
-    if (target === 'import') { pollImportStatus(); loadImportResults(); }
-    if (target === 'logs') { loadLogs(); loadOBErrors(); }
-    if (target === 'v3-debug') loadV3Debug();
+    if (target === 'network') pending.push(loadNetwork());
+    if (target === 'plan') pending.push(loadPlans());
+    if (target === 'import') pending.push(pollImportStatus(), loadImportResults());
+    if (target === 'logs') pending.push(loadLogs(), loadOBErrors());
+    if (target === 'v3-debug') pending.push(loadV3Debug());
     if (target === 'settings') {
       // 任务D：合并 config + settings 后，切换到「设置」时一次性加载所有面板数据
-      loadSettingsStatus();
-      loadSystemDiagnostics();
-      loadHumanName();
-      loadConfig();
-      refreshEnvConfig();
-      loadGithubStatus();
-      loadSamplingSettings();
-      loadEnvVars();
-      loadHostVault();
-      loadLocalEmbStatus();
+      pending.push(
+        loadSettingsStatus(),
+        loadSystemDiagnostics(),
+        loadHumanName(),
+        loadConfig(),
+        refreshEnvConfig(),
+        loadGithubStatus(),
+        loadSamplingSettings(),
+        loadEnvVars(),
+        loadHostVault(),
+        loadLocalEmbStatus()
+      );
       // MCP 面板同步初始化（不依赖异步请求）
       const _mcpOriginEl = document.getElementById('mcp-local-origin');
       if (_mcpOriginEl) _mcpOriginEl.textContent = location.origin;
       renderMcpUrls();
     }
-    if (target === 'letters') loadLetters();
-    if (target === 'anchors') loadAnchorsView();
-    if (target === 'about') loadAbout();
+    if (target === 'letters') pending.push(loadLetters());
+    if (target === 'anchors') pending.push(loadAnchorsView());
+    if (target === 'about') pending.push(loadAbout());
+    return Promise.allSettled(pending);
+}
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    activateDashboardTab(tab);
   });
 });
 
@@ -4305,7 +4497,7 @@ document.getElementById('search-input').addEventListener('input', (e) => {
   const q = e.target.value.trim();
   searchTimer = setTimeout(() => {
     if (q) searchBuckets(q);
-    else renderBuckets(allBuckets);
+    else renderBuckets(filterBuckets(allBuckets));
   }, 300);
 });
 function doSearch() {
@@ -4313,16 +4505,24 @@ function doSearch() {
   const q = document.getElementById('search-input').value.trim();
   if (['小鸡','大吉','可恶的人类','chicken'].includes(q.toLowerCase()) && window.ObPet) ObPet.react('secret');
   if (q) searchBuckets(q);
-  else renderBuckets(allBuckets);
+  else renderBuckets(filterBuckets(allBuckets));
 }
 
 async function loadBuckets() {
+  var generation = ++bucketLoadGeneration;
+  var requestedSort = bucketSort;
   try {
-    const res = await fetch(BASE + '/api/buckets');
+    var sortQuery = requestedSort === 'score'
+      ? ''
+      : '?sort=' + encodeURIComponent(requestedSort);
+    const res = await fetch(BASE + '/api/buckets' + sortQuery);
     const data = await res.json();
     if (!res.ok || !Array.isArray(data)) {
       throw new Error((data && data.error) ? data.error : `HTTP ${res.status}`);
     }
+    // Rapid sort changes can leave an older request finishing last. Never let
+    // that stale response overwrite the currently selected chronological view.
+    if (generation !== bucketLoadGeneration || requestedSort !== bucketSort) return;
     var previousIds = new Set((allBuckets || []).map(function(b){return b.id;}));
     var hadPrevious = previousIds.size > 0;
     allBuckets = data;
@@ -4331,9 +4531,12 @@ async function loadBuckets() {
     selectedBucketIds.forEach(function(id) { if (!liveIds.has(id)) selectedBucketIds.delete(id); });
     updateStats();
     buildFilters();
-    renderBuckets(allBuckets);
+    // 数据刷新不等于用户切换视图：继续应用当前筛选，并保留所在页。
+    // 若刷新后页数减少，_paintBuckets 会自动把 bucketPage 收敛到末页。
+    renderBuckets(filterBuckets(allBuckets), true);
     if (data.length === 0 && window.ObPet) window.ObPet.react('empty');
   } catch (e) {
+    if (generation !== bucketLoadGeneration || requestedSort !== bucketSort) return;
     document.getElementById('bucket-list').innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
     if (window.ObPet) window.ObPet.react('connection_error');
   }
@@ -4362,20 +4565,43 @@ function buildFilters() {
     { key: 'digested', label: '<i data-lucide="leaf"></i> 已消化' },
     { key: 'archived', label: '<i data-lucide="archive"></i> 归档' },
   ];
+  const typeKeys = types.map(function(t) { return t.key; });
+  // domain 筛选可能因最后一个相关桶被编辑而消失；这时才安全退回“全部”。
+  if (currentFilter.startsWith('domain:')) {
+    if (!domains.has(currentFilter.slice(7))) currentFilter = 'all';
+  } else if (!typeKeys.includes(currentFilter)) {
+    currentFilter = 'all';
+  }
+  const visibleDomains = Array.from(domains).slice(0, 10);
+  // 排序会改变 domain 的首次出现顺序。即使当前 domain 掉出前 10，
+  // 也保留它的活动按钮，而不是悄悄清空用户的筛选。
+  var currentDomain = currentFilter.startsWith('domain:') ? currentFilter.slice(7) : '';
+  if (currentDomain && !visibleDomains.includes(currentDomain)) {
+    if (visibleDomains.length >= 10) visibleDomains[visibleDomains.length - 1] = currentDomain;
+    else visibleDomains.push(currentDomain);
+  }
   filters.innerHTML = types.map(function(t) {
-    return '<button class="filter-btn ' + (t.key === 'all' ? 'active' : '') + '" data-filter="' + escAttr(t.key) + '">' + t.label + '</button>';
-  }).join('') + Array.from(domains).slice(0, 10).map(function(d) {
-    return '<button class="filter-btn" data-filter="' + escAttr('domain:' + d) + '">' + esc(d) + '</button>';
+    var active = t.key === currentFilter;
+    return '<button class="filter-btn ' + (active ? 'active' : '') + '" aria-pressed="' + (active ? 'true' : 'false') + '" data-filter="' + escAttr(t.key) + '">' + t.label + '</button>';
+  }).join('') + visibleDomains.map(function(d) {
+    var key = 'domain:' + d;
+    var active = key === currentFilter;
+    return '<button class="filter-btn ' + (active ? 'active' : '') + '" aria-pressed="' + (active ? 'true' : 'false') + '" data-filter="' + escAttr(key) + '">' + esc(d) + '</button>';
   }).join('');
 
-  filters.addEventListener('click', function(e) {
+  // buildFilters 会在每次数据刷新后运行；覆盖处理器，避免重复累积监听器。
+  filters.onclick = function(e) {
     var btn = e.target.closest('.filter-btn');
     if (!btn) return;
-    filters.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
+    filters.querySelectorAll('.filter-btn').forEach(function(b) {
+      b.classList.remove('active');
+      b.setAttribute('aria-pressed', 'false');
+    });
     btn.classList.add('active');
+    btn.setAttribute('aria-pressed', 'true');
     currentFilter = btn.dataset.filter;
     renderBuckets(filterBuckets(allBuckets));
-  });
+  };
 }
 
 function filterBuckets(buckets) {
@@ -4392,31 +4618,62 @@ function filterBuckets(buckets) {
   return buckets;
 }
 
-// 翻页状态：renderBuckets 每次换新数据集时重置到第 1 页；gotoBucketPage 只翻页不重置。
+// 翻页状态：用户主动切换筛选/搜索时回到第 1 页；后台刷新可显式保留当前页。
 var bucketPage = 1;
 var _curBuckets = [];
 var BUCKETS_PER_PAGE = 10;
 
-function renderBuckets(buckets) {
+function renderBuckets(buckets, preservePage) {
   _curBuckets = buckets || [];
-  bucketPage = 1;
+  if (!preservePage) bucketPage = 1;
   _paintBuckets();
 }
 
+function _normalizeBucketPage(value, totalPages, fallbackPage) {
+  var maxPage = Number(totalPages);
+  maxPage = Number.isFinite(maxPage) && maxPage >= 1 ? Math.trunc(maxPage) : 1;
+  var fallback = Number(fallbackPage);
+  fallback = Number.isFinite(fallback) ? Math.trunc(fallback) : 1;
+  fallback = Math.min(maxPage, Math.max(1, fallback));
+  if (value === null || value === undefined || String(value).trim() === '') return fallback;
+  var parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(maxPage, Math.max(1, Math.trunc(parsed)));
+}
+
+function _visibleBucketTotalPages() {
+  var visibleCount = (_curBuckets || []).filter(function(b) { return !b.dont_surface; }).length;
+  return Math.max(1, Math.ceil(visibleCount / BUCKETS_PER_PAGE));
+}
+
 function gotoBucketPage(n) {
-  bucketPage = n;
+  bucketPage = _normalizeBucketPage(n, _visibleBucketTotalPages(), bucketPage);
   _paintBuckets();
   var list = document.getElementById('bucket-list');
   if (list) list.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
+function jumpToBucketPage() {
+  var input = document.getElementById('bucket-page-input');
+  if (!input) return;
+  gotoBucketPage(input.value);
+}
+
 function _bucketPagerHtml(total, totalPages) {
   if (totalPages <= 1) return '';
-  return '<div class="bucket-pager">' +
-    '<button class="pager-btn"' + (bucketPage <= 1 ? ' disabled' : '') + ' onclick="gotoBucketPage(' + (bucketPage - 1) + ')">‹ 上一页</button>' +
-    '<span class="pager-info">' + bucketPage + ' / ' + totalPages + ' 页 · 共 ' + total + '</span>' +
-    '<button class="pager-btn"' + (bucketPage >= totalPages ? ' disabled' : '') + ' onclick="gotoBucketPage(' + (bucketPage + 1) + ')">下一页 ›</button>' +
-  '</div>';
+  return '<nav class="bucket-pager" aria-label="记忆桶分页">' +
+    '<button type="button" class="pager-btn" aria-label="跳到第一页"' + (bucketPage <= 1 ? ' disabled' : '') + ' onclick="gotoBucketPage(1)">« 首页</button>' +
+    '<button type="button" class="pager-btn" aria-label="上一页"' + (bucketPage <= 1 ? ' disabled' : '') + ' onclick="gotoBucketPage(' + (bucketPage - 1) + ')">‹ 上一页</button>' +
+    '<span class="pager-info" role="status" aria-live="polite">' + bucketPage + ' / ' + totalPages + ' 页 · 共 ' + total + '</span>' +
+    '<button type="button" class="pager-btn" aria-label="下一页"' + (bucketPage >= totalPages ? ' disabled' : '') + ' onclick="gotoBucketPage(' + (bucketPage + 1) + ')">下一页 ›</button>' +
+    '<button type="button" class="pager-btn" aria-label="跳到最后一页"' + (bucketPage >= totalPages ? ' disabled' : '') + ' onclick="gotoBucketPage(' + totalPages + ')">末页 »</button>' +
+    '<form class="pager-jump" onsubmit="event.preventDefault();jumpToBucketPage()">' +
+      '<label for="bucket-page-input">第</label>' +
+      '<input class="pager-input" id="bucket-page-input" type="number" inputmode="numeric" min="1" max="' + totalPages + '" step="1" value="' + bucketPage + '" aria-label="输入页码">' +
+      '<span>页</span>' +
+      '<button type="submit" class="pager-btn" aria-label="跳转到输入页码">跳转</button>' +
+    '</form>' +
+  '</nav>';
 }
 
 function _paintBuckets() {
@@ -4427,15 +4684,15 @@ function _paintBuckets() {
   var visible = _curBuckets.filter(function(b) { return !b.dont_surface; });
   renderForgottenGroup(forgotten);
   if (!visible.length) {
+    bucketPage = 1;
     list.innerHTML = '<div class="loading">没有记忆桶 / No buckets</div>';
+    syncBucketSelectionUi();
     return;
   }
   // 分页：每页 BUCKETS_PER_PAGE 个，底部翻页
   var totalPages = Math.ceil(visible.length / BUCKETS_PER_PAGE);
-  if (bucketPage > totalPages) bucketPage = totalPages;
-  if (bucketPage < 1) bucketPage = 1;
-  var startIdx = (bucketPage - 1) * BUCKETS_PER_PAGE;
-  var pageItems = visible.slice(startIdx, startIdx + BUCKETS_PER_PAGE);
+  bucketPage = _normalizeBucketPage(bucketPage, totalPages, 1);
+  var pageItems = _currentBucketPageItems();
   list.innerHTML = pageItems.map(function(b) {
     // iter 1.8: dont_surface = 主动遗忘（仍在磁盘） / first_of_kind = 首次出现的标签组合
     // 图标：feel→计算表情、letter→信封、pinned→可发光的钉、其余沿用原逻辑
@@ -4450,9 +4707,21 @@ function _paintBuckets() {
     var firstBadge = b.first_of_kind ? ' <i data-lucide="sparkles" title="首次出现" style="width:12px;height:12px;color:var(--accent);vertical-align:-1px;"></i>' : '';
     var vPos = Math.round(b.valence * 100);
     var modelV = b.model_valence != null ? ' → V' + b.model_valence.toFixed(1) : '';
-    var timeAgo = formatTimeAgo(b.last_active || b.created);
+    var activityTime = firstValidBucketTime(
+      b.last_active_epoch_ms, b.last_active, b.created_epoch_ms, b.created
+    );
+    var chronologicalSort = bucketSort === 'created_desc' || bucketSort === 'created_asc';
+    var shownTime = chronologicalSort
+      ? firstValidBucketTime(b.created_epoch_ms, b.created)
+      : activityTime;
+    var timeLabel = chronologicalSort
+      ? (shownTime ? '创建 ' + formatCompactBucketTime(shownTime) : '创建时间未知')
+      : (shownTime ? '活跃 ' + formatTimeAgo(shownTime) : '活跃时间未知');
+    var timeTitle = chronologicalSort
+      ? (shownTime ? '首次记录时间：' + formatExactBucketTime(shownTime) : '首次记录时间未知')
+      : (shownTime ? '最近活跃时间：' + formatExactBucketTime(shownTime) : '最近活跃时间未知');
     // 久未浮现（>45 天且非钉选/锚点/已遗忘）→ 稀疏虚线，视觉上「模糊、遥远」
-    var stale = !b.pinned && !b.anchor && !b.dont_surface && daysSince(b.last_active || b.created) >= 45;
+    var stale = !b.pinned && !b.anchor && !b.dont_surface && daysSince(activityTime) >= 45;
     var rowCls = 'bucket-row' + (stale ? ' faded' : '');
     var inlineStyle = b.dont_surface ? 'opacity:0.45;' : '';
     var rowClick = 'onclick="showDetail(this.dataset.id)"';
@@ -4470,7 +4739,7 @@ function _paintBuckets() {
           emotionHtml +
           '<span class="score">' + (b.score != null ? b.score.toFixed(2) : '—') + '</span>' +
         '</div>' +
-        '<span class="time">' + esc(timeAgo) + '</span>' +
+        '<span class="time" title="' + escAttr(timeTitle) + '">' + esc(timeLabel) + '</span>' +
       '</div>' +
       '<div class="bucket-row-bottom"><span class="preview">' + esc(b.content_preview) + '</span></div>' +
     '</div>';
@@ -4502,6 +4771,26 @@ function _localBucketMatches(query) {
   return name.concat(other);                          // 桶名匹配排最前
 }
 
+function normalizeMeaningItems(value) {
+  var values = Array.isArray(value)
+    ? value
+    : (typeof value === 'string' ? [value] : []);
+  return values.map(function(item) {
+    return typeof item === 'string' ? item.trim() : '';
+  }).filter(function(item) { return item.length > 0; });
+}
+
+function renderMeaningHtml(value) {
+  var items = normalizeMeaningItems(value);
+  if (!items.length) return '';
+  return '<section class="meaning-block" data-field="meaning" aria-label="Meaning / 为什么值得被想起">' +
+    '<div class="meaning-block-label">MEANING · 为什么值得被想起</div>' +
+    items.map(function(item) {
+      return '<blockquote class="meaning-quote">❝ ' + esc(item) + ' ❞</blockquote>';
+    }).join('') +
+  '</section>';
+}
+
 async function searchBuckets(query) {
   var seen = {}, merged = [];
   _localBucketMatches(query).forEach(function(b) { if (!seen[b.id]) { seen[b.id] = 1; merged.push(b); } });
@@ -4516,7 +4805,9 @@ async function searchBuckets(query) {
   renderBuckets(merged);
 }
 
+let detailLoadGeneration = 0;
 async function showDetail(id) {
+  const generation = ++detailLoadGeneration;
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
   content.innerHTML = '<div class="loading">加载中… / Loading…</div>';
@@ -4524,13 +4815,27 @@ async function showDetail(id) {
 
   try {
     var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id));
-    var b = await res.json();
+    var b = await readJsonSafe(res);
+    if (generation !== detailLoadGeneration) return false;
+    if (!res.ok) throw new Error((b && b.error) || ('HTTP ' + res.status));
+    if (!b || typeof b !== 'object' || Array.isArray(b)) throw new Error('记忆详情响应无效 / Invalid bucket detail response');
     var meta = b.metadata || {};
+    // content 是可无损写回的原始 Markdown；display_content 仅供详情展示。
+    var displayContent = typeof b.display_content === 'string' ? b.display_content : (b.content || '');
+    var safeValence = safeNumber(meta.valence, 0.5, 0, 1);
+    var safeArousal = safeNumber(meta.arousal, 0.3, 0, 1);
+    var safeModelValence = meta.model_valence == null
+      ? null
+      : safeNumber(meta.model_valence, 0.5, 0, 1);
+    var safeImportance = Math.round(safeNumber(meta.importance, 5, 1, 10));
+    var safeActivationCount = safeNumber(meta.activation_count, 0, 0);
     // letter → 翻信纸展开动画；anchor → 引力线背景（坐标系质感）
     panel.classList.toggle('letter-mode', meta.type === 'letter');
     panel.classList.toggle('anchor-mode', !!meta.anchor);
     // iter 1.8: why_remembered = 这条为什么被记得（展示不计分）
     var whyHtml = meta.why_remembered ? ('<div style="margin:8px 0 16px;padding:10px 14px;border-left:3px solid var(--accent);background:var(--surface-solid);font-style:italic;color:var(--accent);font-family:\'Cormorant Garamond\',\'Noto Serif SC\',serif;line-height:1.7;">❝ ' + esc(meta.why_remembered) + ' ❞</div>') : '';
+    // meaning 是可累积的体验锚点；兼容早期手写桶中的单字符串格式。
+    var meaningHtml = renderMeaningHtml(meta.meaning);
     var firstBadge = meta.first_of_kind ? '<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--accent);margin-left:8px;"><i data-lucide="sparkles" style="width:12px;height:12px;"></i>首次出现</span>' : '';
     var weightHtml = (meta.type === 'plan' && meta.weight != null) ? ('<div class="field"><label>承诺重量</label><span style="display:inline-block;width:80px;height:6px;background:var(--border);border-radius:3px;vertical-align:middle;overflow:hidden;"><span style="display:block;width:' + Math.round(meta.weight*100) + '%;height:100%;background:var(--accent);"></span></span> ' + (meta.weight*100).toFixed(0) + '% · ' + weightAnchorLabel(meta.weight) + '</div>') : '';
     // iter 1.9 D3: triggered_by 渲染成可跳转链接
@@ -4549,17 +4854,18 @@ async function showDetail(id) {
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + firstBadge + '</h2>' +
       whyHtml +
+      meaningHtml +
       '<div class="detail-meta">' +
         '<div class="field"><label>ID</label>' + esc(id) + '</div>' +
         '<div class="field"><label>类型 / Type</label>' + esc(meta.type || 'dynamic') + '</div>' +
         '<div class="field"><label>域 / Domain</label>' + esc((meta.domain || []).join(', ')) + '</div>' +
         '<div class="field"><label>标签 / Tags</label>' + esc((meta.tags || []).join(', ')) + '</div>' +
-        '<div class="field"><label>事件效价 / Valence</label>V' + (meta.valence || 0.5).toFixed(2) + '</div>' +
-        '<div class="field"><label>唤醒度 / Arousal</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
-        '<div class="field"><label>模型视角 / Model view</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
-        '<div class="field"><label>稳定重要度 / Importance</label>' + (meta.importance || 5) + '/10 · ' + importanceLabel(meta.importance || 5) + '</div>' +
+        '<div class="field"><label>事件效价 / Valence</label>V' + safeValence.toFixed(2) + '</div>' +
+        '<div class="field"><label>唤醒度 / Arousal</label>A' + safeArousal.toFixed(2) + '</div>' +
+        '<div class="field"><label>模型视角 / Model view</label>' + (safeModelValence != null ? 'V' + safeModelValence.toFixed(2) : '—') + '</div>' +
+        '<div class="field"><label>稳定重要度 / Importance</label>' + safeImportance + '/10 · ' + importanceLabel(safeImportance) + '</div>' +
         '<div class="field"><label>权重分 / Weight</label>' + (b.score != null ? b.score.toFixed(4) : '—') + '</div>' +
-        '<div class="field"><label>激活次数 / Activations</label>' + (meta.activation_count != null ? meta.activation_count : 0) + '</div>' +
+        '<div class="field"><label>激活次数 / Activations</label>' + safeActivationCount + '</div>' +
         '<div class="field"><label>已解决 / Resolved</label>' + (meta.resolved ? _SV.ok : '—') + '</div>' +
         '<div class="field"><label>已消化 / Digested</label>' + (meta.digested ? _SV.ok : '—') + '</div>' +
         '<div class="field"><label>钉选 / Pinned</label>' + (meta.pinned ? _SV.ok : '—') + '</div>' +
@@ -4578,10 +4884,13 @@ async function showDetail(id) {
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketArchive(this.dataset.bucketId)" class="icon-btn"><i data-lucide="archive"></i> 归档</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketDelete(this.dataset.bucketId)" class="icon-btn" style="color:#b85c3c;"><i data-lucide="trash-2"></i> 删除到档案</button>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>' +
+      '<div class="detail-content">' + esc(displayContent) + '</div>' +
       renderEditForm(id, Object.assign({}, meta, {_content_for_edit: b.content}));
+    return true;
   } catch (e) {
+    if (generation !== detailLoadGeneration) return false;
     content.innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
+    return false;
   }
 }
 
@@ -4590,7 +4899,7 @@ async function bucketPin(id) {
     var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/pin', { method: 'POST' });
     if (!res.ok) throw new Error(await res.text());
     await showDetail(id);
-    loadBuckets();
+    await loadBuckets();
   } catch (e) { alert('钉选切换失败 / Pin toggle failed: ' + e.message); }
 }
 
@@ -4702,6 +5011,7 @@ async function bucketDelete(id) {
 }
 
 function closeDetail() {
+  detailLoadGeneration++;
   document.getElementById('detail-panel').classList.remove('open', 'letter-mode', 'anchor-mode');
 }
 
@@ -5167,12 +5477,6 @@ function animateConceptNetwork(canvas, ctx, W, H, data) {
   _netRAF = requestAnimationFrame(frame);
 }
 
-// 兼容旧调用点（depth-slider 里的 renderConceptNetwork）
-function renderConceptNetwork(ctx, W, H, data) {
-  networkState.needsLayout = true;
-  // 动画循环正在跑时不需要额外触发；若未运行（embedding 模式切回）则忽略
-}
-
 // –– 注入控制栏 ––
 function injectNetworkControls() {
   if (document.getElementById('network-depth-control')) return;
@@ -5210,12 +5514,6 @@ function injectNetworkControls() {
       networkState.needsLayout  = true;
     }
   });
-}
-
-// drawConceptNetwork 改为调用新函数（兼容原有调用点，如 networkData == 'concept' 情况等）
-function drawConceptNetwork(ctx, W, H, data) {
-  var canvas = document.getElementById('network-canvas');
-  initConceptNetwork(canvas, ctx, W, H, data);
 }
 
 // 旧的桶级网络（embedding 模式仍然能切到）
@@ -5324,9 +5622,23 @@ window._updateWeightLabel = function(v) {
   if (el) el.textContent = v + '% · ' + weightAnchorLabel(parseFloat(v) / 100);
 };
 
-function formatTimeAgo(iso) {
-  if (!iso) return '—';
+function parseBucketDate(iso) {
+  if (iso === null || iso === undefined || String(iso).trim() === '') return null;
   var d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function firstValidBucketTime() {
+  for (var i = 0; i < arguments.length; i++) {
+    var parsed = parseBucketDate(arguments[i]);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function formatTimeAgo(iso) {
+  var d = parseBucketDate(iso);
+  if (!d) return '—';
   var now = new Date();
   var hours = Math.floor((now - d) / 3600000);
   if (hours < 1) return '刚刚';
@@ -5336,10 +5648,25 @@ function formatTimeAgo(iso) {
   return Math.floor(days/30) + 'mo前';
 }
 
+function formatCompactBucketTime(iso) {
+  var d = parseBucketDate(iso);
+  if (!d) return '—';
+  function pad(value) { return String(value).padStart(2, '0'); }
+  var now = new Date();
+  var datePart = d.getFullYear() === now.getFullYear()
+    ? pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    : d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  return datePart + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function formatExactBucketTime(iso) {
+  var d = parseBucketDate(iso);
+  return d ? d.toLocaleString('zh-CN', { hour12: false }) : '—';
+}
+
 function daysSince(iso) {
-  if (!iso) return 0;
-  var d = new Date(iso);
-  if (isNaN(d)) return 0;
+  var d = parseBucketDate(iso);
+  if (!d) return 0;
   return (Date.now() - d.getTime()) / 86400000;
 }
 
@@ -5993,7 +6320,7 @@ async function refreshEmbInfo() {
     var r = await fetch(BASE + '/api/embedding/info');
     var d = await r.json();
     if (!d || !d.ok) return;
-    document.getElementById('emb-info-backend').textContent = d.backend || '—';
+    document.getElementById('emb-info-backend').textContent = d.api_format || d.backend || '—';
     document.getElementById('emb-info-model').textContent = d.model || '—';
     document.getElementById('emb-info-dim').textContent = d.vector_dim || '—';
     document.getElementById('emb-info-count').textContent = (d.db_count != null ? d.db_count : '—');
@@ -6043,7 +6370,7 @@ function _renderEmbMigrateStatus(s) {
     var sample = s.failed_items.slice(0, 3).map(function(it) { return esc(it.bucket_id) + ': ' + esc(it.error); }).join('<br>');
     html += '<br><span style="color:var(--negative,#c33)">失败样本（前 3）：<br>' + sample + '</span>';
   }
-  if (s.phase === 'failed' || (s.phase === 'completed' && s.failed_count > 0)) {
+  if (s.phase === 'failed' || s.phase === 'publish_failed' || (s.phase === 'completed' && s.failed_count > 0)) {
     if (s.tail_log && s.tail_log.length) {
       html += '<br><details style="margin-top:6px;"><summary>最近 15 行错误日志（点开复制给 AI 排查，不要发给作者）</summary>'
         + '<pre style="white-space:pre-wrap;font-size:11px;background:#222;color:#eee;padding:8px;border-radius:4px;max-height:240px;overflow:auto;">'
@@ -6061,7 +6388,7 @@ async function pollEmbMigrateStatus() {
     var d = await r.json();
     if (!d || !d.ok) return;
     _renderEmbMigrateStatus(d.status);
-    if (d.status && (d.status.phase === 'completed' || d.status.phase === 'failed') && !d.running) {
+    if (d.status && ['completed', 'failed', 'publish_failed'].includes(d.status.phase) && !d.running) {
       // 停止轮询，刷新一次摘要
       if (_embMigratePollTimer) { clearInterval(_embMigratePollTimer); _embMigratePollTimer = null; }
       refreshEmbInfo();
@@ -6165,10 +6492,16 @@ document.addEventListener('click', function(e) {
     var btn = e.target;
     btn.disabled = true;
     btn.textContent = '启动中… / Starting…';
+    var migrationPayload = {
+      target_backend: targetBackend,
+      api_format: (document.getElementById('cfg-emb-format') || {value:'openai_compat'}).value || 'openai_compat',
+      base_url: (document.getElementById('cfg-emb-base-url') || {value:''}).value.trim(),
+      model: (document.getElementById('cfg-emb-model') || {value:''}).value.trim()
+    };
     fetch(BASE + '/api/embedding/migrate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target_backend: targetBackend })
+      body: JSON.stringify(migrationPayload)
     }).then(function(r) {
       // 经 readJsonSafe 解析：响应体为空 / 网关 502 HTML（隧道重连、Safari）时
       // 给人话错误，而不是 iOS Safari 那句 "The string did not match the expected pattern."
@@ -6340,7 +6673,7 @@ async function switchEmbedding(mode, skipConfirm) {
     payload = { target_backend: 'ollama', api_format: 'ollama', model: 'bge-m3', base_url: '' };
     label = '本地 bge-m3';
   } else {
-    payload = { target_backend: 'gemini', api_format: 'gemini', model: 'gemini-embedding-001' };
+    payload = { target_backend: 'gemini', api_format: 'gemini', model: 'gemini-embedding-001', base_url: '' };
     label = '云端 Gemini';
   }
   if (!skipConfirm && !confirm('即将切换到「' + label + '」并重算全库向量。\n\n· 后台运行，期间可正常使用（检索暂用旧库）\n· Gemini 3072 维 ↔ bge-m3 1024 维不通用，必须重算\n· 切到本地前请确认 bge-m3 已下载\n\n继续？')) return;
@@ -6364,7 +6697,7 @@ async function switchEmbedding(mode, skipConfirm) {
 
 // ===== 服务商预设：选一下自动填好 base_url + 正确的 model 名 =====
 // 参考酒馆：先选「用哪个」，字段自动长出来；从根上消灭「填错 model 名 400」那类坑。
-// 只填现有字段、不改保存逻辑（保存仍读这些 input 的值）。
+// 只填现有字段；保存时会把 format/base_url/model 作为一个完整 provider 配置提交。
 var EMBED_PRESETS = {
   gemini:      { format: 'openai_compat', base_url: 'https://generativelanguage.googleapis.com/v1beta/openai/', model: 'gemini-embedding-001' },
   siliconflow: { format: 'openai_compat', base_url: 'https://api.siliconflow.cn/v1', model: 'BAAI/bge-m3' },
@@ -6464,15 +6797,24 @@ async function loadGithubStatus() {
     var res = await authFetch('/api/github/status');
     if (!res || !res.ok) return;
     var d = await res.json();
-    if (d.repo) document.getElementById('gh-repo').placeholder = '当前: ' + d.repo;
-    if (d.branch) document.getElementById('gh-branch').placeholder = '当前: ' + d.branch;
-    if (d.path_prefix !== undefined) document.getElementById('gh-prefix').placeholder = d.path_prefix || '（仓库根目录）';
+    // 非敏感字段回填 value，不只写 placeholder。否则页面刷新/标签页
+    // 被浏览器回收后表单看起来「全被清空」，再次保存还强制重填 repo。
+    var tokenEl = document.getElementById('gh-token');
+    var repoEl = document.getElementById('gh-repo');
+    var branchEl = document.getElementById('gh-branch');
+    var prefixEl = document.getElementById('gh-prefix');
+    if (repoEl && d.repo !== undefined) repoEl.value = d.repo || '';
+    if (branchEl && d.branch !== undefined) branchEl.value = d.branch || 'main';
+    if (prefixEl && d.path_prefix !== undefined) prefixEl.value = d.path_prefix || '';
+    if (tokenEl) tokenEl.placeholder = d.token_set
+      ? '已配置（留空 = 保留现有 Token）'
+      : 'ghp_xxxx…（Fine-grained 或 Classic，需 repo 权限）';
     var autoMin = d.auto_interval_minutes || 0;
     var ghIntervalEl = document.getElementById('gh-interval');
     if (ghIntervalEl) ghIntervalEl.value = String(autoMin);
     var box = document.getElementById('gh-status-box');
+    if (box) box.style.display = d.configured ? '' : 'none';
     if (d.configured && box) {
-      box.style.display = '';
       document.getElementById('gh-st-repo').textContent = d.repo || '—';
       document.getElementById('gh-st-branch').textContent = d.branch || '—';
       document.getElementById('gh-st-prefix').textContent = d.path_prefix || '（根目录）';
@@ -6653,7 +6995,8 @@ async function loadConfig() {
     var dehyNotice = document.getElementById('dehy-key-notice');
     if (dehyNotice) dehyNotice.style.display = cfg.dehydration.api_key_masked ? 'none' : '';
     document.getElementById('cfg-dehy-maxtokens').value = cfg.dehydration.max_tokens || 1024;
-    document.getElementById('cfg-dehy-temp').value = cfg.dehydration.temperature || 0.1;
+    document.getElementById('cfg-dehy-temp').value = cfg.dehydration.temperature != null
+      ? cfg.dehydration.temperature : 0.1;
     document.getElementById('cfg-emb-enabled').value = cfg.embedding.enabled ? 'true' : 'false';
     document.getElementById('cfg-emb-model').value = cfg.embedding.model || '';
     var embFmtEl = document.getElementById('cfg-emb-format');
@@ -6671,7 +7014,8 @@ async function loadConfig() {
     // 加载当前 embedding 后端摘要 + 启动迁移轮询（只刷一次摘要，迁移状态独立轮询）
     refreshEmbInfo();
     refreshEnvConfig();
-    document.getElementById('cfg-merge').value = cfg.merge_threshold || 75;
+    document.getElementById('cfg-merge').value = cfg.merge_threshold != null
+      ? cfg.merge_threshold : 75;
     var mcpAuthEl = document.getElementById('cfg-mcp-auth');
     if (mcpAuthEl) {
       mcpAuthEl.value = cfg.mcp_require_auth
@@ -6681,6 +7025,14 @@ async function loadConfig() {
     window._mcpTokenConfigured = !!cfg.mcp_token_configured;
     window._mcpTokenHint = cfg.mcp_token_hint || null;
     onMcpAuthModeChange();
+    const publicUrl = String((cfg.deployment || {}).public_url || '');
+    const publicMode = document.querySelector('input[name="mcp-mode"][value="public"]');
+    const localMode = document.querySelector('input[name="mcp-mode"][value="local"]');
+    const publicUrlInput = document.getElementById('mcp-custom-domain');
+    if (publicUrlInput) publicUrlInput.value = publicUrl;
+    if (publicUrl && publicMode) publicMode.checked = true;
+    else if (localMode) localMode.checked = true;
+    onMcpModeChange();
     setRestartRequired(!!cfg.restart_required, 'MCP 鉴权设置已保存');
     var portEl = document.getElementById('cfg-host-port');
     if (portEl) portEl.value = cfg.host_port || '';
@@ -6695,7 +7047,9 @@ async function loadConfig() {
     document.getElementById('cfg-sf-breath-tokens').value = sf.breath_max_tokens || 10000;
     document.getElementById('cfg-sf-feel-tokens').value = sf.feel_max_tokens || 6000;
     document.getElementById('config-readonly').innerHTML =
-      'Transport: <strong>' + esc(cfg.transport) + '</strong><br>数据目录: <strong>' + esc(cfg.buckets_dir) + '</strong>'
+      'Transport（已保存）: <strong>' + esc(cfg.transport) + '</strong>'
+      + '<br>Transport（当前生效）: <strong>' + esc(cfg.transport_effective || cfg.transport) + '</strong>'
+      + '<br>数据目录: <strong>' + esc(cfg.buckets_dir) + '</strong>'
       + '<br>运行环境: <strong>' + (cfg.in_docker ? 'Docker 容器' : '裸机') + '</strong>'
       + '<br>对外端口: <strong>' + esc(cfg.host_port || '18001（默认）') + '</strong>';
     if (cfg.transport) highlightTransport(cfg.transport);
@@ -6870,6 +7224,7 @@ async function saveEnvConfig() {
 async function _saveEnvKeys(updates, msgElId) {
   var msgEl = document.getElementById(msgElId);
   if (msgEl) msgEl.textContent = '保存中… / Saving…';
+  var requestedKeys = Object.keys(updates || {});
   try {
     var r = await authFetch('/api/env-config', {
       method: 'POST',
@@ -6878,16 +7233,61 @@ async function _saveEnvKeys(updates, msgElId) {
     });
     if (!r) return;
     var d = await readJsonSafe(r);
-    if (d && d.ok) {
-      if (msgEl) msgEl.innerHTML = '<span style="color:var(--positive,#7EAD68)">' + _SV.ok + ' 已保存</span>';
+    var updatedKeys = d && Array.isArray(d.updated) ? d.updated : [];
+    var persistedKeys = d && Array.isArray(d.persisted) ? d.persisted : null;
+    var warnings = d && Array.isArray(d.warnings) ? d.warnings.filter(function (item) {
+      return item !== null && item !== undefined && String(item).trim();
+    }).map(function (item) { return String(item); }) : [];
+    var savedKeys = requestedKeys.filter(function (key) { return updatedKeys.indexOf(key) !== -1; });
+    var missingKeys = requestedKeys.filter(function (key) { return updatedKeys.indexOf(key) === -1; });
+    var unpersistedKeys = persistedKeys === null ? [] : savedKeys.filter(function (key) {
+      return persistedKeys.indexOf(key) === -1;
+    });
+    var responsePartial = !!(d && d.partial);
+    var responseFailed = !r.ok || !d || !d.ok;
+
+    if (responseFailed && savedKeys.length === 0) {
+      var httpLabel = !r.ok ? '（HTTP ' + r.status + '）' : '';
+      var reason = d && d.error
+        ? d.error
+        : (warnings.length ? warnings.join('; ') : (!r.ok ? '服务器拒绝保存' : '未知错误'));
+      if (msgEl) msgEl.innerHTML = '<span style="color:var(--negative)">' + _SV.err + ' 保存失败 / Save failed' + httpLabel + '：' + esc(reason) + '</span>';
+      return;
+    }
+
+    if (!responseFailed && !responsePartial && missingKeys.length === 0 && unpersistedKeys.length === 0 && warnings.length === 0) {
+      if (msgEl) msgEl.innerHTML = '<span style="color:var(--positive,#7EAD68)">' + _SV.ok + ' 已保存 / Saved</span>';
+    } else if (savedKeys.length > 0) {
+      var partialDetails = [];
+      if (missingKeys.length) partialDetails.push('未保存 / Not saved: ' + missingKeys.join(', '));
+      if (unpersistedKeys.length) partialDetails.push('未持久化 / Not persisted: ' + unpersistedKeys.join(', '));
+      if (warnings.length) partialDetails.push('警告 / Warning: ' + warnings.join('; '));
+      if (d && d.error) partialDetails.push(d.error);
+      if (!partialDetails.length) partialDetails.push((d && d.note) || '服务器报告部分保存 / Server reported a partial save');
+      if (msgEl) msgEl.innerHTML = '<span style="color:var(--warning,#B89762)">' + _SV.warn + ' 部分保存 / Partially saved<br>' + esc(partialDetails.join('\n')).replace(/\n/g, '<br>') + '</span>';
+    } else {
+      var failureDetails = warnings.length
+        ? warnings.join('; ')
+        : '服务器未确认任何请求字段 / Server did not confirm any requested field';
+      if (missingKeys.length) failureDetails += '\n未保存 / Not saved: ' + missingKeys.join(', ');
+      if (msgEl) msgEl.innerHTML = '<span style="color:var(--negative)">' + _SV.err + ' 保存失败 / Save failed：' + esc(failureDetails).replace(/\n/g, '<br>') + '</span>';
+    }
+
+    if (savedKeys.length > 0) {
       refreshEnvConfig();
       refreshEmbInfo();
-    } else {
-      if (msgEl) msgEl.innerHTML = '<span style="color:var(--negative)">' + _SV.err + ' ' + esc(d && d.error ? d.error : '失败') + '</span>';
     }
   } catch (e) {
-    if (msgEl) msgEl.innerHTML = '<span style="color:var(--negative)">' + _SV.err + ' ' + esc(e.message) + '</span>';
+    if (msgEl) msgEl.innerHTML = '<span style="color:var(--negative)">' + _SV.err + ' 请求失败 / Request failed：' + esc(e.message) + '</span>';
   }
+}
+
+function safeNumber(value, fallback, minValue, maxValue) {
+  var numeric = Number(value);
+  if (!Number.isFinite(numeric)) numeric = Number(fallback);
+  if (Number.isFinite(minValue)) numeric = Math.max(minValue, numeric);
+  if (Number.isFinite(maxValue)) numeric = Math.min(maxValue, numeric);
+  return numeric;
 }
 
 async function saveCompressKey() {
@@ -6901,29 +7301,42 @@ async function saveCompressKey() {
 async function saveEmbedKey() {
   var key = (document.getElementById('cfg-emb-api-key').value || '').trim();
   var base = (document.getElementById('cfg-emb-base-url').value || '').trim();
-  if (!key && !base) { var m = document.getElementById('emb-key-msg'); if (m) m.textContent = '请输入 Key'; return; }
-  var updates = {};
+  var model = (document.getElementById('cfg-emb-model').value || '').trim();
+  var format = (document.getElementById('cfg-emb-format') || {value:'openai_compat'}).value || 'openai_compat';
+  if (!key && !base && !model) { var m = document.getElementById('emb-key-msg'); if (m) m.textContent = '请先选择或填写向量服务配置'; return; }
+  // Provider identity is one tuple. Saving only key/base or only model/format
+  // publishes a mixed runtime immediately and can send a local model ID to a
+  // cloud endpoint (or the reverse), so submit all non-secret fields at once.
+  var updates = {
+    'OMBRE_EMBED_BASE_URL': base,
+    'OMBRE_EMBED_MODEL': model,
+    'OMBRE_EMBED_FORMAT': format
+  };
   if (key) { updates['OMBRE_EMBED_API_KEY'] = key; document.getElementById('cfg-emb-api-key').value = ''; }
-  if (base !== undefined) updates['OMBRE_EMBED_BASE_URL'] = base;
   await _saveEnvKeys(updates, 'emb-key-msg');
 }
 
 async function saveConfig(persist) {
+  var dehyTemperatureRaw = document.getElementById('cfg-dehy-temp').value.trim();
+  var mergeThresholdRaw = document.getElementById('cfg-merge').value.trim();
+  var dehyTemperature = dehyTemperatureRaw === '' ? NaN : Number(dehyTemperatureRaw);
+  var mergeThreshold = mergeThresholdRaw === '' ? NaN : Number(mergeThresholdRaw);
   var body = {
     dehydration: {
       model: document.getElementById('cfg-dehy-model').value,
       base_url: document.getElementById('cfg-dehy-url').value,
       max_tokens: parseInt(document.getElementById('cfg-dehy-maxtokens').value) || 1024,
-      temperature: parseFloat(document.getElementById('cfg-dehy-temp').value) || 0.1,
+      temperature: Number.isFinite(dehyTemperature) ? dehyTemperature : 0.1,
       api_format: (document.getElementById('cfg-dehy-format') || {value:'openai_compat'}).value || 'openai_compat',
     },
     embedding: {
       enabled: document.getElementById('cfg-emb-enabled').value === 'true',
       model: document.getElementById('cfg-emb-model').value,
+      base_url: document.getElementById('cfg-emb-base-url').value,
       backend: document.getElementById('cfg-emb-backend').value,
       api_format: (document.getElementById('cfg-emb-format') || {value:'openai_compat'}).value || 'openai_compat',
     },
-    merge_threshold: parseInt(document.getElementById('cfg-merge').value) || 75,
+    merge_threshold: Number.isFinite(mergeThreshold) ? mergeThreshold : 75,
     surfacing: {
       breath_max_results: parseInt(document.getElementById('cfg-sf-breath-results').value) || 20,
       breath_max_tokens: parseInt(document.getElementById('cfg-sf-breath-tokens').value) || 10000,
@@ -6951,7 +7364,7 @@ async function saveConfig(persist) {
   }
 }
 
-checkAuth().then(authed => { if (authed) { loadBuckets(); loadStatusBanner(); } });
+checkAuth().then(authed => { if (authed) return beginAuthenticatedDashboardSession(); });
 
 // ====== iter 1.7: version badge, plan kanban, about page ======
 var _obLocalVersion = null;
@@ -7017,7 +7430,7 @@ loadVersionBadge();
     if (deployEl) {
       deployEl.textContent = [
         '当前版本  : v' + (info.version || _obLocalVersion || '?'),
-        '部署方式  : ' + (info.is_docker ? 'Docker 容器' : '裸机 / git'),
+        '部署方式  : ' + (info.is_render ? 'Render' : (info.is_docker ? 'Docker 容器' : '裸机 / git')),
         '服务端口  : ' + (info.port || location.port || '8000'),
         '数据目录  : ' + (info.data_dir || '（未知）'),
         '访问地址  : ' + location.origin,
@@ -7026,7 +7439,9 @@ loadVersionBadge();
 
     var cmdEl = document.getElementById('ver-cmd-box');
     if (cmdEl) {
-      if (info.is_docker) {
+      if (info.is_render) {
+        cmdEl.textContent = '请在 Render Dashboard 中触发正式部署\n或更新所连接 Git 仓库的 main 分支';
+      } else if (info.is_docker) {
         var cname = info.container_name || 'ombre-brain';
         cmdEl.textContent = 'docker pull p0luz/ombre-brain:latest\ndocker restart ' + cname;
       } else {
@@ -7042,8 +7457,8 @@ loadVersionBadge();
   function renderPersistNote(info) {
     var el = document.getElementById('ver-persist-note');
     if (!el) return;
-    // 裸机天然持久，无需打扰
-    if (!info || !info.is_docker || info.hot_update_persistent === undefined) {
+    // 裸机天然持久，无需打扰；Render 虽非 Docker，源码层仍是易失的，必须提示。
+    if (!info || info.hot_update_persistent === undefined || (!info.is_docker && !info.is_render)) {
       el.style.display = 'none';
       return;
     }
@@ -7068,9 +7483,12 @@ loadVersionBadge();
     var logBox  = document.getElementById('ver-log-box');
     var doneEl  = document.getElementById('ver-update-done');
 
-    // v2.3.9 起：服务端热更新后会「自我重启」(os.execv 原地替换进程)，
-    // 不再依赖外部守护进程，Docker / Render / Zeabur / 裸机 Mac·Linux·Windows 统一自动恢复。
+    // v2.3.9 起：服务端热更新后会「自我重启」(os.execv 原地替换进程)。
+    // Render 当前实例也会恢复，但源码层易失，平台下一次重建会回到正式部署版本。
     var _confirmMsg = '确认开始热更新？\n\n请确保已导出记忆备份，更新期间服务会自动重启（约 10-30 秒）后自行恢复。';
+    if (_deployInfo && _deployInfo.is_render) {
+      _confirmMsg = 'Render 上的 Dashboard 热更新只对当前实例临时生效，平台重启或重新部署后会回滚。\n\n建议取消并改用 Render 正式部署。仍要进行临时热更新吗？';
+    }
     if (!confirm(_confirmMsg)) return;
 
     if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader"></i> 更新中…'; lucide.createIcons(); }
@@ -7081,8 +7499,27 @@ loadVersionBadge();
     var log = function(line) { if (logBox) logBox.textContent += line + '\n'; };
 
     try {
-      var r = await fetch(BASE + '/api/do-update', { method: 'POST', credentials: 'include' });
-      if (!r.ok) { log('请求失败：' + r.status); return; }
+      // 热更新不是可重试写操作，不能走会对瞬时 502/503/504 自动重试的
+      // authFetch；否则代理丢失首个响应时可能重复发起更新任务。
+      var r = await fetch(BASE + '/api/do-update', {
+        method: 'POST', credentials: 'include'
+      });
+      if (r.status === 401) {
+        checkAuth();
+        log('登录状态已失效，请重新登录后重试。');
+        return;
+      }
+      if (!r.ok) {
+        var failure = {};
+        try { failure = await readJsonSafe(r); } catch (parseError) {
+          failure = {error: parseError.message};
+        }
+        log('请求失败（HTTP ' + r.status + '）：' + (failure.error || '未知错误'));
+        if (r.status === 403 && failure.error === 'Cross-origin request rejected') {
+          log('这不是 CORS 缺失。请让 nginx 保留公网 Host/HTTPS 转发头，并把最后一跳代理 CIDR 加入 OMBRE_TRUSTED_PROXY_CIDRS。');
+        }
+        return;
+      }
 
       var reader = r.body.getReader();
       var decoder = new TextDecoder();
@@ -7362,17 +7799,9 @@ async function loadAbout() {
 
 // Re-render Lucide icons whenever DOM is ready (covers static markup)
 window.addEventListener('DOMContentLoaded', function() {
-  syncRestartRequirement();
   if (window.lucide) lucide.createIcons();
-  // iter 2.0: refresh anchor counter on first load + every 30s
-  if (typeof refreshAnchorCounter === 'function') {
-    refreshAnchorCounter();
-    setInterval(refreshAnchorCounter, 30000);
-  }
   updateChick(0);              // 小黄鸡蛋初始（loadBuckets 后会按真实总数更新）
   startPlaceholderRotation();  // 搜索框随机 placeholder
-  checkEmptyMemoryBanner();    // 零记忆时红色提示「可从 GitHub 恢复」
-  loadOwnerBadge();            // 多人共用时顶部显示记忆归属徽标（单人隐藏）
 });
 
 // 更新/换机后发现一条记忆都没有 → 顶部红色横幅，引导从 GitHub 恢复。
@@ -7579,15 +8008,30 @@ async function pauseImport() {
   try { await fetch(BASE + '/api/import/pause', { method: 'POST' }); } catch(e) { alert('暂停失败: ' + (e.message || e)); }
 }
 
-async function loadImportResults() {
+let importResultsLoadGeneration = 0;
+async function loadImportResults(options) {
   const container = document.getElementById('import-results-list');
-  container.innerHTML = '<div class="loading">加载中… / Loading…</div>';
+  const opts = options && typeof options === 'object' ? options : {};
+  const generation = ++importResultsLoadGeneration;
+  const preserveScroll = opts.preserveScroll === true;
+  const requestedScrollTop = Number(opts.scrollTop);
+  const previousScrollTop = preserveScroll
+    ? (Number.isFinite(requestedScrollTop) ? Math.max(0, requestedScrollTop) : container.scrollTop)
+    : 0;
+  container.setAttribute('aria-busy', 'true');
+  if (!preserveScroll) container.innerHTML = '<div class="loading">加载中… / Loading…</div>';
   try {
     const res = await fetch(BASE + '/api/import/results?limit=30');
-    const data = await res.json();
+    const data = await readJsonSafe(res);
+    if (generation !== importResultsLoadGeneration) return false;
+    if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+    if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.buckets)) {
+      throw new Error('导入结果响应无效 / Invalid import results response');
+    }
     if (!data.buckets || !data.buckets.length) {
       container.innerHTML = '<p style="color:var(--text-dim)">暂无记忆桶</p>';
-      return;
+      if (preserveScroll) container.scrollTop = previousScrollTop;
+      return true;
     }
     container.innerHTML = data.buckets.map(b => `
       <div data-review-bucket-id="${escAttr(b.id)}" style="background:var(--surface);border-radius:12px;padding:14px;margin:8px 0;">
@@ -7597,7 +8041,8 @@ async function loadImportResults() {
         </div>
         <p style="font-size:13px;margin:6px 0;white-space:pre-wrap;">${esc(b.content)}</p>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">${esc((b.tags||[]).map(t=>'#'+t).join(' '))}</div>
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button data-bucket-id="${escAttr(b.id)}" onclick="openImportedBucketEditor(this.dataset.bucketId)" class="icon-btn" title="编辑完整记忆 / Edit full memory"><svg class="icon" aria-hidden="true"><use href="#i-edit"></use></svg> 编辑</button>
           <button data-bucket-id="${escAttr(b.id)}" onclick="reviewAction(this.dataset.bucketId,'pin')" class="icon-btn" title="固定为永久记忆"><i data-lucide="pin"></i> 固定</button>
           <button data-bucket-id="${escAttr(b.id)}" onclick="reviewAction(this.dataset.bucketId,'important')" class="icon-btn" title="标为重要"><i data-lucide="star"></i> 重要</button>
           <button data-bucket-id="${escAttr(b.id)}" onclick="reviewAction(this.dataset.bucketId,'noise')" class="icon-btn" title="标为噪声并resolve"><i data-lucide="trash-2"></i> 噪声</button>
@@ -7605,7 +8050,27 @@ async function loadImportResults() {
         </div>
       </div>
     `).join('');
-  } catch(e) { container.innerHTML = '<p style="color:var(--negative)">加载失败: ' + esc(e.message) + '</p>'; }
+    if (preserveScroll) container.scrollTop = previousScrollTop;
+    return true;
+  } catch(e) {
+    if (generation !== importResultsLoadGeneration) return false;
+    container.innerHTML = '<p style="color:var(--negative)">加载失败: ' + esc(e.message) + '</p>';
+    return false;
+  } finally {
+    if (generation === importResultsLoadGeneration) container.removeAttribute('aria-busy');
+  }
+}
+
+async function openImportedBucketEditor(bid) {
+  // Import results intentionally contain only a short preview. Always enter
+  // through showDetail so the editor receives the complete Markdown body.
+  if (!await showDetail(bid)) return;
+  const editor = document.getElementById('bucket-edit-form');
+  if (!editor) return;
+  editor.open = true;
+  const contentInput = document.getElementById('edit-content');
+  if (contentInput) contentInput.focus();
+  else editor.scrollIntoView({block:'start'});
 }
 
 async function detectPatterns() {
@@ -7634,10 +8099,14 @@ async function detectPatterns() {
 
 async function reviewAction(bid, action) {
   try {
-    await fetch(BASE + '/api/import/review', {
+    const response = await fetch(BASE + '/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: [{ bucket_id: bid, action }] })
     });
+    const result = await readJsonSafe(response);
+    if (!response.ok || !result || result.applied !== 1 || result.errors) {
+      throw new Error((result && result.error) || '审阅操作未生效');
+    }
     // Remove card from UI
     const card = Array.from(document.querySelectorAll('[data-review-bucket-id]'))
       .find(function(el) { return el.dataset.reviewBucketId === bid; });
@@ -7648,10 +8117,18 @@ async function reviewAction(bid, action) {
 async function batchReview(idsJson, action) {
   try {
     const ids = JSON.parse(idsJson);
-    await fetch(BASE + '/api/import/review', {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('没有可审阅的记忆');
+    const response = await fetch(BASE + '/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: ids.map(id => ({ bucket_id: id, action })) })
     });
+    const result = await readJsonSafe(response);
+    if (!response.ok || !result || result.applied !== ids.length || result.errors) {
+      const summary = result
+        ? `成功 ${Number(result.applied || 0)}，失败 ${Number(result.errors || 0)}`
+        : '服务器未返回结果';
+      throw new Error((result && result.error) || summary);
+    }
     detectPatterns();
   } catch(e) { alert('批量操作失败: ' + (e.message || e)); }
 }
@@ -7760,7 +8237,6 @@ async function pollHeartbeat() {
     txt.title = e.message;
   }
 }
-setInterval(pollHeartbeat, 15000);
 
 async function loadLogs() {
   const out = document.getElementById('logs-output');
@@ -7884,7 +8360,7 @@ function _getMcpOrigin() {
     let domain = (document.getElementById('mcp-custom-domain')?.value || '').trim();
     if (!domain) return location.origin;
     if (!/^https?:\/\//i.test(domain)) domain = 'https://' + domain;
-    return domain.replace(/\/+$/, '');
+    return domain.replace(/\/mcp\/?$/i, '').replace(/\/+$/, '');
   }
   // 本地模式：固定用 127.0.0.1 + 当前端口，保证 Claude Desktop 连本机 Docker
   const port = location.port || (location.protocol === 'https:' ? '443' : '80');
@@ -8081,6 +8557,40 @@ function onMcpModeChange() {
   renderMcpUrls();
 }
 
+async function saveMcpAddress() {
+  const msg = document.getElementById('mcp-address-msg');
+  const mode = document.querySelector('input[name="mcp-mode"]:checked')?.value;
+  const publicUrl = mode === 'public'
+    ? (document.getElementById('mcp-custom-domain')?.value || '').trim()
+    : '';
+  if (mode === 'public' && !publicUrl) {
+    msg.style.color = 'var(--negative)';
+    msg.textContent = '请先填写公网 HTTPS 地址';
+    return;
+  }
+  try {
+    const response = await authFetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({deployment: {public_url: publicUrl}, persist: true}),
+    });
+    if (!response) return;
+    const data = await readJsonSafe(response);
+    if (!response.ok || !data.ok) throw new Error(data.error || '保存失败');
+    const savedUrl = String((data.deployment || {}).public_url || '');
+    const input = document.getElementById('mcp-custom-domain');
+    if (input) input.value = savedUrl;
+    msg.style.color = data.restart_required ? 'var(--warning)' : 'var(--positive)';
+    msg.textContent = (savedUrl ? ('已保存：' + savedUrl) : '已切回本地模式并清除公网地址')
+      + (data.restart_required ? '；重启服务后生效' : '');
+    setRestartRequired(!!data.restart_required, 'MCP 连接地址已保存');
+    renderMcpUrls();
+  } catch (error) {
+    msg.style.color = 'var(--negative)';
+    msg.textContent = error.message || String(error);
+  }
+}
+
 function copyMcpUrl(which) {
   const el = document.getElementById('mcp-url-main');
   const text = el?.textContent || '';
@@ -8116,6 +8626,7 @@ function exportClaudeDesktopConfig() {
 // 冲突决策表：{bucket_id: "skip"|"overwrite"|"keep_both"}
 let _migrateDecisions = {};
 let _migratePollingTimer = null;
+let _migrateJobId = '';
 
 function handleMigrateFileDrop(event) {
   const files = event.dataTransfer.files;
@@ -8153,6 +8664,7 @@ async function uploadMigrateZip(file) {
 
 function renderMigrateParsed(d) {
   _migrateDecisions = {};
+  _migrateJobId = String(d.job_id || '');
   document.getElementById('migrate-upload-zone').style.display = 'none';
   const panel = document.getElementById('migrate-parsed-panel');
   panel.style.display = 'block';
@@ -8216,7 +8728,7 @@ async function applyMigrate() {
     const r = await fetch(BASE + '/api/migrate/apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decisions: _migrateDecisions }),
+      body: JSON.stringify({ decisions: _migrateDecisions, job_id: _migrateJobId }),
     });
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
@@ -8236,6 +8748,12 @@ async function pollMigrateStatus() {
   try {
     const r = await fetch(BASE + '/api/migrate/status');
     const d = await r.json();
+    if (_migrateJobId && d.job_id && d.job_id !== _migrateJobId) {
+      clearInterval(_migratePollingTimer);
+      _migratePollingTimer = null;
+      document.getElementById('migrate-phase-text').textContent = '任务已被新的迁移包替代，请重新上传';
+      return;
+    }
     updateMigrateProgress(d);
     if (d.phase === 'done' || d.phase === 'error') {
       clearInterval(_migratePollingTimer);
@@ -8248,7 +8766,7 @@ async function pollMigrateStatus() {
 
 function updateMigrateProgress(d) {
   const phaseNames = {
-    idle: '空闲', parsed: '已解析', applying: '正在写入…',
+    idle: '空闲', parsing: '正在解析…', parsed: '已解析', applying: '正在写入…',
     reindexing: '重新向量化…', done: '完成', error: '出错',
   };
   const phaseText = document.getElementById('migrate-phase-text');
@@ -8286,6 +8804,7 @@ function updateMigrateProgress(d) {
 function resetMigrate() {
   if (_migratePollingTimer) { clearInterval(_migratePollingTimer); _migratePollingTimer = null; }
   _migrateDecisions = {};
+  _migrateJobId = '';
   const zone = document.getElementById('migrate-upload-zone');
   zone.style.display = 'block';
   zone.innerHTML = '<div style="font-size:13px;color:var(--text-dim);">点击或拖入 <code>ombre_export_*.zip</code></div><input type="file" id="migrate-file-input" accept=".zip" style="display:none" onchange="handleMigrateFileSelect(event)" />';
@@ -8316,28 +8835,39 @@ async function loadDuplicates() {
 // ========================================
 function renderEditForm(bid, meta) {
   const curContent = esc(meta._content_for_edit || '');
+  const safeImportance = Math.round(safeNumber(meta.importance, 5, 1, 10));
+  const editableTypes = ['dynamic','permanent','feel','plan','letter'];
+  const currentType = String(meta.type || 'dynamic');
+  const typeIsEditable = editableTypes.indexOf(currentType) !== -1;
+  // BucketManager 对“解除钉选”采用确定性的 permanent → dynamic 迁移。
+  // 钉选状态下只展示这条可原子保存的路径，避免 UI 承诺后端会拒绝的
+  // permanent → feel/plan/letter 一步迁移；解钉保存后即可继续改为其他类型。
+  const typeOptions = meta.pinned && typeIsEditable
+    ? ['permanent', 'dynamic']
+    : (typeIsEditable ? editableTypes : [currentType].concat(editableTypes));
   return `
-    <details style="margin-top:14px;border:1px solid var(--border);border-radius:2px;padding:12px 14px;background:var(--surface-solid);">
+    <details id="bucket-edit-form" style="margin-top:14px;border:1px solid var(--border);border-radius:2px;padding:12px 14px;background:var(--surface-solid);">
       <summary style="cursor:pointer;font-weight:600;color:var(--accent);display:flex;align-items:center;gap:5px;"><svg class="icon" aria-hidden="true"><use href="#i-edit"></use></svg> 编辑这条记忆</summary>
       <div style="display:grid;grid-template-columns:90px 1fr;gap:10px 12px;align-items:center;margin-top:14px;font-size:13px;">
         <label>名称</label>
         <input id="edit-name" type="text" value="${escAttr(meta.name || '')}" />
         <label>类型</label>
-        <select id="edit-type" style="width:160px;">
-          ${['dynamic','permanent','feel','plan','letter'].map(t =>
-            `<option value="${t}" ${meta.type === t ? 'selected' : ''}>${t}</option>`
+        <select id="edit-type" style="width:160px;" onchange="syncEditPinConstraints('type')" ${typeIsEditable ? '' : 'disabled title="特殊类型由对应工具维护，编辑其他字段时会保持原类型"'}>
+          ${typeOptions.map(t =>
+            `<option value="${escAttr(t)}" ${currentType === t ? 'selected' : ''}>${esc(t)}</option>`
           ).join('')}
         </select>
+        ${typeIsEditable ? '' : '<span></span><small style="color:var(--text-dim);margin-top:-8px;">特殊/未知类型保持不变</small>'}
         <label>主题（domain）</label>
         <input id="edit-domain" type="text" value="${escAttr((meta.domain||[]).join(', '))}" placeholder="逗号分隔，如：工作, 心情" />
         <label>标签</label>
         <input id="edit-tags" type="text" value="${escAttr((meta.tags||[]).join(', '))}" placeholder="逗号分隔" />
         <label>重要度</label>
-        <span><input id="edit-importance" type="range" min="1" max="10" value="${meta.importance || 5}" oninput="document.getElementById('edit-imp-val').textContent=this.value;document.getElementById('edit-imp-label').textContent=importanceLabel(this.value)" style="vertical-align:middle;" /> <span id="edit-imp-val">${meta.importance || 5}</span>/10 · <span id="edit-imp-label">${importanceLabel(meta.importance || 5)}</span></span>
+        <span><input id="edit-importance" type="range" min="1" max="10" value="${safeImportance}" oninput="document.getElementById('edit-imp-val').textContent=this.value;document.getElementById('edit-imp-label').textContent=importanceLabel(this.value);syncEditPinConstraints('importance')" style="vertical-align:middle;" /> <span id="edit-imp-val">${safeImportance}</span>/10 · <span id="edit-imp-label">${importanceLabel(safeImportance)}</span></span>
         <label>已解决</label>
         <span><input id="edit-resolved" type="checkbox" ${meta.resolved ? 'checked' : ''} /> <small style="color:var(--text-dim);">勾上后仅在关键词命中时重现（适合已闭环的 plan / 事件）</small></span>
         <label>钉选</label>
-        <span><input id="edit-pinned" type="checkbox" ${meta.pinned ? 'checked' : ''} /> <small style="color:var(--text-dim);">会自动锁 importance=10</small></span>
+        <span><input id="edit-pinned" type="checkbox" onchange="syncEditPinConstraints('pinned')" ${meta.pinned ? 'checked' : ''} /> <small id="edit-pin-hint" style="color:var(--text-dim);">钉选会同步为 permanent / importance=10</small></span>
         <label>已消化</label>
         <span><input id="edit-digested" type="checkbox" ${meta.digested ? 'checked' : ''} /></span>
         <label>主动遗忘</label>
@@ -8351,8 +8881,8 @@ function renderEditForm(bid, meta) {
           <span id="edit-weight-val" style="margin-left:8px;">${Math.round((meta.weight||0)*100)}% · ${weightAnchorLabel((meta.weight||0))}</span>
           <small style="color:var(--text-dim);display:block;margin-top:4px;">轻 25% · 中 50% · 重 75% · 必须 100%（0–100%，仅用于排序展示）</small>
         </span>` : ''}
-        <label style="align-self:start;padding-top:8px;">正文</label>
-        <textarea id="edit-content" placeholder="留空不改" style="min-height:120px;font-family:inherit;line-height:1.7;resize:vertical;">${curContent}</textarea>
+        <label for="edit-content" style="align-self:start;padding-top:8px;">正文</label>
+        <textarea id="edit-content" aria-label="正文 / Content" placeholder="留空不改" style="min-height:120px;font-family:inherit;line-height:1.7;resize:vertical;">${curContent}</textarea>
       </div>
       <div style="margin-top:12px;display:flex;gap:10px;align-items:center;">
         <button class="btn-primary" data-bucket-id="${escAttr(bid)}" onclick="bucketSaveEdit(this.dataset.bucketId)" title="保存修改" style="padding:0 14px;height:36px;display:inline-flex;align-items:center;gap:5px;"><i data-lucide="check"></i> 保存修改</button>
@@ -8361,13 +8891,46 @@ function renderEditForm(bid, meta) {
     </details>`;
 }
 
+function syncEditPinConstraints(source) {
+  const pinnedEl = document.getElementById('edit-pinned');
+  const typeEl = document.getElementById('edit-type');
+  const importanceEl = document.getElementById('edit-importance');
+  const importanceValueEl = document.getElementById('edit-imp-val');
+  const hintEl = document.getElementById('edit-pin-hint');
+  // i/self、archived 等受保护类型不通过普通编辑器改变生命周期约束。
+  if (!pinnedEl || !typeEl || typeEl.disabled) return;
+
+  if (source === 'pinned' && pinnedEl.checked) {
+    typeEl.value = 'permanent';
+    if (importanceEl) importanceEl.value = '10';
+    if (importanceValueEl) importanceValueEl.textContent = '10';
+    if (hintEl) {
+      hintEl.textContent = '已同步为 permanent / importance=10';
+      hintEl.style.color = 'var(--accent)';
+    }
+    return;
+  }
+
+  const typeAllowsPin = typeEl.value === 'permanent';
+  const importanceAllowsPin = !importanceEl || Number(importanceEl.value) >= 10;
+  if (pinnedEl.checked && (!typeAllowsPin || !importanceAllowsPin)) {
+    pinnedEl.checked = false;
+    if (hintEl) {
+      hintEl.textContent = '已自动取消钉选；类型和重要度可在本次一并保存';
+      hintEl.style.color = 'var(--accent)';
+    }
+  }
+}
+
 async function bucketSaveEdit(bid) {
+  // 事件联动之外再做一次保存前校验，避免脚本赋值或浏览器差异留下矛盾字段。
+  syncEditPinConstraints('save');
   const newContent = document.getElementById('edit-content').value;
   // iter 1.8: 新增 why_remembered / dont_surface / weight，plan 才会有 weight
   const weightEl = document.getElementById('edit-weight');
+  const typeEl = document.getElementById('edit-type');
   const body = {
     name: document.getElementById('edit-name').value,
-    type: document.getElementById('edit-type').value,
     tags: document.getElementById('edit-tags').value,
     domain: document.getElementById('edit-domain').value,
     importance: parseInt(document.getElementById('edit-importance').value, 10),
@@ -8377,10 +8940,18 @@ async function bucketSaveEdit(bid) {
     dont_surface: document.getElementById('edit-dont-surface').checked,
     why_remembered: document.getElementById('edit-why').value,
   };
+  // i/self、archived 及未来特殊类型由专用生命周期维护；不要把浏览器
+  // select 的默认首项 dynamic 写回。普通类型仍允许沿用现有编辑入口。
+  if (typeEl && !typeEl.disabled) body.type = typeEl.value;
   if (weightEl) body.weight = parseFloat(weightEl.value) / 100;
   // 内容只在非空时带上，避免误清空
   if (newContent && newContent.trim()) body.content = newContent;
   const msg = document.getElementById('edit-msg');
+  const importView = document.getElementById('import-view');
+  const refreshImportResults = importView && importView.style.display !== 'none';
+  const importList = document.getElementById('import-results-list');
+  const importScrollTop = importList ? importList.scrollTop : 0;
+  const detailGenerationAtSave = detailLoadGeneration;
   msg.textContent = '保存中… / Saving…';
   msg.style.color = 'var(--text-dim)';
   try {
@@ -8392,8 +8963,15 @@ async function bucketSaveEdit(bid) {
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
     msg.innerHTML = _SV.ok + ' 已保存：' + esc((d.updated || []).join(', '));
     msg.style.color = 'var(--accent)';
-    await showDetail(bid);
-    loadBuckets();
+    // If the user opened/closed another detail while PATCH was in flight, do
+    // not pull the panel back to the bucket that just finished saving.
+    if (detailLoadGeneration === detailGenerationAtSave) {
+      await showDetail(bid);
+    }
+    await loadBuckets();
+    if (refreshImportResults) {
+      await loadImportResults({preserveScroll:true, scrollTop:importScrollTop});
+    }
   } catch (e) {
     msg.innerHTML = _SV.err + ' ' + esc(e.message);
     msg.style.color = 'var(--negative)';
@@ -8564,26 +9142,6 @@ function _renderLetter(l) {
   </article>`;
 }
 
-// 日期「按钮」：点按钮 → 主动唤起浏览器原生日期选择器。
-// showPicker() 是专门干这事的 API（Chrome/Edge/Safari 支持）；
-// 不支持时退回 focus+click，再不行就让隐藏 input 临时可见聚焦。
-function openDatePicker() {
-  const inp = document.getElementById('letter-date');
-  if (!inp) return;
-  try {
-    if (typeof inp.showPicker === 'function') { inp.showPicker(); return; }
-  } catch (e) { /* 某些浏览器在非用户手势下会抛错，下面兜底 */ }
-  inp.focus();
-  inp.click();
-}
-
-// 选完日期后，把按钮上的文字更新成所选日期（没选则回到提示）。
-function syncDateLabel() {
-  const inp = document.getElementById('letter-date');
-  const lbl = document.getElementById('letter-date-label');
-  if (inp && lbl) lbl.textContent = inp.value || '请选择日期 / Pick a date';
-}
-
 async function sendLetter() {
   const status = document.getElementById('letter-status');
   status.style.color = 'var(--text-dim)';
@@ -8661,7 +9219,6 @@ async function deleteLetter(id) {
 // ── E/F 级错误自动弹窗 ────────────────────────────────────────
 // 每 60s 轮询 /api/errors/recent?min_level=E，若有新条目则弹窗提示。
 // 用 localStorage 存最后确认时间戳，避免重复打扰。
-var _errorAlertTimer = null;
 
 async function pollCriticalErrors() {
   try {
@@ -8721,15 +9278,16 @@ function goToLogsTab() {
   if (t) t.click();
 }
 
-// 启动后挂载
-pollHeartbeat();
-pollCriticalErrors();
-_errorAlertTimer = setInterval(pollCriticalErrors, 60000);
-maybeShowOnboarding();
-// 支持 #letters 锚点直达（老书签从 /letters → / #letters 时自动切换）
-if (location.hash === '#letters') {
-  const t = document.querySelector('.tab[data-tab="letters"]');
-  if (t) t.click();
+// 认证完成后刷新当前视图；也支持 #letters 老书签直达。
+// 这里不能在脚本解析阶段直接 click，否则未登录访问会抢跑受保护接口。
+function refreshAuthenticatedActiveView() {
+  let target = null;
+  if (location.hash === '#letters') {
+    target = document.querySelector('.tab[data-tab="letters"]');
+  }
+  if (!target) target = document.querySelector('.tab.active');
+  if (target) return activateDashboardTab(target);
+  return Promise.resolve([]);
 }
 
 // ── 给作者反馈 ──────────────────────────────────────────────
@@ -8973,19 +9531,19 @@ function renderSelfEntries() {
   }).join('');
 }
 
-// 初始化：检测是否有条目，给 FAB 加小圆点
-(async function initSelfFab() {
+// 认证成功后检测是否有条目，给 FAB 加小圆点
+async function initSelfFab() {
   try {
     const res = await authFetch('/api/self');
     if (res && res.ok) {
       const data = await res.json();
-      if (Array.isArray(data) && data.length > 0) {
-        document.getElementById('self-fab').classList.add('has-entries');
-        _selfEntries = data;
-      }
+      const hasEntries = Array.isArray(data) && data.length > 0;
+      const fab = document.getElementById('self-fab');
+      if (fab) fab.classList.toggle('has-entries', hasEntries);
+      _selfEntries = hasEntries ? data : [];
     }
   } catch (_) {}
-})();
+}
 </script>
 
 </body>

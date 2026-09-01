@@ -28,6 +28,35 @@ except ImportError:  # pragma: no cover
     from ..utils import strip_wikilinks, extract_wikilinks  # type: ignore
 
 
+_SEMANTIC_DISABLED_NOTE = "语义索引暂不可用，本次仅使用关键词/BM25"
+
+
+async def _semantic_scores_for_dashboard(query: str, top_k: int) -> tuple[dict[str, float], str]:
+    """显式跑一次向量查询，失败时给出可读原因。
+
+    跟 tools/breath/search.py 的 _semantic_scores 同一个套路——如果不显式跑
+    这一步、直接把裸 query 扔给 bucket_mgr.search()，它内部会自己悄悄尝试
+    embedding_engine.search_similar()，失败只打一行 warning 日志就吞掉异常，
+    调用方（这里是 Dashboard）完全看不出这次检索到底有没有真的用上语义通道。
+    """
+    engine = sh.embedding_engine
+    if not engine or not getattr(engine, "enabled", False):
+        return {}, _SEMANTIC_DISABLED_NOTE
+    try:
+        strict_search = getattr(engine, "search_similar_strict", None)
+        if callable(strict_search):
+            pairs = await strict_search(query, top_k=top_k)
+        else:
+            pairs = await engine.search_similar(query, top_k=top_k)
+        return {bucket_id: float(score) for bucket_id, score in pairs}, ""
+    except Exception as exc:
+        logger.warning(
+            f"/api/search semantic search failed; using keyword/BM25 only: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return {}, _SEMANTIC_DISABLED_NOTE
+
+
 def _unit_query_float(raw: str | None, name: str) -> float | None:
     if raw in (None, ""):
         return None
@@ -58,7 +87,12 @@ def register(mcp) -> None:
         if query_error:
             return JSONResponse({"error": query_error}, status_code=400)
         try:
-            matches = await sh.bucket_mgr.search(query, limit=10)
+            vector_scores, semantic_notice = await _semantic_scores_for_dashboard(
+                query, top_k=50
+            )
+            matches = await sh.bucket_mgr.search(
+                query, limit=10, vector_scores=vector_scores
+            )
             result = []
             for b in matches:
                 if not _SURFACE_POLICY.evaluate_bucket(b, mode="search").allowed:
@@ -73,7 +107,14 @@ def register(mcp) -> None:
                     "arousal": meta.get("arousal", 0.3),
                     "content_preview": strip_wikilinks(b.get("content", ""))[:200],
                 })
-            return JSONResponse(result)
+            response = JSONResponse(result)
+            # 响应体保持纯数组不变（前端 Array.isArray(results) 依赖这个形状），
+            # 语义检索是否降级改用响应头传递——不破坏现有调用方，同时让「离线要
+            # 明确提示」这条约定在这个接口上也真正可核实，而不是只在日志里。
+            response.headers["X-Semantic-Search"] = (
+                "degraded" if semantic_notice else "ok"
+            )
+            return response
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 

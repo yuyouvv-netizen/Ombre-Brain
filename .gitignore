@@ -35,6 +35,10 @@ data/
 docs/internal/
 docs/secret/
 docs/secrets/
+docs/superpowers/
+docs/CODE_HEALTH_AUDIT_*.md
+docs/TODO_*.md
+docs/V2.4.0_*.md
 
 # 本地测试脚手架 —— 不上传（需要时本地维护）
 tests/integration/
@@ -66,3 +70,5 @@ frontend/dashboard-preview.html
 # so its generated Cargo.lock is not a release lockfile.
 kernel/rust/**/target/
 kernel/rust/ombre-kernel/Cargo.lock
+.tmp/ombre-nodes-v2.yaml
+.tmp/

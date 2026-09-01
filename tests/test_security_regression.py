@@ -1,3 +1,4 @@
+import hashlib
 import io
 import tarfile
 import zipfile
@@ -51,7 +52,7 @@ def test_hook_requests_accept_configured_token(monkeypatch):
 
     assert hooks_mod._is_hook_request_authorized(
         DummyRequest(query_params={"token": "secret-token"})
-    ) is True
+    ) is False
     assert hooks_mod._is_hook_request_authorized(
         DummyRequest(headers={"x-ombre-hook-token": "secret-token"})
     ) is True
@@ -148,10 +149,27 @@ def test_ollama_download_allows_trusted_hosts(monkeypatch):
     monkeypatch.delenv("OMBRE_ALLOW_UNTRUSTED_MIRROR", raising=False)
     for url in (
         "https://ollama.com/download/OllamaSetup.exe",
-        "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst",
+        f"https://github.com/ollama/ollama/releases/download/{ollama_mod._OLLAMA_VERSION}/ollama-linux-amd64.tar.zst",
         "https://objects.githubusercontent.com/foo/ollama-linux-amd64.tar.zst",
     ):
         assert ollama_mod._validate_download_url(url) == url
+
+
+@pytest.mark.parametrize(
+    ("osk", "arch", "filename"),
+    [
+        ("windows", "amd64", "OllamaSetup.exe"),
+        ("macos", "arm64", "Ollama-darwin.zip"),
+        ("linux", "amd64", "ollama-linux-amd64.tar.zst"),
+        ("linux", "arm64", "ollama-linux-arm64.tar.zst"),
+    ],
+)
+def test_ollama_official_binary_urls_are_version_pinned(osk, arch, filename):
+    url = ollama_mod._bin_url("official", osk, arch)
+
+    assert f"/releases/download/{ollama_mod._OLLAMA_VERSION}/" in url
+    assert "/latest/" not in url
+    assert url.endswith(filename)
 
 
 def test_ollama_download_rejects_untrusted_host_by_default(monkeypatch):
@@ -184,17 +202,17 @@ def test_artifact_verify_rejects_too_small(tmp_path):
     p = tmp_path / "OllamaSetup.exe"
     p.write_bytes(b"MZ" + b"\x00" * 100)  # 头对但太小
     with pytest.raises(RuntimeError):
-        ollama_mod._verify_downloaded_artifact(str(p), "windows")
+        ollama_mod._verify_downloaded_artifact(str(p), "windows", "amd64")
 
 
 def test_artifact_verify_rejects_wrong_magic(tmp_path):
     p = tmp_path / "OllamaSetup.exe"
     p.write_bytes(b"<html>404 Not Found</html>" + b"\x00" * (200 * 1024))  # 够大但头不对（HTML 错误页）
     with pytest.raises(RuntimeError):
-        ollama_mod._verify_downloaded_artifact(str(p), "windows")
+        ollama_mod._verify_downloaded_artifact(str(p), "windows", "amd64")
 
 
-def test_artifact_verify_accepts_valid(tmp_path):
+def test_artifact_verify_accepts_valid_magic_and_pinned_digest(monkeypatch, tmp_path):
     big = b"\x00" * (200 * 1024)
     cases = {
         "windows": b"MZ" + big,
@@ -204,7 +222,136 @@ def test_artifact_verify_accepts_valid(tmp_path):
     for osk, data in cases.items():
         p = tmp_path / f"art_{osk}"
         p.write_bytes(data)
-        ollama_mod._verify_downloaded_artifact(str(p), osk)  # 不抛即通过
+        monkeypatch.setitem(
+            ollama_mod._ARTIFACT_SHA256,
+            (osk, "amd64"),
+            hashlib.sha256(data).hexdigest(),
+        )
+        ollama_mod._verify_downloaded_artifact(str(p), osk, "amd64")
+
+
+def test_artifact_verify_rejects_digest_mismatch(monkeypatch, tmp_path):
+    data = b"MZ" + b"\x00" * (200 * 1024)
+    p = tmp_path / "OllamaSetup.exe"
+    p.write_bytes(data)
+    monkeypatch.setitem(
+        ollama_mod._ARTIFACT_SHA256,
+        ("windows", "amd64"),
+        hashlib.sha256(b"different artifact").hexdigest(),
+    )
+
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        ollama_mod._verify_downloaded_artifact(str(p), "windows", "amd64")
+
+
+def test_ollama_download_revalidates_redirect_target(monkeypatch, tmp_path):
+    class _RedirectedResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def geturl():
+            return "https://evil.attacker.example/OllamaSetup.exe"
+
+    monkeypatch.delenv("OMBRE_ALLOW_UNTRUSTED_MIRROR", raising=False)
+    monkeypatch.setattr(
+        ollama_mod.urllib.request,
+        "urlopen",
+        lambda _request, timeout=0: _RedirectedResponse(),
+    )
+    dest = tmp_path / "OllamaSetup.exe"
+
+    with pytest.raises(ValueError, match="evil.attacker.example"):
+        ollama_mod._download(
+            f"https://github.com/ollama/ollama/releases/download/{ollama_mod._OLLAMA_VERSION}/OllamaSetup.exe",
+            str(dest),
+        )
+
+    assert not dest.exists()
+
+
+def test_ollama_download_rejects_oversized_content_length(monkeypatch, tmp_path):
+    class _OversizedResponse:
+        headers = {"Content-Length": "5"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def geturl():
+            return "https://objects.githubusercontent.com/release/artifact"
+
+    monkeypatch.setattr(ollama_mod, "_MAX_DOWNLOAD_BYTES", 4)
+    monkeypatch.setattr(
+        ollama_mod.urllib.request,
+        "urlopen",
+        lambda _request, timeout=0: _OversizedResponse(),
+    )
+    dest = tmp_path / "ollama.tar.zst"
+
+    with pytest.raises(RuntimeError, match="byte limit"):
+        ollama_mod._download(
+            f"https://github.com/ollama/ollama/releases/download/{ollama_mod._OLLAMA_VERSION}/ollama-linux-amd64.tar.zst",
+            str(dest),
+        )
+
+    assert not dest.exists()
+
+
+def test_safe_zip_extract_rejects_member_count_limit(monkeypatch, tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("one.txt", b"1")
+        zf.writestr("two.txt", b"2")
+    buf.seek(0)
+    monkeypatch.setattr(ollama_mod, "_MAX_ARCHIVE_MEMBERS", 1)
+    dest = tmp_path / "extract"
+
+    with zipfile.ZipFile(buf) as zf:
+        with pytest.raises(ValueError, match="too many members"):
+            ollama_mod._safe_extract_zip(zf, str(dest))
+
+    assert not any(dest.rglob("*"))
+
+
+def test_safe_zip_extract_rejects_total_expansion_limit(monkeypatch, tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("large.txt", b"1234")
+    buf.seek(0)
+    monkeypatch.setattr(ollama_mod, "_MAX_EXTRACTED_BYTES", 3)
+    dest = tmp_path / "extract"
+
+    with zipfile.ZipFile(buf) as zf:
+        with pytest.raises(ValueError, match="byte limit"):
+            ollama_mod._safe_extract_zip(zf, str(dest))
+
+    assert not (dest / "large.txt").exists()
+
+
+def test_safe_tar_extract_rejects_member_size_limit(monkeypatch, tmp_path):
+    buf = io.BytesIO()
+    info = tarfile.TarInfo("large.bin")
+    info.size = 2
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        tf.addfile(info, io.BytesIO(b"12"))
+    buf.seek(0)
+    monkeypatch.setattr(ollama_mod, "_MAX_ARCHIVE_MEMBER_BYTES", 1)
+    dest = tmp_path / "extract"
+
+    with tarfile.open(fileobj=buf, mode="r") as tf:
+        with pytest.raises(ValueError, match="too large"):
+            ollama_mod._safe_extract_tar(tf, str(dest))
+
+    assert not (dest / "large.bin").exists()
 
 
 @pytest.mark.asyncio

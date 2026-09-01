@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from utils import load_config
-from vault_health import inspect_vault
+from ombrebrain.storage.vault_health import inspect_vault
 
 
 def _pending_ids(buckets_dir: str) -> set[str]:

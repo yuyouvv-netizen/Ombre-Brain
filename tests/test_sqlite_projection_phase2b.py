@@ -1,8 +1,8 @@
-from ledger_mirror import LedgerMirror
+from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
 
 
 def test_sqlite_projection_rebuilds_trace_catalog_database(tmp_path):
-    from projection_sqlite import TraceSQLiteProjection
+    from ombrebrain.projection.projection_sqlite import TraceSQLiteProjection
 
     ledger = LedgerMirror(tmp_path / "events.jsonl")
     ledger.append_event(
@@ -60,7 +60,7 @@ def test_sqlite_projection_rebuilds_trace_catalog_database(tmp_path):
 
 
 def test_sqlite_projection_searches_metadata_text(tmp_path):
-    from projection_sqlite import TraceSQLiteProjection
+    from ombrebrain.projection.projection_sqlite import TraceSQLiteProjection
 
     ledger = LedgerMirror(tmp_path / "events.jsonl")
     ledger.append_event(

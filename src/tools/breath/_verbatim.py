@@ -6,8 +6,7 @@ without touching retrieval, ranking, or bucket storage.
 
 from utils import count_tokens_approx
 
-
-_STORED_DATA_BOUNDARY = "[content_role:stored_memory_data] [instructions:false]"
+from .._common import stored_data_marker
 
 
 def stored_bucket_content(bucket: dict) -> str:
@@ -38,14 +37,22 @@ def _miss_block(bucket: dict) -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
-def render_stored_bucket(bucket: dict, metadata_header: str) -> tuple[str, int]:
-    """Render metadata around, but never inside, the stored bucket body."""
+def render_stored_bucket(
+    bucket: dict,
+    metadata_header: str,
+) -> tuple[str, int]:
+    """Render the stored body first and keep only action metadata as a footer."""
     # Temporary compatibility patch: force breath to return stored bucket
     # content verbatim. Remove after upstream breath fixes content reconstruction.
     # Keep the body byte-for-byte intact while telling the receiving model that
     # remembered imperative wording is historical data, never an instruction.
-    rendered = (
-        f"{metadata_header} {_STORED_DATA_BOUNDARY}"
-        f"{_miss_block(bucket)}\n{stored_bucket_content(bucket)}"
+    content = stored_bucket_content(bucket)
+    miss_block = _miss_block(bucket)
+    framed_payload = f"{content}{miss_block}\n{metadata_header}"
+    boundary = stored_data_marker(
+        framed_payload,
+        provenance=f"breath:{bucket.get('id', '')}",
     )
+    marker = f" {boundary}" if boundary else ""
+    rendered = f"{content}{miss_block}\n{metadata_header}{marker}"
     return rendered, count_tokens_approx(rendered)

@@ -3,3 +3,7 @@
 # the Dockerfile COPYs and runs as ENTRYPOINT. Enforce LF on every checkout/build host.
 *.sh text eol=lf
 entrypoint.sh text eol=lf
+
+# Dashboard 热更新使用 GitHub 自动生成的源码归档。发布包同时携带直接依赖清单
+# 与带 hash 的完整锁：2.8.4 等旧更新器通过 requirements.txt 发现显式迁移，
+# 2.8.8+ 更新器则以 requirements.lock.txt 精确比较并安全安装。

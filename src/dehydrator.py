@@ -30,6 +30,7 @@ import json
 import asyncio
 import hashlib
 import sqlite3
+import weakref
 import logging
 from typing import Optional
 
@@ -37,13 +38,10 @@ from openai import AsyncOpenAI
 
 from utils import clean_llm_json, count_tokens_approx, parse_bool, positive_float
 
-try:
-    from provider_detect import is_gemini_native_host, strip_native_resource_prefix
-except ImportError:  # pragma: no cover
-    from .provider_detect import (  # type: ignore
-        is_gemini_native_host,
-        strip_native_resource_prefix,
-    )
+from ombrebrain.integrations.provider_detect import (
+    is_gemini_native_host,
+    strip_native_resource_prefix,
+)
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -59,7 +57,11 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 # 改任何会影响脱水/合并输出的 prompt 时 +1，使存量缓存自然失效（见 _content_key）。
 # v2：DEHYDRATE/MERGE 加入「视角铁律」，强制保留第一人称（我 / 人名）。
 # v3：脱水结果只接受既定 JSON schema，隔离模型追加的评论、立场与未知字段。
-_PROMPT_VERSION = 3
+# v4：视角铁律补反向条款——v2 只防「我被抹掉」方向（规则和示例都是单向的），
+#     脱水 LLM 在含糊处过度矫正：省略主语的句子被归给「我」（实案：正文
+#     「07-07嚎啕大哭…吊她」经 /breath-hook 脱水成「07-07我嚎啕大哭…吊我」，
+#     主语翻转）。补反向同罪条款 + 省略主语处理规则 + 反向示例。
+_PROMPT_VERSION = 4
 
 # --- LLM 默认参数 ---
 _DEFAULT_MODEL = "gemini-2.0-flash"
@@ -88,12 +90,15 @@ _MERGE_INPUT_LIMIT = 2000     # 新旧各一份
 _ANALYZE_INPUT_LIMIT = 2000
 _DIGEST_INPUT_LIMIT = 5000    # 一天的日记量较大
 _PLAN_JUDGE_INPUT_LIMIT = 1500  # plan 与 new event 各一份
+_SAME_EVENT_INPUT_LIMIT = 1800  # 旧桶与新内容各一份
 
 # --- 各专用调用的 max_tokens 覆盖 ---
 _ANALYZE_MAX_TOKENS = 4096      # Gemini 2.5 thinking 会消耗大量 token，需留足余量
 _DIGEST_MAX_TOKENS = 8192       # 日记拆条内容多，thinking + 输出都需要足量空间
 _PLAN_JUDGE_MAX_TOKENS = 2048   # thinking 模型下 200 token 完全不够
 _PLAN_JUDGE_TEMPERATURE = 0.0   # 判定需确定性
+_SAME_EVENT_MAX_TOKENS = 1024   # 仅返回紧凑 JSON
+_SAME_EVENT_TEMPERATURE = 0.0   # 事件边界判定需确定性
 _DIGEST_TEMPERATURE = 0.0       # 拆条需确定性
 
 # --- 默认情感坐标（与 bucket_manager 中保持一致）---
@@ -105,6 +110,7 @@ _TAGS_MAX = 6            # 只保留原文直接支持的精确标签
 _DOMAIN_MAX = 2          # domain 只选最精确的 1~2 个
 _NAME_MAX_CHARS = 20     # suggested_name 上限
 _PLAN_REASON_MAX = 200   # plan 判定 reason 上限
+_SAME_EVENT_REASON_MAX = 200  # 合并边界判定 reason 上限
 _PARSE_ERR_PREVIEW = 200  # JSON 解析失败时日志中 raw 预览长度
 
 # --- importance 范围（与哲学边界一致）---
@@ -159,9 +165,15 @@ def _perspective_rule(human: str) -> str:
         f"- 人类那一方一律称呼「{human}」（原文里的「你/她/他」都指「{human}」，按名字还原）。\n"
         "- 严禁把「我」和「" + human + "」合并成「双方」「彼此」「对方」「用户」等抹掉视角的中性词。\n"
         "- 谁做的动作、谁的感受，就归到谁名下，不得混同或对调。\n"
-        "示例：『我也在她这里看到了自己没见过的碎片』\n"
+        f"- 反方向同罪：严禁把「{human}」的动作/情绪归给「我」。\n"
+        "- 原文省略主语时，先从紧邻上下文判断归属；判断不了就照抄原句结构、"
+        "保持主语省略——禁止靠猜补一个「我」。\n"
+        "示例一：『我也在她这里看到了自己没见过的碎片』\n"
         f"  ✗ 错（视角丢失）：双方在互动中互相发现对方未知的情感碎片\n"
-        f"  ✓ 对（视角保留）：我在{human}这里看到了自己没见过的碎片"
+        f"  ✓ 对（视角保留）：我在{human}这里看到了自己没见过的碎片\n"
+        f"示例二：『{human}刚下班就来报信——嚎啕大哭后还是把库建好了』\n"
+        f"  ✗ 错（主语翻转）：我嚎啕大哭后把库建好了\n"
+        f"  ✓ 对（归属正确）：{human}嚎啕大哭后把库建好了"
     )
 
 
@@ -342,6 +354,16 @@ class Dehydrator:
         db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
         self.cache_db_path = db_path
         self._cache_conn: sqlite3.Connection = self._init_cache_db()
+        # Keep the cache connection persistent for hot-path lookups, but do not
+        # leak the Windows file handle when a runtime/test instance is released.
+        # ``weakref.finalize`` also runs during interpreter shutdown in reverse
+        # creation order, before an enclosing temporary vault is cleaned up.
+        self._cache_finalizer = weakref.finalize(self, self._cache_conn.close)
+
+    def close(self) -> None:
+        """Close the persistent cache connection; safe to call repeatedly."""
+
+        self._cache_finalizer()
 
     def _init_cache_db(self) -> sqlite3.Connection:
         """Open (or create) the dehydration cache DB; return a persistent connection."""
@@ -531,7 +553,11 @@ class Dehydrator:
         if self.thinking_budget is not None:
             payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": self.thinking_budget}
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            r = await client.post(url, params={"key": self.api_key}, json=payload)
+            r = await client.post(
+                url,
+                headers={"x-goog-api-key": self.api_key},
+                json=payload,
+            )
             r.raise_for_status()
         data = r.json()
         candidates = data.get("candidates", [])
@@ -978,7 +1004,7 @@ class Dehydrator:
         调用 LLM API 执行日记整理。
         """
         raw = await self._chat(
-            DIGEST_PROMPT,
+            DIGEST_PROMPT + _perspective_rule(self.human),
             content[:_DIGEST_INPUT_LIMIT],
             max_tokens=_DIGEST_MAX_TOKENS,
             temperature=_DIGEST_TEMPERATURE,
@@ -1076,3 +1102,44 @@ class Dehydrator:
         except Exception as e:
             logger.warning(f"judge_plan_resolution failed: {e}")
             return {"resolved": False, "confidence": 0.0, "reason": str(e)}
+
+    async def judge_same_event(self, old_memory: str, new_content: str) -> dict:
+        """保守判断两段内容是否属于同一个具体事件。
+
+        主题相似不足以合并；只有后者是前者的补充、进展、纠正或重复表述时
+        才返回 same_event=True。API 不可用或解析失败时保守返回 False。
+        """
+        if old_memory.strip() == new_content.strip():
+            return {"same_event": True, "confidence": 1.0, "reason": "正文完全相同"}
+        if not self.api_available:
+            return {"same_event": False, "confidence": 0.0, "reason": "API 不可用"}
+        system = (
+            "你是一个保守的记忆事件边界判定器。判断新内容与旧记忆是否描述同一个具体事件。"
+            "只有新内容是旧事件的补充、进展、纠正或重复表述时才能判为 true。"
+            "仅主题、人物、情绪或 tags 相似必须判为 false。"
+            "日期不同、场景不同、关键动作不同，或两段各自已是语义闭合的独立事件，必须判为 false。"
+            "有疑问时一律 false。只返回严格 JSON："
+            '{"same_event": true/false, "confidence": 0~1, "reason": "..."}。'
+        )
+        user = (
+            f"OLD MEMORY:\n{old_memory[:_SAME_EVENT_INPUT_LIMIT]}\n\n"
+            f"NEW CONTENT:\n{new_content[:_SAME_EVENT_INPUT_LIMIT]}"
+        )
+        try:
+            raw = await self._chat(
+                system,
+                user,
+                max_tokens=_SAME_EVENT_MAX_TOKENS,
+                temperature=_SAME_EVENT_TEMPERATURE,
+            )
+            if not raw:
+                return {"same_event": False, "confidence": 0.0, "reason": "空响应"}
+            data = json.loads(self._strip_md_fence(raw))
+            return {
+                "same_event": parse_bool(data.get("same_event", False), default=False),
+                "confidence": float(data.get("confidence", 0.0)),
+                "reason": str(data.get("reason", ""))[:_SAME_EVENT_REASON_MAX],
+            }
+        except Exception as e:
+            logger.warning(f"judge_same_event failed: {e}")
+            return {"same_event": False, "confidence": 0.0, "reason": str(e)}

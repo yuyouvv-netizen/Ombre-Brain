@@ -20,6 +20,8 @@ def _prepare_image(root: Path, source: str = "IMAGE = 'one'\n") -> None:
     (root / "frontend").mkdir(parents=True)
     (root / "frontend" / "dashboard.html").write_text("<h1>image</h1>\n", encoding="utf-8")
     (root / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+    (root / "requirements.txt").write_text("package>=1\n", encoding="utf-8")
+    (root / "requirements.lock.txt").write_text("package==1\n", encoding="utf-8")
     (root / "config.default.yaml").write_text("buckets_dir: ./buckets\n", encoding="utf-8")
 
 
@@ -57,18 +59,29 @@ def test_same_version_changed_image_reseeds_but_unchanged_image_preserves_hot_up
     assert first.returncode == 0, first.stdout + first.stderr
     assert (code / "src" / "server.py").read_text(encoding="utf-8") == "IMAGE = 'one'\n"
     assert (code / ".seeded_image_fingerprint").is_file()
+    assert (code / "requirements.txt").read_text(encoding="utf-8") == "package>=1\n"
+    assert (code / "requirements.lock.txt").read_text(encoding="utf-8") == "package==1\n"
 
     # Dashboard hot update: image did not change, so the persisted runtime must win.
     (code / "src" / "server.py").write_text("HOT_UPDATE = True\n", encoding="utf-8")
+    (code / "requirements.txt").write_text("hot-package>=1\n", encoding="utf-8")
+    (code / "requirements.lock.txt").write_text("hot-package==1\n", encoding="utf-8")
     unchanged = _run(image, code, data)
     assert unchanged.returncode == 0, unchanged.stdout + unchanged.stderr
     assert (code / "src" / "server.py").read_text(encoding="utf-8") == "HOT_UPDATE = True\n"
+    assert (code / "requirements.lock.txt").read_text(encoding="utf-8") == "hot-package==1\n"
 
     # A locally rebuilt image with the same VERSION must still replace the old baseline.
     (image / "src" / "server.py").write_text("IMAGE = 'two'\n", encoding="utf-8")
+    (image / "requirements.txt").write_text("package>=2\n", encoding="utf-8")
+    (image / "requirements.lock.txt").write_text("package==2\n", encoding="utf-8")
     rebuilt = _run(image, code, data)
     assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
     assert (code / "src" / "server.py").read_text(encoding="utf-8") == "IMAGE = 'two'\n"
+    assert (code / "requirements.txt").read_text(encoding="utf-8") == "package>=2\n"
+    assert (code / "requirements.lock.txt").read_text(encoding="utf-8") == "package==2\n"
+    assert (code / "_prev" / "requirements.txt").read_text(encoding="utf-8") == "hot-package>=1\n"
+    assert (code / "_prev" / "requirements.lock.txt").read_text(encoding="utf-8") == "hot-package==1\n"
     assert "代码指纹" in rebuilt.stdout
 
 
@@ -88,6 +101,28 @@ def test_non_active_legacy_data_app_is_reported_without_deletion(tmp_path):
     assert "旧布局代码遗留" in result.stdout
     assert "未被当前进程使用" in result.stdout
     assert (legacy / "src" / "server.py").is_file()
+
+
+def test_directory_config_path_fails_closed_without_deleting_contents(tmp_path):
+    image = tmp_path / "image"
+    code = tmp_path / "code" / "_app"
+    data = tmp_path / "data"
+    mistaken_config = data / "mistaken-config"
+    remembered = mistaken_config / "permanent" / "must-survive.md"
+    _prepare_image(image)
+    remembered.parent.mkdir(parents=True)
+    remembered.write_text("irreplaceable memory\n", encoding="utf-8")
+
+    result = _run(
+        image,
+        code,
+        data,
+        OMBRE_CONFIG_PATH=str(mistaken_config),
+    )
+
+    assert result.returncode == 1
+    assert "refusing to delete" in result.stdout
+    assert remembered.read_text(encoding="utf-8") == "irreplaceable memory\n"
 
 
 def test_image_seed_failure_keeps_existing_runtime_tree(tmp_path):
@@ -114,10 +149,14 @@ def test_crash_rollback_is_not_immediately_overwritten_by_same_image(tmp_path):
 
     # Same VERSION, new image content. Seeding keeps the healthy prior runtime in _prev.
     (image / "src" / "server.py").write_text("IMAGE = 'crashing'\n", encoding="utf-8")
+    (image / "requirements.txt").write_text("crashing-package>=2\n", encoding="utf-8")
+    (image / "requirements.lock.txt").write_text("crashing-package==2\n", encoding="utf-8")
     assert _run(image, code, data).returncode == 0
     assert (code / "_prev" / "src" / "server.py").read_text(encoding="utf-8") == (
         "IMAGE = 'known-good'\n"
     )
+    assert (code / "_prev" / "requirements.txt").read_text(encoding="utf-8") == "package>=1\n"
+    assert (code / "_prev" / "requirements.lock.txt").read_text(encoding="utf-8") == "package==1\n"
 
     # Simulate two failed service starts. The next entrypoint pass must restore _prev
     # and treat it as a persisted override instead of reseeding the same bad image.
@@ -130,3 +169,5 @@ def test_crash_rollback_is_not_immediately_overwritten_by_same_image(tmp_path):
     assert (code / "src" / "server.py").read_text(encoding="utf-8") == (
         "IMAGE = 'known-good'\n"
     )
+    assert (code / "requirements.txt").read_text(encoding="utf-8") == "package>=1\n"
+    assert (code / "requirements.lock.txt").read_text(encoding="utf-8") == "package==1\n"

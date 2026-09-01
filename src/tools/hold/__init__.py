@@ -5,7 +5,7 @@ tools/hold/__init__.py — hold 工具入口
 
 hold 是「我把这件事/这个感受存进我的记忆」。这个文件按入参把请求
 路由到三种分支：feel（写第一人称感受）、pinned（钉为永久核心准则）、
-core（普通存入 + 自动合并）。
+core（普通存入 + 精确重复幂等复用）。
 
 关键行为：
 - null-safe 兜底；先做 content / 字节上限校验，再分支
@@ -29,7 +29,6 @@ from .. import _runtime as rt
 from .._common import (
     check_content_size,
     check_metadata_size,
-    enforce_high_importance_quota,
     enforce_pinned_quota,
 )
 from .feel import store_feel
@@ -126,9 +125,8 @@ async def dispatch(
     if pinned and not feel:
         pinned = await enforce_pinned_quota(True)
 
-    # importance≥9 配额检查（OB-W003 软警告 / OB-I001 自动降级）
-    if not pinned and not feel:
-        importance = await enforce_high_importance_quota(importance)
+    # 普通桶的 importance 配额在 merge_or_create 的最终 merge/create
+    # 事务内检查；这里预检查会在“合并到已占位桶”时产生假降级提示。
 
     # valence/arousal 越界回退到自动打标（OB-W002 由 bucket_manager 在 clamp 时 push；
     # 这里的 -1 咨兵语义是"她/他未传"，越界则忽略，让 LLM analyze 决定）

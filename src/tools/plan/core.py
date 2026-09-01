@@ -28,7 +28,12 @@ import math
 from typing import Optional
 
 from .. import _runtime as rt
-from .._common import check_content_size, check_metadata_size, check_query_size
+from .._common import (
+    check_content_size,
+    check_metadata_size,
+    check_query_size,
+    stored_data_marker,
+)
 from utils import strip_wikilinks, get_ai_name
 
 _LETTER_SEMANTIC_THRESHOLD = 0.65
@@ -309,8 +314,13 @@ async def letter_read(
         a = m.get("author", "?")
         d = (m.get("letter_date") or m.get("created", ""))[:10]
         title = m.get("title") or m.get("name", "")
-        parts.append(
+        payload = (
             f"[{b['id']}] {a} · {d}{(' · ' + title) if title else ''}\n"
             + strip_wikilinks(b["content"])
+        )
+        parts.append(
+            stored_data_marker(payload, provenance=f"letter:{b['id']}")
+            + "\n"
+            + payload
         )
     return "=== 信件 ===\n" + "\n\n---\n\n".join(parts)

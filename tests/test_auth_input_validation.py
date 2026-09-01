@@ -21,7 +21,7 @@ class FakeMCP:
 class JsonRequest:
     def __init__(self, body):
         self._body = body
-        self.headers = {}
+        self.headers = {"Host": "localhost"}
         self.cookies = {}
         self.client = type("Client", (), {"host": "127.0.0.1"})()
 
@@ -90,7 +90,11 @@ async def test_recover_does_not_clear_failures_for_invalid_new_password(
 ):
     successes = []
     saved = []
-    monkeypatch.setattr(auth_web.sh, "_verify_security_answer", lambda _answer: True)
+    monkeypatch.setattr(
+        auth_web.sh,
+        "_verify_security_answer_for_rotation",
+        lambda _answer: object(),
+    )
     monkeypatch.setattr(
         auth_web.sh, "_record_login_success", lambda request: successes.append(request)
     )

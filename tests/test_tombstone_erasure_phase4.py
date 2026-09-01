@@ -2,7 +2,7 @@ import frontmatter
 import pytest
 
 from bucket_manager import BucketManager
-from projection_mirror import TraceCatalogProjection
+from ombrebrain.projection.projection_mirror import TraceCatalogProjection
 
 
 @pytest.mark.asyncio

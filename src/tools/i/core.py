@@ -23,7 +23,7 @@ I 是 OB 的自我感知层：AI 把关于自己的观察写下来（本质/规�
 from typing import Optional
 
 from .. import _runtime as rt
-from .._common import check_content_size, check_metadata_size
+from .._common import check_content_size, check_metadata_size, stored_data_marker
 
 _VALID_ASPECTS = {"nature", "values", "patterns", "limits", "becoming", "uncertainty", "stance"}
 
@@ -123,6 +123,12 @@ async def _read_i(limit: int) -> str:
         ts = (meta.get("last_active") or "")[:10]
         aspect_label = f"[{aspect_tag}] " if aspect_tag else ""
         text = (b.get("content") or "").strip()
-        lines.append(f"\n{ts} {aspect_label}{b['id']}\n{text}")
+        payload = f"{ts} {aspect_label}{b['id']}\n{text}"
+        lines.append(
+            "\n"
+            + stored_data_marker(payload, provenance=f"I:{b['id']}")
+            + "\n"
+            + payload
+        )
 
     return "\n".join(lines)

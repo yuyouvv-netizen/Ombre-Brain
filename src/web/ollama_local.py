@@ -25,6 +25,8 @@ web/ollama_local.py — 本地向量化「一键搭建」(非 Docker 用户)
 
 import os
 import sys
+import hashlib
+import hmac
 import shutil
 import platform
 import asyncio
@@ -48,8 +50,8 @@ _LOCAL_BASE = f"http://127.0.0.1:{_OLLAMA_PORT}"
 
 # ollama 运行时（二进制/安装器）下载镜像。模型 registry 的镜像在 embedding.py 里另算。
 _BIN_MIRRORS = {
-    "official": "https://ollama.com/download",
-    "github": "https://github.com/ollama/ollama/releases/latest/download",
+    "official": "https://github.com/ollama/ollama/releases/download/v0.32.0",
+    "github": "https://github.com/ollama/ollama/releases/download/v0.32.0",
 }
 
 # 各系统官方安装命令（自动装失败时回退给用户手动跑）
@@ -173,8 +175,22 @@ def _recommend(in_docker: bool, installed: bool, running: bool) -> str:
 # 安装（线程里跑，免提权）
 # ============================================================
 
-_GH_RELEASES = "https://github.com/ollama/ollama/releases/latest/download"
-_OLLAMA_DL = "https://ollama.com/download"
+_OLLAMA_VERSION = "v0.32.0"
+_GH_RELEASES = (
+    f"https://github.com/ollama/ollama/releases/download/{_OLLAMA_VERSION}"
+)
+_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_ARCHIVE_MEMBERS = 20_000
+_MAX_ARCHIVE_MEMBER_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_EXTRACTED_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_COMPRESSION_RATIO = 2_000.0
+_ARTIFACT_SHA256 = {
+    ("windows", "amd64"): "07846c9074875e4d47518d41636880a9d9a40a7e1483659ac00be7aec082de06",
+    ("macos", "amd64"): "0762f0a5c086f77a5fceda3ec1e6a0d96500a114a8adc82856224bbc8f3a9d7f",
+    ("macos", "arm64"): "0762f0a5c086f77a5fceda3ec1e6a0d96500a114a8adc82856224bbc8f3a9d7f",
+    ("linux", "amd64"): "56362d7609dfa9e35aaebb7c9cab25605d8f0528ec3d5d585dc83d6642002bab",
+    ("linux", "arm64"): "2c1fbc47a5351c74f5400d7e4b1104bb470291af5d2f425c37c151487a477ad6",
+}
 
 
 def _bin_url(mirror: str, osk: str, arch: str) -> str:
@@ -193,10 +209,8 @@ def _bin_url(mirror: str, osk: str, arch: str) -> str:
         name = "Ollama-darwin.zip"
     else:
         name = f"ollama-linux-{arch}.tar.zst"
-    if mirror == "official" and osk in ("windows", "macos"):
-        base = _OLLAMA_DL
-    elif mirror in ("official", "github"):
-        base = _GH_RELEASES          # linux 强制走 GitHub Releases；github 同理
+    if mirror in ("official", "github"):
+        base = _GH_RELEASES
     else:
         base = mirror.rstrip("/")     # 自定义镜像前缀（如 github 代理）
     return f"{base}/{name}"
@@ -214,7 +228,22 @@ def _safe_archive_target(dest: str, member_name: str) -> str:
 
 def _safe_extract_zip(zf: zipfile.ZipFile, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
-    for info in zf.infolist():
+    infos = zf.infolist()
+    if len(infos) > _MAX_ARCHIVE_MEMBERS:
+        raise ValueError("archive contains too many members")
+    total = 0
+    for info in infos:
+        if info.file_size < 0 or info.file_size > _MAX_ARCHIVE_MEMBER_BYTES:
+            raise ValueError(f"archive member is too large: {info.filename!r}")
+        total += info.file_size
+        if total > _MAX_EXTRACTED_BYTES:
+            raise ValueError("archive expands beyond the byte limit")
+        if (
+            info.file_size > 0
+            and info.compress_size > 0
+            and info.file_size / info.compress_size > _MAX_COMPRESSION_RATIO
+        ):
+            raise ValueError(f"suspicious compression ratio: {info.filename!r}")
         target = _safe_archive_target(dest, info.filename)
         mode = (info.external_attr >> 16) & 0o170000
         if mode in (stat.S_IFLNK, stat.S_IFSOCK, stat.S_IFIFO, stat.S_IFCHR, stat.S_IFBLK):
@@ -229,7 +258,17 @@ def _safe_extract_zip(zf: zipfile.ZipFile, dest: str) -> None:
 
 def _safe_extract_tar(tf, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
+    members = 0
+    total = 0
     for member in tf:
+        members += 1
+        if members > _MAX_ARCHIVE_MEMBERS:
+            raise ValueError("archive contains too many members")
+        if member.size < 0 or member.size > _MAX_ARCHIVE_MEMBER_BYTES:
+            raise ValueError(f"archive member is too large: {member.name!r}")
+        total += member.size
+        if total > _MAX_EXTRACTED_BYTES:
+            raise ValueError("archive expands beyond the byte limit")
         target = _safe_archive_target(dest, member.name)
         if member.issym() or member.islnk() or member.isdev() or member.isfifo():
             raise ValueError(f"unsafe archive member type: {member.name!r}")
@@ -302,7 +341,12 @@ def _download(url: str, dest: str) -> None:
     req = urllib.request.Request(safe_url, headers={"User-Agent": "OmbreBrain-Setup"})
     # URL scheme is validated above; urllib is used for streaming installer downloads.
     with urllib.request.urlopen(req, timeout=60) as resp:  # nosec B310
+        _validate_download_url(resp.geturl())
         total = int(resp.headers.get("Content-Length") or 0)
+        if total < 0 or total > _MAX_DOWNLOAD_BYTES:
+            raise RuntimeError(
+                f"download exceeds {_MAX_DOWNLOAD_BYTES} byte limit"
+            )
         done = 0
         with open(dest, "wb") as f:
             while True:
@@ -311,6 +355,10 @@ def _download(url: str, dest: str) -> None:
                     break
                 f.write(chunk)
                 done += len(chunk)
+                if done > _MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError(
+                        f"download exceeds {_MAX_DOWNLOAD_BYTES} byte limit"
+                    )
                 if total > 0:
                     _install_state["percent"] = round(done / total * 100, 1)
     _install_state["percent"] = 100.0
@@ -326,8 +374,8 @@ _ARTIFACT_MAGICS = {
 _ARTIFACT_MIN_BYTES = 100 * 1024            # <100KB 基本可判定是错误页/截断
 
 
-def _verify_downloaded_artifact(path: str, osk: str) -> None:
-    """执行/解压前校验下载产物：大小合理 + 文件头匹配。不符抛异常，中止安装。"""
+def _verify_downloaded_artifact(path: str, osk: str, arch: str) -> None:
+    """执行/解压前校验固定发行版的大小、文件头和 SHA-256。"""
     try:
         size = os.path.getsize(path)
     except OSError as e:
@@ -340,6 +388,22 @@ def _verify_downloaded_artifact(path: str, osk: str) -> None:
             head = f.read(8)
         if not any(head.startswith(m) for m in magics):
             raise RuntimeError("下载文件的格式不对（文件头不匹配预期），疑似被劫持/损坏，已中止")
+    digest_key = (osk, arch)
+    if osk == "windows" and digest_key not in _ARTIFACT_SHA256:
+        # The published setup executable is currently x64 and runs under
+        # Windows-on-ARM emulation; it is still the exact same signed artifact.
+        digest_key = ("windows", "amd64")
+    expected = _ARTIFACT_SHA256.get(digest_key)
+    if not expected:
+        raise RuntimeError(
+            f"版本 {_OLLAMA_VERSION} 没有 {osk}/{arch} 的已信任摘要"
+        )
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if not hmac.compare_digest(digest.hexdigest(), expected):
+        raise RuntimeError("Ollama 发行产物 SHA-256 校验失败，已中止")
 
 
 def _install_run(osk: str, arch: str, mirror: str) -> None:
@@ -355,7 +419,7 @@ def _install_run(osk: str, arch: str, mirror: str) -> None:
         if osk == "windows":
             exe = os.path.join(tmpdir, "OllamaSetup.exe")
             _download(url, exe)
-            _verify_downloaded_artifact(exe, osk)   # 执行前先确认是真的安装器
+            _verify_downloaded_artifact(exe, osk, arch)
             _install_state.update(phase="installing", msg="静默安装中（per-user，无需管理员）…")
             # Ollama 的 Windows 安装器（Inno Setup）默认就装到 %LOCALAPPDATA%\Programs\Ollama，
             # per-user、不需管理员。静默装即可；不传 /CURRENTUSER 以免个别版本不允许覆盖而报错。
@@ -369,7 +433,7 @@ def _install_run(osk: str, arch: str, mirror: str) -> None:
         elif osk == "linux":
             tzst = os.path.join(tmpdir, "ollama.tar.zst")
             _download(url, tzst)
-            _verify_downloaded_artifact(tzst, osk)   # 解压前先确认是真的 zstd 包
+            _verify_downloaded_artifact(tzst, osk, arch)
             _install_state.update(phase="extracting", msg="解压到用户目录（无需 sudo）…")
             root = _user_install_root()
             os.makedirs(root, exist_ok=True)
@@ -385,7 +449,7 @@ def _install_run(osk: str, arch: str, mirror: str) -> None:
         elif osk == "macos":
             zp = os.path.join(tmpdir, "Ollama-darwin.zip")
             _download(url, zp)
-            _verify_downloaded_artifact(zp, osk)   # 解压前先确认是真的 zip
+            _verify_downloaded_artifact(zp, osk, arch)
             _install_state.update(phase="extracting", msg="解压 App 到用户目录…")
             root = _user_install_root()
             os.makedirs(root, exist_ok=True)

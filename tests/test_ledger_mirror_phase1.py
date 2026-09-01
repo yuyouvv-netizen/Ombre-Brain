@@ -5,7 +5,7 @@ import pytest
 
 
 def test_append_event_writes_jsonl_with_hash_and_sequence(tmp_path):
-    from ledger_mirror import LedgerMirror
+    from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
 
     ledger = LedgerMirror(tmp_path / "events.jsonl")
 
@@ -129,7 +129,7 @@ async def test_bucket_manager_exposes_read_only_ledger_integrity_report(
 
 
 def test_iter_events_skips_corrupt_partial_lines_and_integrity_reports_them(tmp_path):
-    from ledger_mirror import LedgerMirror
+    from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
 
     ledger = LedgerMirror(tmp_path / "events.jsonl")
     ledger.append_event(

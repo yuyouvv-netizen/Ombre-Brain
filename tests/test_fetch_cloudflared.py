@@ -3,6 +3,7 @@
 只测纯逻辑（不真的联网下载）：架构名映射、release URL 拼接、重试后成功/失败。
 """
 import importlib.util
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -28,20 +29,46 @@ def test_arch_mapping_rejects_unknown():
 
 def test_release_url_shape():
     url = fc.release_url("amd64")
-    assert url.startswith("https://github.com/cloudflare/cloudflared/releases/latest/download/")
+    assert url.startswith("https://github.com/cloudflare/cloudflared/releases/download/")
+    assert f"/{fc._CLOUDFLARED_VERSION}/" in url
+    assert "/latest/" not in url
     assert url.endswith("cloudflared-linux-amd64")
+
+
+@pytest.mark.parametrize("arch", ["386", "amd64", "arm", "arm64"])
+def test_each_supported_arch_has_a_pinned_sha256(arch):
+    digest = fc.expected_sha256(arch)
+
+    assert len(digest) == 64
+    assert int(digest, 16) >= 0
+
+
+def test_expected_sha256_rejects_unknown_arch():
+    with pytest.raises(SystemExit):
+        fc.expected_sha256("sparc64")
 
 
 def test_download_retries_then_succeeds(monkeypatch, tmp_path):
     calls = {"n": 0}
+    payload = b"BINARY"
 
     class _FakeResp:
+        headers = {}
+
+        def __init__(self):
+            self._read = False
+
         def __enter__(self):
             return self
+
         def __exit__(self, *a):
             return False
+
         def read(self, *_a):
-            return b""
+            if self._read:
+                return b""
+            self._read = True
+            return payload
 
     def _fake_urlopen(req, timeout=0):
         calls["n"] += 1
@@ -49,17 +76,19 @@ def test_download_retries_then_succeeds(monkeypatch, tmp_path):
             raise OSError("502 Bad Gateway")
         return _FakeResp()
 
-    def _fake_copy(src, dst):
-        dst.write(b"BINARY")
-
     monkeypatch.setattr(fc.urllib.request, "urlopen", _fake_urlopen)
-    monkeypatch.setattr(fc.shutil, "copyfileobj", _fake_copy)
     monkeypatch.setattr(fc.time, "sleep", lambda *_a: None)
 
     dest = tmp_path / "cloudflared"
-    fc.download("https://example/cf", str(dest), attempts=5)
+    fc.download(
+        "https://example/cf",
+        str(dest),
+        expected_digest=hashlib.sha256(payload).hexdigest(),
+        attempts=5,
+    )
     assert calls["n"] == 3
-    assert dest.read_bytes() == b"BINARY"
+    assert dest.read_bytes() == payload
+    assert not (tmp_path / "cloudflared.part").exists()
 
 
 def test_download_fails_after_all_retries(monkeypatch, tmp_path):
@@ -70,4 +99,154 @@ def test_download_fails_after_all_retries(monkeypatch, tmp_path):
     monkeypatch.setattr(fc.time, "sleep", lambda *_a: None)
 
     with pytest.raises(SystemExit):
-        fc.download("https://example/cf", str(tmp_path / "cloudflared"), attempts=3)
+        fc.download(
+            "https://example/cf",
+            str(tmp_path / "cloudflared"),
+            expected_digest=hashlib.sha256(b"expected").hexdigest(),
+            attempts=3,
+        )
+
+
+def test_checksum_mismatch_retries_without_replacing_existing_binary(
+    monkeypatch, tmp_path
+):
+    calls = {"n": 0}
+
+    class _FakeResp:
+        headers = {}
+
+        def __init__(self):
+            self._read = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            if self._read:
+                return b""
+            self._read = True
+            return b"tampered"
+
+    def _fake_urlopen(_req, timeout=0):
+        calls["n"] += 1
+        return _FakeResp()
+
+    monkeypatch.setattr(fc.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(fc.time, "sleep", lambda *_a: None)
+
+    dest = tmp_path / "cloudflared"
+    dest.write_bytes(b"known-good")
+
+    with pytest.raises(SystemExit, match="SHA-256"):
+        fc.download(
+            "https://example/cf",
+            str(dest),
+            expected_digest=hashlib.sha256(b"expected").hexdigest(),
+            attempts=2,
+        )
+
+    assert calls["n"] == 2
+    assert dest.read_bytes() == b"known-good"
+    assert not (tmp_path / "cloudflared.part").exists()
+
+
+def test_download_rejects_oversized_declared_length(monkeypatch, tmp_path):
+    class _FakeResp:
+        headers = {"Content-Length": "5"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read(*_args):
+            raise AssertionError("body must not be read after oversized declaration")
+
+    monkeypatch.setattr(fc, "_MAX_DOWNLOAD_BYTES", 4)
+    monkeypatch.setattr(
+        fc.urllib.request,
+        "urlopen",
+        lambda _request, timeout=0: _FakeResp(),
+    )
+    monkeypatch.setattr(fc.time, "sleep", lambda *_a: None)
+    dest = tmp_path / "cloudflared"
+
+    with pytest.raises(SystemExit):
+        fc.download(
+            "https://example/cf",
+            str(dest),
+            expected_digest=hashlib.sha256(b"1234").hexdigest(),
+            attempts=1,
+        )
+
+    assert not dest.exists()
+    assert not (tmp_path / "cloudflared.part").exists()
+
+
+def test_download_rejects_oversized_stream_without_content_length(
+    monkeypatch, tmp_path
+):
+    class _FakeResp:
+        headers = {}
+
+        def __init__(self):
+            self._chunks = iter((b"123", b"45", b""))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return next(self._chunks)
+
+    monkeypatch.setattr(fc, "_MAX_DOWNLOAD_BYTES", 4)
+    monkeypatch.setattr(
+        fc.urllib.request,
+        "urlopen",
+        lambda _request, timeout=0: _FakeResp(),
+    )
+    monkeypatch.setattr(fc.time, "sleep", lambda *_a: None)
+    dest = tmp_path / "cloudflared"
+
+    with pytest.raises(SystemExit):
+        fc.download(
+            "https://example/cf",
+            str(dest),
+            expected_digest=hashlib.sha256(b"1234").hexdigest(),
+            attempts=1,
+        )
+
+    assert not dest.exists()
+    assert not (tmp_path / "cloudflared.part").exists()
+
+
+def test_main_binds_release_url_to_matching_arch_digest(monkeypatch, tmp_path):
+    captured = {}
+
+    monkeypatch.setattr(fc, "cloudflared_arch", lambda: "arm64")
+
+    def _fake_download(url, dest, *, expected_digest, attempts=5):
+        captured.update(
+            url=url,
+            dest=dest,
+            expected_digest=expected_digest,
+            attempts=attempts,
+        )
+
+    monkeypatch.setattr(fc, "download", _fake_download)
+    dest = str(tmp_path / "cloudflared")
+
+    assert fc.main(["fetch_cloudflared.py", dest]) == 0
+    assert captured == {
+        "url": fc.release_url("arm64"),
+        "dest": dest,
+        "expected_digest": fc.expected_sha256("arm64"),
+        "attempts": 5,
+    }

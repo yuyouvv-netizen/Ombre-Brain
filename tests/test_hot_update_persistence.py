@@ -22,6 +22,7 @@ def _restore():
 
 
 def _setup(monkeypatch, *, in_docker, repo_root, buckets_dir):
+    monkeypatch.delenv("RENDER", raising=False)
     monkeypatch.setattr(sh, "_in_docker_cache", in_docker)
     monkeypatch.setattr(sh, "repo_root", repo_root)
     monkeypatch.setattr(sh, "config", {"buckets_dir": buckets_dir})
@@ -97,3 +98,19 @@ def test_mountinfo_decodes_escaped_spaces(tmp_path):
     assert meta._path_is_mounted_volume(
         "/app/code volume/_app", str(mountinfo)
     ) is True
+
+
+def test_render_hot_update_is_ephemeral_even_though_runtime_is_not_docker(monkeypatch):
+    _setup(
+        monkeypatch,
+        in_docker=False,
+        repo_root="/opt/render/project/src",
+        buckets_dir="/opt/render/project/src/buckets",
+    )
+    monkeypatch.setenv("RENDER", "true")
+
+    res = meta._hot_update_persistence()
+
+    assert res["persistent"] is False
+    assert res["mode"] == "render-ephemeral"
+    assert "正式部署" in res["note"]

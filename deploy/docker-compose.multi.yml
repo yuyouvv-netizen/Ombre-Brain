@@ -20,6 +20,8 @@ x-common-env: &common-env
   OMBRE_EMBED_API_KEY: ${OMBRE_EMBED_API_KEY:-}
   OMBRE_EMBED_BASE_URL: ${OMBRE_EMBED_BASE_URL:-}
   OMBRE_EMBED_MODEL: ${OMBRE_EMBED_MODEL:-}
+  # Trust only the last-hop reverse proxy CIDRs supplied by the operator.
+  OMBRE_TRUSTED_PROXY_CIDRS: "${OMBRE_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}"
   # 跳过 SRV edge discovery，兼容 VPN DNS；双 region 保留 Tunnel 冗余。
   TUNNEL_EDGE: ${TUNNEL_EDGE-region1.v2.argotunnel.com:7844,region2.v2.argotunnel.com:7844}
   TUNNEL_TRANSPORT_PROTOCOL: ${TUNNEL_TRANSPORT_PROTOCOL:-http2}
@@ -32,11 +34,11 @@ services:
     container_name: ombre-ming
     restart: unless-stopped
     ports:
-      - "18001:8000"
+      - "${OMBRE_BIND_ADDRESS:-127.0.0.1}:18001:8000"
     environment:
       <<: *common-env
       OMBRE_OWNER_NAME: 小明
-      OMBRE_DASHBOARD_PASSWORD: ${OMBRE_MING_PASSWORD:-}
+      OMBRE_DASHBOARD_PASSWORD: ${OMBRE_MING_PASSWORD:?OMBRE_MING_PASSWORD is required}
       OMBRE_HOST_VAULT_DIR: ${OMBRE_MING_VAULT_DIR:-}
     volumes:
       - type: bind
@@ -50,11 +52,11 @@ services:
     container_name: ombre-hong
     restart: unless-stopped
     ports:
-      - "18002:8000"
+      - "${OMBRE_BIND_ADDRESS:-127.0.0.1}:18002:8000"
     environment:
       <<: *common-env
       OMBRE_OWNER_NAME: 小红
-      OMBRE_DASHBOARD_PASSWORD: ${OMBRE_HONG_PASSWORD:-}
+      OMBRE_DASHBOARD_PASSWORD: ${OMBRE_HONG_PASSWORD:?OMBRE_HONG_PASSWORD is required}
       OMBRE_HOST_VAULT_DIR: ${OMBRE_HONG_VAULT_DIR:-}
     volumes:
       - type: bind

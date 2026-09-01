@@ -16,6 +16,7 @@ def _restore(monkeypatch):
 
 def test_bare_metal_is_local_persistent(monkeypatch):
     monkeypatch.setattr(sh, "_in_docker_cache", False)
+    monkeypatch.delenv("RENDER", raising=False)
     res = sh.data_dir_persistence("/home/me/ombre/buckets")
     assert res["persistent"] is True
     assert res["mode"] == "local"
@@ -23,6 +24,7 @@ def test_bare_metal_is_local_persistent(monkeypatch):
 
 def test_docker_unmounted_is_ephemeral(monkeypatch):
     monkeypatch.setattr(sh, "_in_docker_cache", True)
+    monkeypatch.delenv("RENDER", raising=False)
     monkeypatch.setattr(sh.os.path, "ismount", lambda p: False)
     res = sh.data_dir_persistence("/app/buckets")
     assert res["persistent"] is False
@@ -32,6 +34,7 @@ def test_docker_unmounted_is_ephemeral(monkeypatch):
 
 def test_docker_mounted_is_persistent(monkeypatch):
     monkeypatch.setattr(sh, "_in_docker_cache", True)
+    monkeypatch.delenv("RENDER", raising=False)
     monkeypatch.setattr(sh.os.path, "ismount", lambda p: True)
     monkeypatch.delenv("OMBRE_HOST_VAULT_DIR", raising=False)
     res = sh.data_dir_persistence("/app/buckets")
@@ -41,8 +44,52 @@ def test_docker_mounted_is_persistent(monkeypatch):
 
 def test_docker_explicit_host_mount(monkeypatch):
     monkeypatch.setattr(sh, "_in_docker_cache", True)
+    monkeypatch.delenv("RENDER", raising=False)
     monkeypatch.setattr(sh.os.path, "ismount", lambda p: True)
     monkeypatch.setenv("OMBRE_HOST_VAULT_DIR", "/host/ombre")
     res = sh.data_dir_persistence("/app/buckets")
     assert res["persistent"] is True
     assert res["mode"] == "host_mount"
+
+
+def test_render_without_disk_is_not_mistaken_for_bare_metal(monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(sh, "_in_docker_cache", False)
+    monkeypatch.setattr(sh.os.path, "ismount", lambda _path: False)
+
+    res = sh.data_dir_persistence("/opt/render/project/src/buckets")
+
+    assert res["persistent"] is False
+    assert res["mode"] == "render_ephemeral"
+    assert "Persistent Disk" in res["note"]
+
+
+def test_render_disk_is_persistent(monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(sh, "_in_docker_cache", False)
+    monkeypatch.setattr(sh.os.path, "ismount", lambda _path: True)
+
+    res = sh.data_dir_persistence("/opt/render/project/src/buckets")
+
+    assert res["persistent"] is True
+    assert res["mode"] == "render_disk"
+
+
+def test_render_subdirectory_below_disk_mount_is_persistent(monkeypatch, tmp_path):
+    disk = tmp_path / "render-disk"
+    buckets = disk / "nested" / "buckets"
+    buckets.mkdir(parents=True)
+    disk_abs = sh.os.path.normcase(sh.os.path.realpath(str(disk)))
+
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(sh, "_in_docker_cache", False)
+    monkeypatch.setattr(
+        sh.os.path,
+        "ismount",
+        lambda path: sh.os.path.normcase(sh.os.path.realpath(path)) == disk_abs,
+    )
+
+    res = sh.data_dir_persistence(str(buckets))
+
+    assert res["persistent"] is True
+    assert res["mode"] == "render_disk"

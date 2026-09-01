@@ -15,35 +15,23 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 from typing import Any, Mapping
 
 import yaml
 from starlette.requests import Request
 from starlette.responses import Response
 
-from deployment_profile import (
+from ombrebrain.security.deployment_profile import (
     build_profile_patch,
     effective_configuration_report,
     profile_catalog,
     validate_profile_patch,
 )
-from utils import config_file_path
+from utils import atomic_update_config_yaml, config_file_path, read_config_yaml
 
 from . import _shared as sh
 
 logger = logging.getLogger("ombre_brain")
-
-
-def _read_persisted_config(path: str) -> dict[str, Any]:
-    """读取原始持久配置；解析失败显式抛出，由路由翻译成人话。"""
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle) or {}
-    if not isinstance(raw, dict):
-        raise ValueError("config.yaml 顶层必须是对象")
-    return raw
 
 
 def _merge_patch(base: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
@@ -54,37 +42,12 @@ def _merge_patch(base: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[str,
             old = merged.get("deployment")
             deployment = dict(old) if isinstance(old, Mapping) else {}
             deployment.update(dict(value))
+            if deployment.get("profile") == "local":
+                deployment.pop("public_url", None)
             merged[key] = deployment
         else:
             merged[key] = value
     return merged
-
-
-def _atomic_write_yaml(path: str, payload: Mapping[str, Any]) -> None:
-    """在同目录原子替换配置，避免容器重启时读到半份 YAML。"""
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    temp_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=parent, prefix=".config-", suffix=".tmp", delete=False
-        ) as handle:
-            temp_path = handle.name
-            yaml.safe_dump(dict(payload), handle, allow_unicode=True, sort_keys=False)
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            os.chmod(temp_path, 0o600)
-        except OSError as exc:
-            logger.warning("无法收紧临时配置文件权限，将继续原子替换: %s", exc)
-        os.replace(temp_path, path)
-    except Exception:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except OSError as cleanup_exc:
-                logger.warning("清理向导临时配置失败: %s", cleanup_exc)
-        raise
 
 
 def _report(path: str, persisted: Mapping[str, Any]) -> dict[str, Any]:
@@ -126,7 +89,7 @@ def register(mcp: Any) -> None:
             return err
         path = config_file_path()
         try:
-            persisted = _read_persisted_config(path)
+            persisted = read_config_yaml()
             return JSONResponse({"ok": True, "profiles": profile_catalog(), "report": _report(path, persisted)})
         except (OSError, ValueError, yaml.YAMLError) as exc:
             logger.error("读取首次部署配置失败: %s", exc)
@@ -166,17 +129,25 @@ def register(mcp: Any) -> None:
             if issues:
                 return JSONResponse({"ok": False, "issues": issues}, status_code=400)
             path = config_file_path()
-            persisted = _read_persisted_config(path)
-            merged = _merge_patch(persisted, patch)
-            _atomic_write_yaml(path, merged)
+            # 与 Dashboard 其余配置入口共用同一把读改写锁及 bind-mount
+            # EBUSY 兼容路径。旧实现先读后 os.replace，不但会在 Docker
+            # 单文件挂载上稳定失败，也可能覆盖同时保存的其他配置。
+            merged = atomic_update_config_yaml(
+                lambda persisted: persisted.update(_merge_patch(persisted, patch))
+            )
             # OAuth/transport 都在启动时绑定；这里只更新“期望值”，不谎报热切换成功。
             report = _report(path, merged)
+            restart_required = bool(report.get("restart_required"))
             return JSONResponse({
                 "ok": True,
                 "saved": patch,
                 "report": report,
-                "restart_required": True,
-                "message": "部署模式已保存，重启服务后生效。",
+                "restart_required": restart_required,
+                "message": (
+                    "部署模式已保存，重启服务后生效。"
+                    if restart_required
+                    else "部署模式已保存，当前进程已使用相同配置。"
+                ),
             })
         except (ValueError, TypeError, OSError, yaml.YAMLError) as exc:
             logger.error("保存首次部署配置失败: %s", exc)

@@ -23,16 +23,24 @@ import secrets
 import time as _time_mod
 import urllib.parse as _urlparse
 import base64 as _base64
+from collections import OrderedDict as _OrderedDict, deque as _deque
 import hashlib as _hashlib_oauth
 import hmac as _hmac
 import html as _html_escape
 import ipaddress as _ipaddress
 import re as _re
+import threading as _threading
 
 from starlette.requests import Request
 from starlette.responses import Response
 
+from ombrebrain.security.public_origin import (
+    configured_public_origin,
+    normalize_http_resource,
+    normalize_public_origin,
+)
 from . import _shared as sh
+from .auth import _run_public_password_verification
 
 try:
     from utils import parse_bool  # type: ignore
@@ -52,15 +60,41 @@ _MCP_TOKEN_TTL = 86400 * 30         # 30 天；避免 100 年秒数溢出部分�
 _MCP_REFRESH_TOKEN_TTL = 86400 * 365
 _MCP_SCOPE = "mcp"
 _OAUTH_CLIENT_TTL = 86400 * 365
+# An unauthenticated DCR entry is useful only while its user completes the
+# authorization flow.  Keeping never-authorized clients for a year lets a
+# public attacker permanently consume the bounded registry.
+_OAUTH_CLIENT_PENDING_TTL = 3600
 _MAX_OAUTH_CLIENTS = 1024
+# 未授权注册应使用远小于长期已授权客户端的独立配额。与
+# _MAX_OAUTH_CLIENTS 分开计数，保持既有已授权客户端容量语义。
+_MAX_PENDING_OAUTH_CLIENTS = 128
 _MAX_OAUTH_CODES = 1024
 _MAX_REDIRECT_URIS = 10
 _MAX_REDIRECT_URI_CHARS = 2048
+_MAX_REDIRECT_URIS_TOTAL_CHARS = 4096
 _MAX_CLIENT_NAME_CHARS = 200
 _PKCE_PATTERN = _re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 _FORBIDDEN_REDIRECT_SCHEMES = {
     "about", "blob", "data", "file", "ftp", "javascript", "vbscript"
 }
+
+# Dynamic client registration must remain public for RFC-compatible MCP
+# clients, so protect it with a small per-source window plus a larger
+# process-wide window.  The global window remains effective when a caller
+# rotates addresses; all state is bounded and shared by every event loop.
+_OAUTH_REGISTRATION_WINDOW_SECONDS = 60
+_OAUTH_REGISTRATION_SOURCE_MAX = 10
+_OAUTH_REGISTRATION_GLOBAL_MAX = 120
+_OAUTH_REGISTRATION_MAX_TRACKED_SOURCES = 2048
+_oauth_registration_source_attempts: _OrderedDict[str, _deque[float]] = _OrderedDict()
+_oauth_registration_global_attempts: _deque[float] = _deque()
+_oauth_registration_rate_lock = _threading.RLock()
+_oauth_client_state_lock = _threading.RLock()
+_oauth_grant_state_lock = _threading.RLock()
+
+
+class OAuthPersistenceError(RuntimeError):
+    """A grant mutation could not be committed to private storage."""
 
 
 def _oauth_required_from_config() -> bool:
@@ -90,8 +124,15 @@ def _first_forwarded(value: str) -> str:
     return (value or "").split(",", 1)[0].strip()
 
 
-def _public_base_url(request: Request) -> str:
+def _public_base_url(
+    request: Request, configured_origin: str | None = None
+) -> str:
     """Return the externally-visible base URL, honoring Cloudflare/reverse-proxy headers."""
+    if configured_origin is None:
+        configured_origin = configured_public_origin(sh.config)
+    normalized_configured = normalize_public_origin(configured_origin)
+    if normalized_configured:
+        return normalized_configured
     proto = sh._trusted_forwarded_value(request, "x-forwarded-proto").lower()
     if proto not in ("http", "https"):
         proto = request.url.scheme
@@ -106,27 +147,160 @@ def _public_base_url(request: Request) -> str:
         or any(char.isspace() or char in "/\\#" for char in host)
     ):
         host = request.url.netloc
-    return f"{proto}://{host}".rstrip("/")
+    candidate = normalize_public_origin(f"{proto}://{host}")
+    if candidate:
+        return candidate
+    return normalize_public_origin(
+        f"{request.url.scheme}://{request.url.netloc}"
+    )
+
+
+def _reserve_oauth_registration(request: Request) -> int:
+    """Atomically reserve one public dynamic-registration attempt.
+
+    Returns zero when admitted, otherwise the number of seconds the caller
+    should wait.  A thread lock is intentional: FastMCP can be mounted from
+    more than one event loop, while an asyncio lock would protect only one.
+    """
+    now = _time_mod.time()
+    window = max(1, int(_OAUTH_REGISTRATION_WINDOW_SECONDS))
+    cutoff = now - window
+    source = sh._client_key(request)
+
+    with _oauth_registration_rate_lock:
+        while (
+            _oauth_registration_global_attempts
+            and _oauth_registration_global_attempts[0] <= cutoff
+        ):
+            _oauth_registration_global_attempts.popleft()
+
+        # Entries are kept in last-seen order.  Pruning from the front avoids
+        # walking every attacker-created source on each request.
+        while _oauth_registration_source_attempts:
+            oldest_source = next(iter(_oauth_registration_source_attempts))
+            oldest_attempts = _oauth_registration_source_attempts[oldest_source]
+            if oldest_attempts and oldest_attempts[-1] > cutoff:
+                break
+            _oauth_registration_source_attempts.popitem(last=False)
+
+        source_attempts = _oauth_registration_source_attempts.get(source)
+        if source_attempts is None:
+            source_attempts = _deque()
+        else:
+            while source_attempts and source_attempts[0] <= cutoff:
+                source_attempts.popleft()
+
+        source_limit = max(1, int(_OAUTH_REGISTRATION_SOURCE_MAX))
+        global_limit = max(1, int(_OAUTH_REGISTRATION_GLOBAL_MAX))
+        retry_after = 0
+        if len(source_attempts) >= source_limit:
+            retry_after = max(
+                retry_after,
+                max(1, int(source_attempts[0] + window - now) + 1),
+            )
+        if len(_oauth_registration_global_attempts) >= global_limit:
+            retry_after = max(
+                retry_after,
+                max(
+                    1,
+                    int(
+                        _oauth_registration_global_attempts[0]
+                        + window
+                        - now
+                    )
+                    + 1,
+                ),
+            )
+        if retry_after:
+            if source in _oauth_registration_source_attempts:
+                _oauth_registration_source_attempts.move_to_end(source)
+            return retry_after
+
+        source_attempts.append(now)
+        _oauth_registration_source_attempts[source] = source_attempts
+        _oauth_registration_source_attempts.move_to_end(source)
+        tracked_limit = max(1, int(_OAUTH_REGISTRATION_MAX_TRACKED_SOURCES))
+        while len(_oauth_registration_source_attempts) > tracked_limit:
+            _oauth_registration_source_attempts.popitem(last=False)
+        _oauth_registration_global_attempts.append(now)
+        return 0
+
+
+def _cleanup_oauth_clients_locked(
+    current: float,
+    registry: dict[str, dict] | None = None,
+) -> bool:
+    """Remove invalid/expired clients while the client-state lock is held."""
+    clients = _oauth_clients if registry is None else registry
+    changed = False
+    for client_id, data in list(clients.items()):
+        if not isinstance(data, dict) or (
+            "expires" in data and data.get("expires", 0) <= current
+        ):
+            clients.pop(client_id, None)
+            changed = True
+    return changed
+
+
+def _evict_oldest_pending_client_locked(
+    registry: dict[str, dict] | None = None,
+) -> bool:
+    """Free one DCR slot without invalidating an authorized client."""
+    clients = _oauth_clients if registry is None else registry
+    candidates = []
+    for client_id, data in clients.items():
+        if not isinstance(data, dict) or data.get("activated") is True:
+            continue
+        created_at = data.get("created_at", data.get("expires", 0))
+        if not isinstance(created_at, (int, float)):
+            created_at = 0
+        candidates.append((float(created_at), client_id))
+    if not candidates:
+        return False
+    _created_at, client_id = min(candidates, key=lambda item: item[0])
+    clients.pop(client_id, None)
+    return True
+
+
+def _activate_oauth_client(client_id: str) -> bool:
+    """Extend a DCR client only after the user successfully authorizes it."""
+    with _oauth_client_state_lock:
+        data = _oauth_clients.get(client_id)
+        if not isinstance(data, dict):
+            return False
+        candidate = {
+            key: dict(value)
+            for key, value in _oauth_clients.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+        candidate_data = candidate[client_id]
+        now = _time_mod.time()
+        candidate_data["activated"] = True
+        candidate_data.setdefault("activated_at", now)
+        candidate_data["last_used"] = now
+        candidate_data["expires"] = now + _OAUTH_CLIENT_TTL
+        _save_oauth_clients(candidate)
+        _oauth_clients.clear()
+        _oauth_clients.update(candidate)
+        return True
 
 
 def _cleanup_oauth_state(now: float | None = None) -> None:
     """Bound public OAuth state and discard expired entries opportunistically."""
     current = _time_mod.time() if now is None else now
-    for client_id, data in list(_oauth_clients.items()):
-        if not isinstance(data, dict) or (
-            "expires" in data and data.get("expires", 0) <= current
-        ):
-            _oauth_clients.pop(client_id, None)
-    for code, data in list(_oauth_codes.items()):
-        if not isinstance(data, dict) or data.get("expires", 0) <= current:
-            _oauth_codes.pop(code, None)
-    for token, expiry in list(_mcp_tokens.items()):
-        if not isinstance(expiry, (int, float)) or expiry <= current:
-            _mcp_tokens.pop(token, None)
-            _mcp_token_resources.pop(token, None)
-    for token, data in list(_mcp_refresh_tokens.items()):
-        if not isinstance(data, dict) or data.get("expires", 0) <= current:
-            _mcp_refresh_tokens.pop(token, None)
+    with _oauth_client_state_lock:
+        _cleanup_oauth_clients_locked(current)
+    with _oauth_grant_state_lock:
+        for code, data in list(_oauth_codes.items()):
+            if not isinstance(data, dict) or data.get("expires", 0) <= current:
+                _oauth_codes.pop(code, None)
+        for token, expiry in list(_mcp_tokens.items()):
+            if not isinstance(expiry, (int, float)) or expiry <= current:
+                _mcp_tokens.pop(token, None)
+                _mcp_token_resources.pop(token, None)
+        for token, data in list(_mcp_refresh_tokens.items()):
+            if not isinstance(data, dict) or data.get("expires", 0) <= current:
+                _mcp_refresh_tokens.pop(token, None)
 
 
 def _valid_redirect_uri(value: object) -> bool:
@@ -166,6 +340,11 @@ def _normalize_client_registration(body: object) -> tuple[dict | None, str]:
         or any(not _valid_redirect_uri(uri) for uri in redirect_uris)
     ):
         return None, "redirect_uris must contain 1-10 safe absolute callback URIs"
+    if sum(len(uri) for uri in redirect_uris) > _MAX_REDIRECT_URIS_TOTAL_CHARS:
+        return None, (
+            "redirect_uris total length must not exceed "
+            f"{_MAX_REDIRECT_URIS_TOTAL_CHARS} characters"
+        )
     client_name = body.get("client_name", "MCP Client")
     if not isinstance(client_name, str):
         return None, "client_name must be a string"
@@ -186,19 +365,16 @@ def _valid_pkce_value(value: object) -> bool:
 
 def _normalize_resource(resource: str) -> str:
     """Normalize an absolute OAuth resource URI for stable equality checks."""
-    try:
-        parsed = _urlparse.urlsplit(resource.strip())
-    except Exception:
-        return ""
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc or parsed.fragment:
-        return ""
-    path = parsed.path.rstrip("/")
-    return _urlparse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+    return normalize_http_resource(resource)
 
 
-def _mcp_resource(request: Request, requested: str = "") -> tuple[bool, str]:
+def _mcp_resource(
+    request: Request,
+    requested: str = "",
+    configured_origin: str | None = None,
+) -> tuple[bool, str]:
     """Validate/bind RFC 8707 resource to this server's canonical /mcp endpoint."""
-    base = _public_base_url(request)
+    base = _public_base_url(request, configured_origin)
     canonical = f"{base}/mcp"
     if not requested:
         return True, canonical
@@ -218,7 +394,6 @@ def _oauth_clients_file() -> str:
 
 def _load_oauth_clients() -> None:
     """Restore active, validated dynamic-client registrations from disk."""
-    global _oauth_clients
     try:
         path = _oauth_clients_file()
         if not os.path.exists(path):
@@ -229,6 +404,11 @@ def _load_oauth_clients() -> None:
             raise ValueError("oauth client registry must be a JSON object")
 
         now = _time_mod.time()
+        granted_client_ids = {
+            str(data.get("client_id", ""))
+            for data in _mcp_refresh_tokens.values()
+            if isinstance(data, dict) and data.get("client_id")
+        }
         restored: list[tuple[float, str, dict]] = []
         for client_id, data in raw.items():
             if not isinstance(client_id, str) or not isinstance(data, dict):
@@ -241,29 +421,54 @@ def _load_oauth_clients() -> None:
                 or expires <= now
             ):
                 continue
-            restored.append((float(expires), client_id, {
+            activated = data.get("activated") is True or client_id in granted_client_ids
+            created_at = data.get("created_at")
+            if not isinstance(created_at, (int, float)) or created_at <= 0:
+                created_at = now
+            effective_expiry = float(expires)
+            if not activated:
+                # Registrations written before this field existed are not
+                # assumed to have user consent.  A matching persisted refresh
+                # grant above safely upgrades genuinely authorized clients.
+                effective_expiry = min(
+                    effective_expiry,
+                    float(created_at) + _OAUTH_CLIENT_PENDING_TTL,
+                )
+            if effective_expiry <= now:
+                continue
+            restored_data = {
                 **registration,
-                "expires": float(expires),
-            }))
+                "created_at": float(created_at),
+                "activated": activated,
+                "expires": effective_expiry,
+            }
+            for timestamp_field in ("activated_at", "last_used"):
+                timestamp = data.get(timestamp_field)
+                if isinstance(timestamp, (int, float)) and timestamp > 0:
+                    restored_data[timestamp_field] = float(timestamp)
+            restored.append((effective_expiry, client_id, restored_data))
 
         # Prefer the registrations that remain valid longest if a corrupt or
         # hand-edited file exceeds the in-memory safety bound.
         restored.sort(reverse=True)
-        _oauth_clients = {
-            client_id: data
-            for _, client_id, data in restored[:_MAX_OAUTH_CLIENTS]
-        }
+        with _oauth_client_state_lock:
+            candidate = {
+                client_id: data
+                for _, client_id, data in restored[:_MAX_OAUTH_CLIENTS]
+            }
+            _oauth_clients.clear()
+            _oauth_clients.update(candidate)
     except Exception as e:
         logger.warning(f"[oauth] failed to load oauth clients: {e}")
 
 
-def _save_oauth_clients() -> None:
-    """Persist active DCR clients using the auth material atomic writer."""
+def _persist_oauth_client_state(clients: dict[str, dict]) -> None:
+    """Durably persist one DCR candidate before publishing it in memory."""
     try:
         now = _time_mod.time()
         active = {
-            client_id: data
-            for client_id, data in _oauth_clients.items()
+            client_id: dict(data)
+            for client_id, data in clients.items()
             if isinstance(client_id, str)
             and isinstance(data, dict)
             and isinstance(data.get("expires"), (int, float))
@@ -271,11 +476,20 @@ def _save_oauth_clients() -> None:
         }
         sh._atomic_write_private_json(_oauth_clients_file(), active)
     except Exception as e:
-        logger.warning(f"[oauth] failed to save oauth clients: {e}")
+        raise OAuthPersistenceError(
+            "failed to persist OAuth client registrations"
+        ) from e
+
+
+def _save_oauth_clients(clients: dict[str, dict] | None = None) -> None:
+    """Persist a DCR candidate or the current registry; never swallow errors."""
+    with _oauth_client_state_lock:
+        _persist_oauth_client_state(
+            _oauth_clients if clients is None else clients
+        )
 
 
 def _load_mcp_tokens() -> None:
-    global _mcp_tokens, _mcp_token_resources, _mcp_refresh_tokens
     try:
         path = _mcp_tokens_file()
         if not os.path.exists(path):
@@ -292,8 +506,8 @@ def _load_mcp_tokens() -> None:
             access_raw = raw
             refresh_raw = {}
 
-        _mcp_tokens = {}
-        _mcp_token_resources = {}
+        loaded_access: dict[str, float] = {}
+        loaded_resources: dict[str, str] = {}
         for tok, data in access_raw.items():
             if isinstance(data, (int, float)):
                 exp = data
@@ -304,10 +518,10 @@ def _load_mcp_tokens() -> None:
             else:
                 continue
             if isinstance(exp, (int, float)) and exp > now:
-                _mcp_tokens[tok] = exp
+                loaded_access[tok] = exp
                 if resource:
-                    _mcp_token_resources[tok] = resource
-        _mcp_refresh_tokens = {}
+                    loaded_resources[tok] = resource
+        loaded_refresh: dict[str, dict] = {}
         for tok, data in refresh_raw.items():
             if isinstance(data, (int, float)):
                 exp = data
@@ -318,16 +532,36 @@ def _load_mcp_tokens() -> None:
             else:
                 continue
             if isinstance(exp, (int, float)) and exp > now:
-                _mcp_refresh_tokens[tok] = {
+                loaded_refresh[tok] = {
                     "expires": exp,
                     "client_id": client_id,
                     "resource": str(data.get("resource", "")) if isinstance(data, dict) else "",
                 }
+        with _oauth_grant_state_lock:
+            _replace_grant_state_locked(
+                loaded_access, loaded_resources, loaded_refresh
+            )
     except Exception as e:
         logger.warning(f"[oauth] failed to load mcp tokens: {e}")
 
 
 def _save_mcp_tokens() -> None:
+    """Persist the current grant registry or raise; never report false success."""
+    with sh._credential_state_guard():
+        with _oauth_grant_state_lock:
+            _persist_mcp_token_state(
+                _mcp_tokens,
+                _mcp_token_resources,
+                _mcp_refresh_tokens,
+            )
+
+
+def _persist_mcp_token_state(
+    access_tokens: dict[str, float],
+    token_resources: dict[str, str],
+    refresh_tokens: dict[str, dict],
+) -> None:
+    """Durably write one candidate grant state before it becomes visible."""
     try:
         path = _mcp_tokens_file()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -335,13 +569,13 @@ def _save_mcp_tokens() -> None:
         active = {
             tok: {
                 "expires": exp,
-                "resource": _mcp_token_resources.get(tok, ""),
+                "resource": token_resources.get(tok, ""),
             }
-            for tok, exp in _mcp_tokens.items()
+            for tok, exp in access_tokens.items()
             if exp > now
         }
         active_refresh = {
-            tok: data for tok, data in _mcp_refresh_tokens.items()
+            tok: dict(data) for tok, data in refresh_tokens.items()
             if isinstance(data, dict)
             and isinstance(data.get("expires"), (int, float))
             and data["expires"] > now
@@ -354,7 +588,158 @@ def _save_mcp_tokens() -> None:
             },
         )
     except Exception as e:
-        logger.warning(f"[oauth] failed to save mcp tokens: {e}")
+        raise OAuthPersistenceError("failed to persist OAuth grants") from e
+
+
+def _replace_grant_state_locked(
+    access_tokens: dict[str, float],
+    token_resources: dict[str, str],
+    refresh_tokens: dict[str, dict],
+) -> None:
+    _mcp_tokens.clear()
+    _mcp_tokens.update(access_tokens)
+    _mcp_token_resources.clear()
+    _mcp_token_resources.update(token_resources)
+    _mcp_refresh_tokens.clear()
+    _mcp_refresh_tokens.update(refresh_tokens)
+
+
+def _commit_authorization_code_exchange(
+    code: str,
+    expected_code: dict,
+    token_resource: str,
+) -> tuple[str, str] | None:
+    """Atomically consume one code and commit its access/refresh grants."""
+    with sh._credential_state_guard():
+        with _oauth_grant_state_lock:
+            current = _oauth_codes.get(code)
+            if (
+                not isinstance(current, dict)
+                or current != expected_code
+                or current.get("expires", 0) <= _time_mod.time()
+            ):
+                return None
+            code_generation = current.get("credential_generation")
+            if (
+                isinstance(code_generation, int)
+                and code_generation != sh._credential_generation_snapshot()
+            ):
+                _oauth_codes.pop(code, None)
+                return None
+
+            access_token = secrets.token_urlsafe(32)
+            refresh_token = secrets.token_urlsafe(32)
+            access_candidate = dict(_mcp_tokens)
+            resource_candidate = dict(_mcp_token_resources)
+            refresh_candidate = {
+                token: dict(data)
+                for token, data in _mcp_refresh_tokens.items()
+                if isinstance(data, dict)
+            }
+            access_candidate[access_token] = _time_mod.time() + _MCP_TOKEN_TTL
+            if token_resource:
+                resource_candidate[access_token] = token_resource
+            refresh_candidate[refresh_token] = {
+                "expires": _time_mod.time() + _MCP_REFRESH_TOKEN_TTL,
+                "client_id": str(current.get("client_id", "")),
+                "resource": token_resource,
+            }
+            _persist_mcp_token_state(
+                access_candidate, resource_candidate, refresh_candidate
+            )
+            _replace_grant_state_locked(
+                access_candidate, resource_candidate, refresh_candidate
+            )
+            _oauth_codes.pop(code, None)
+            return access_token, refresh_token
+
+
+def _commit_refresh_token_rotation(
+    refresh_token: str,
+    expected_refresh: dict,
+    token_resource: str,
+) -> tuple[str, str] | None:
+    """Atomically rotate a refresh token and issue one access token."""
+    with sh._credential_state_guard():
+        with _oauth_grant_state_lock:
+            current = _mcp_refresh_tokens.get(refresh_token)
+            if (
+                not isinstance(current, dict)
+                or current != expected_refresh
+                or current.get("expires", 0) <= _time_mod.time()
+            ):
+                return None
+
+            access_token = secrets.token_urlsafe(32)
+            replacement_refresh = secrets.token_urlsafe(32)
+            access_candidate = dict(_mcp_tokens)
+            resource_candidate = dict(_mcp_token_resources)
+            refresh_candidate = {
+                token: dict(data)
+                for token, data in _mcp_refresh_tokens.items()
+                if isinstance(data, dict)
+            }
+            refresh_candidate.pop(refresh_token, None)
+            access_candidate[access_token] = _time_mod.time() + _MCP_TOKEN_TTL
+            if token_resource:
+                resource_candidate[access_token] = token_resource
+            refresh_candidate[replacement_refresh] = {
+                "expires": _time_mod.time() + _MCP_REFRESH_TOKEN_TTL,
+                "client_id": str(current.get("client_id", "")),
+                "resource": token_resource,
+            }
+            _persist_mcp_token_state(
+                access_candidate, resource_candidate, refresh_candidate
+            )
+            _replace_grant_state_locked(
+                access_candidate, resource_candidate, refresh_candidate
+            )
+            return access_token, replacement_refresh
+
+
+def _oauth_grant_generation_snapshot() -> int:
+    return sh._credential_generation_snapshot()
+
+
+def _store_authorization_code(
+    code: str,
+    code_data: dict,
+    expected_generation: int | sh.CredentialProof,
+) -> bool:
+    """Publish a code only if no credential revocation raced its KDF."""
+    with sh._credential_state_guard():
+        if isinstance(expected_generation, sh.CredentialProof):
+            if not sh._credential_proof_matches_locked(expected_generation):
+                return False
+            generation = expected_generation.generation
+        else:
+            generation = expected_generation
+            if sh._credential_generation_snapshot() != generation:
+                return False
+        with _oauth_grant_state_lock:
+            now = _time_mod.time()
+            for existing_code, data in list(_oauth_codes.items()):
+                if not isinstance(data, dict) or data.get("expires", 0) <= now:
+                    _oauth_codes.pop(existing_code, None)
+            if len(_oauth_codes) >= _MAX_OAUTH_CODES:
+                return False
+            stored = dict(code_data)
+            stored["credential_generation"] = generation
+            _oauth_codes[code] = stored
+            return True
+
+
+def revoke_all_mcp_grants() -> None:
+    """Durably revoke persisted grants or raise without claiming success."""
+    with sh._credential_state_guard():
+        # Invalidate KDF proofs before attempting persistence.  Even when the
+        # disk write fails, no authorization begun before this revocation may
+        # publish a late code using a stale credential.
+        sh._advance_credential_generation_locked()
+        with _oauth_grant_state_lock:
+            _oauth_codes.clear()
+            _persist_mcp_token_state({}, {}, {})
+            _replace_grant_state_locked({}, {}, {})
 
 
 def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
@@ -366,17 +751,21 @@ def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
 
 
 def _is_valid_mcp_token(token: str, resource: str = "") -> bool:
-    expiry = _mcp_tokens.get(token)
-    if expiry is None:
-        return False
-    if _time_mod.time() > expiry:
-        del _mcp_tokens[token]
-        _mcp_token_resources.pop(token, None)
-        return False
-    bound_resource = _mcp_token_resources.get(token, "")
-    if resource and bound_resource:
-        return _normalize_resource(resource) == _normalize_resource(bound_resource)
-    return True
+    with sh._credential_state_guard():
+        with _oauth_grant_state_lock:
+            expiry = _mcp_tokens.get(token)
+            if expiry is None:
+                return False
+            if _time_mod.time() > expiry:
+                del _mcp_tokens[token]
+                _mcp_token_resources.pop(token, None)
+                return False
+            bound_resource = _mcp_token_resources.get(token, "")
+            if resource and bound_resource:
+                return _normalize_resource(resource) == _normalize_resource(
+                    bound_resource
+                )
+            return True
 
 
 def _is_valid_static_mcp_token(token: str, resource: str = "") -> bool:
@@ -400,22 +789,26 @@ def _is_valid_static_mcp_token(token: str, resource: str = "") -> bool:
 
 def _issue_mcp_access_token(resource: str = "") -> str:
     _cleanup_oauth_state()
-    token = secrets.token_urlsafe(32)
-    _mcp_tokens[token] = _time_mod.time() + _MCP_TOKEN_TTL
-    if resource:
-        _mcp_token_resources[token] = resource
-    return token
+    with sh._credential_state_guard():
+        with _oauth_grant_state_lock:
+            token = secrets.token_urlsafe(32)
+            _mcp_tokens[token] = _time_mod.time() + _MCP_TOKEN_TTL
+            if resource:
+                _mcp_token_resources[token] = resource
+            return token
 
 
 def _issue_mcp_refresh_token(client_id: str, resource: str = "") -> str:
     _cleanup_oauth_state()
-    refresh_token = secrets.token_urlsafe(32)
-    _mcp_refresh_tokens[refresh_token] = {
-        "expires": _time_mod.time() + _MCP_REFRESH_TOKEN_TTL,
-        "client_id": client_id,
-        "resource": resource,
-    }
-    return refresh_token
+    with sh._credential_state_guard():
+        with _oauth_grant_state_lock:
+            refresh_token = secrets.token_urlsafe(32)
+            _mcp_refresh_tokens[refresh_token] = {
+                "expires": _time_mod.time() + _MCP_REFRESH_TOKEN_TTL,
+                "client_id": client_id,
+                "resource": resource,
+            }
+            return refresh_token
 
 
 def _token_response(access_token: str, *, refresh_token: str | None = None) -> dict:
@@ -426,20 +819,13 @@ def _token_response(access_token: str, *, refresh_token: str | None = None) -> d
         "scope": _MCP_SCOPE,
     }
     if refresh_token:
-        refresh_data = _mcp_refresh_tokens.get(refresh_token, {})
+        with _oauth_grant_state_lock:
+            refresh_data = dict(_mcp_refresh_tokens.get(refresh_token, {}))
         refresh_exp = refresh_data.get("expires")
         if isinstance(refresh_exp, (int, float)):
             payload["refresh_expires_in"] = max(0, int(refresh_exp - _time_mod.time()))
         payload["refresh_token"] = refresh_token
     return payload
-
-
-def _mcp_auth_check(request: Request):
-    """Return True if request has a valid MCP Bearer token."""
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return _is_valid_mcp_token(auth[7:])
-    return False
 
 
 def _validate_authorize_redirect(client_id: str, redirect_uri: str) -> tuple[bool, str]:
@@ -449,7 +835,10 @@ def _validate_authorize_redirect(client_id: str, redirect_uri: str) -> tuple[boo
         return False, "missing client_id"
     if not redirect_uri:
         return False, "missing redirect_uri"
-    client_info = _oauth_clients.get(client_id)
+    with _oauth_client_state_lock:
+        client_info = _oauth_clients.get(client_id)
+        if isinstance(client_info, dict):
+            client_info = dict(client_info)
     if not client_info:
         return False, "unknown client_id"
     if redirect_uri not in (client_info.get("redirect_uris") or []):
@@ -466,9 +855,12 @@ def _oauth_authorize_html(client_id: str, redirect_uri: str, state: str,
     except ImportError:  # pragma: no cover
         from ..utils import get_ai_name  # type: ignore
     ai_name = e(get_ai_name())
-    client_info = _oauth_clients.get(client_id, {})
+    with _oauth_client_state_lock:
+        stored_client = _oauth_clients.get(client_id, {})
+        client_info = dict(stored_client) if isinstance(stored_client, dict) else {}
     client_name = e(str(client_info.get("client_name") or "MCP Client"))
     callback = e(redirect_uri[:240])
+    trace_id = secrets.token_hex(6)
     err_html = f'<p style="color:#ff6b6b;font-size:13px;margin-top:12px;">{e(error)}</p>' if error else ""
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -486,25 +878,49 @@ input[type=password]{{display:block;width:100%;padding:11px 14px;background:#111
 button{{width:100%;padding:12px;background:#c9a96e;color:#0f0f0f;border:none;
   border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}}
 button:hover{{background:#d4b87a}}
+button:disabled{{opacity:.65;cursor:wait}}
+.submit-status{{display:none;color:#c9a96e;font-size:12px;margin-top:12px;line-height:1.5}}
 .note{{color:#666;font-size:11px;margin-top:16px;line-height:1.6}}
 </style></head>
 <body><div class="card">
 <h2>◐ Ombre Brain</h2>
 <p class="sub">授权 {ai_name} 连接 MCP</p>
 <p class="note">请求方：{client_name}<br>回调：{callback}</p>
-<form method="POST">
+<form method="POST" id="oauth-form">
 <input type="hidden" name="client_id" value="{e(client_id)}">
 <input type="hidden" name="redirect_uri" value="{e(redirect_uri)}">
 <input type="hidden" name="state" value="{e(state)}">
 <input type="hidden" name="code_challenge" value="{e(code_challenge)}">
 <input type="hidden" name="resource" value="{e(resource)}">
 <input type="hidden" name="scope" value="{e(scope)}">
+<input type="hidden" name="trace_id" value="{trace_id}">
 <input type="password" name="password" placeholder="输入 Dashboard 密码" autofocus>
-<button type="submit">授权并连接</button>
+<button type="submit" id="oauth-submit">授权并连接</button>
 </form>
+<p class="submit-status" id="submit-status" role="status" aria-live="polite"></p>
 {err_html}
-<p class="note">授权后 {ai_name} 将可使用 MCP 工具读写记忆。<br>Token 长期有效，并支持自动续期。<br>若工具调用失败，请在客户端断开重连，再重新点击此页授权即可。</p>
-</div></body></html>"""
+<p class="note">授权后 {ai_name} 将可使用 MCP 工具读写记忆。<br>Token 长期有效，并支持自动续期。<br>若工具调用失败，请在客户端断开重连，再重新点击此页授权即可。<br>诊断编号：{trace_id}</p>
+</div>
+<script>
+(() => {{
+  const form = document.getElementById('oauth-form');
+  const button = document.getElementById('oauth-submit');
+  const status = document.getElementById('submit-status');
+  form.addEventListener('submit', () => {{
+    button.disabled = true;
+    button.textContent = '正在验证…';
+    status.style.display = 'block';
+    status.textContent = '正在验证密码并生成授权码，请勿关闭此页。';
+    window.setTimeout(() => {{
+      if (!document.hidden) {{
+        button.disabled = false;
+        button.textContent = '重试授权';
+        status.textContent = '等待超过 30 秒。请记下诊断编号 {trace_id}，再重试或查看服务端日志。';
+      }}
+    }}, 30000);
+  }});
+}})();
+</script></body></html>"""
 
 
 def register(mcp) -> None:
@@ -512,6 +928,10 @@ def register(mcp) -> None:
     # Keep discovery aligned with the start-time middleware snapshot. Dashboard
     # config edits require a restart, so they must not change metadata early.
     oauth_required = _oauth_required_from_config()
+    # OAuth routes and MCPAuthMiddleware both use startup config snapshots.
+    # Saving a new public URL therefore cannot split token issuance from token
+    # validation in the interval before the documented process restart.
+    oauth_public_origin = configured_public_origin(sh.config)
     if oauth_required:
         _load_mcp_tokens()   # Docker 重启后恢复 token，不强制重新 OAuth
         _load_oauth_clients()
@@ -523,7 +943,7 @@ def register(mcp) -> None:
         if not oauth_required:
             return _oauth_not_found()
 
-        base = _public_base_url(request)
+        base = _public_base_url(request, oauth_public_origin)
         # Ombre exposes one MCP endpoint. Do not let retired or invented paths
         # complete OAuth discovery and appear connected before failing at use.
         sub = str(request.path_params.get("resource_path", "") or "").strip("/")
@@ -546,7 +966,7 @@ def register(mcp) -> None:
         if not oauth_required:
             return _oauth_not_found()
 
-        base = _public_base_url(request)
+        base = _public_base_url(request, oauth_public_origin)
         return JSONResponse({
             "issuer": base,
             "authorization_endpoint": f"{base}/oauth/authorize",
@@ -565,6 +985,16 @@ def register(mcp) -> None:
         if not oauth_required:
             return _oauth_not_found()
 
+        retry_after = _reserve_oauth_registration(request)
+        if retry_after:
+            return JSONResponse(
+                {"error": "temporarily_unavailable"},
+                status_code=429,
+                headers={
+                    "Retry-After": str(retry_after),
+                    "Cache-Control": "no-store",
+                },
+            )
         try:
             body = await request.json()
         except Exception:
@@ -580,29 +1010,68 @@ def register(mcp) -> None:
                     "error_description": registration_error,
                 },
                 status_code=400,
+        )
+        now = _time_mod.time()
+        with _oauth_client_state_lock:
+            candidate = {
+                key: dict(value)
+                for key, value in _oauth_clients.items()
+                if isinstance(key, str) and isinstance(value, dict)
+            }
+            _cleanup_oauth_clients_locked(now, candidate)
+            pending_count = sum(
+                1
+                for data in candidate.values()
+                if data.get("activated") is not True
             )
-        _cleanup_oauth_state()
-        if len(_oauth_clients) >= _MAX_OAUTH_CLIENTS:
-            return JSONResponse(
-                {"error": "temporarily_unavailable"},
-                status_code=429,
-                headers={"Retry-After": "60"},
-            )
-        client_id = secrets.token_urlsafe(16)
-        _oauth_clients[client_id] = {
-            **registration,
-            "expires": _time_mod.time() + _OAUTH_CLIENT_TTL,
-        }
-        _save_oauth_clients()
+            if pending_count >= max(1, int(_MAX_PENDING_OAUTH_CLIENTS)):
+                return JSONResponse(
+                    {"error": "temporarily_unavailable"},
+                    status_code=429,
+                    headers={
+                        "Retry-After": "60",
+                        "Cache-Control": "no-store",
+                    },
+                )
+            if len(candidate) >= max(1, int(_MAX_OAUTH_CLIENTS)):
+                if not _evict_oldest_pending_client_locked(candidate):
+                    return JSONResponse(
+                        {"error": "temporarily_unavailable"},
+                        status_code=429,
+                        headers={
+                            "Retry-After": "60",
+                            "Cache-Control": "no-store",
+                        },
+                    )
+            client_id = secrets.token_urlsafe(16)
+            candidate[client_id] = {
+                **registration,
+                "created_at": now,
+                "activated": False,
+                "expires": now + _OAUTH_CLIENT_PENDING_TTL,
+            }
+            try:
+                _save_oauth_clients(candidate)
+            except OAuthPersistenceError:
+                return JSONResponse(
+                    {"error": "temporarily_unavailable"},
+                    status_code=503,
+                    headers={
+                        "Retry-After": "5",
+                        "Cache-Control": "no-store",
+                    },
+                )
+            _oauth_clients.clear()
+            _oauth_clients.update(candidate)
         return JSONResponse({
             "client_id": client_id,
-            "client_id_issued_at": int(_time_mod.time()),
+            "client_id_issued_at": int(now),
             "redirect_uris": registration["redirect_uris"],
             "client_name": registration["client_name"],
             "token_endpoint_auth_method": "none",
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
-        }, status_code=201)
+        }, status_code=201, headers={"Cache-Control": "no-store"})
 
     @mcp.custom_route("/oauth/authorize", methods=["GET", "POST"])
     async def oauth_authorize(request: Request) -> Response:
@@ -615,7 +1084,9 @@ def register(mcp) -> None:
             ok, err = _validate_authorize_redirect(
                 p.get("client_id", ""), p.get("redirect_uri", "")
             )
-            resource_ok, resource = _mcp_resource(request, p.get("resource", ""))
+            resource_ok, resource = _mcp_resource(
+                request, p.get("resource", ""), oauth_public_origin
+            )
             if ok and not resource_ok:
                 ok, err = False, "resource 与当前 MCP 地址不匹配"
             if ok and p.get("response_type", "code") != "code":
@@ -645,9 +1116,17 @@ def register(mcp) -> None:
         code_challenge = str(form.get("code_challenge", ""))
         requested_resource = str(form.get("resource", ""))
         scope = str(form.get("scope", _MCP_SCOPE)) or _MCP_SCOPE
+        trace_id = str(form.get("trace_id", ""))[:32] or secrets.token_hex(6)
+        sh.logger.info(
+            "op=oauth_authorize phase=post trace_id=%s client_id=%s",
+            trace_id,
+            client_id[:24],
+        )
 
         ok, err = _validate_authorize_redirect(client_id, redirect_uri)
-        resource_ok, resource = _mcp_resource(request, requested_resource)
+        resource_ok, resource = _mcp_resource(
+            request, requested_resource, oauth_public_origin
+        )
         if ok and not resource_ok:
             ok, err = False, "resource 与当前 MCP 地址不匹配"
         if ok and not _valid_scope(scope):
@@ -685,26 +1164,45 @@ def register(mcp) -> None:
                 ),
                 status_code=400,
             )
-        if not sh._verify_any_password(password):
+        global_retry = sh._reserve_global_login_attempt()
+        if global_retry:
+            return HTMLResponse(
+                _oauth_authorize_html(
+                    client_id, redirect_uri, state, code_challenge,
+                    resource=resource, scope=scope,
+                    error=f"登录服务繁忙，请 {global_retry} 秒后重试",
+                ),
+                status_code=429,
+                headers={"Retry-After": str(global_retry)},
+            )
+        verified, queued_retry = await _run_public_password_verification(
+            request, sh._verify_password_for_rotation, password
+        )
+        if queued_retry:
+            return HTMLResponse(
+                _oauth_authorize_html(
+                    client_id, redirect_uri, state, code_challenge,
+                    resource=resource, scope=scope,
+                    error=f"尝试过于频繁，请 {queued_retry} 秒后再试",
+                ),
+                status_code=429,
+                headers={"Retry-After": str(queued_retry)},
+            )
+        if not verified:
             sh._record_login_failure(request)
+            sh.logger.warning(
+                "op=oauth_authorize phase=password_failed trace_id=%s client_id=%s",
+                trace_id,
+                client_id[:24],
+            )
             return HTMLResponse(_oauth_authorize_html(
                 client_id, redirect_uri, state, code_challenge,
                 resource=resource, scope=scope, error="密码错误，请重试"
             ), status_code=401)
 
         sh._record_login_success(request)
-        _cleanup_oauth_state()
-        if len(_oauth_codes) >= _MAX_OAUTH_CODES:
-            return HTMLResponse(
-                _oauth_authorize_html(
-                    client_id, redirect_uri, state, code_challenge,
-                    resource=resource, scope=scope,
-                    error="授权请求过多，请稍后重试",
-                ),
-                status_code=503,
-            )
         code = secrets.token_urlsafe(32)
-        _oauth_codes[code] = {
+        code_data = {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "code_challenge": code_challenge,
@@ -712,10 +1210,61 @@ def register(mcp) -> None:
             "scope": scope,
             "expires": _time_mod.time() + _OAUTH_CODE_TTL,
         }
+        if not _store_authorization_code(code, code_data, verified):
+            return HTMLResponse(
+                _oauth_authorize_html(
+                    client_id, redirect_uri, state, code_challenge,
+                    resource=resource, scope=scope,
+                    error="授权状态已变化，请重新发起连接",
+                ),
+                status_code=409,
+            )
+        try:
+            activated = _activate_oauth_client(client_id)
+        except OAuthPersistenceError:
+            with _oauth_grant_state_lock:
+                _oauth_codes.pop(code, None)
+            return HTMLResponse(
+                _oauth_authorize_html(
+                    client_id,
+                    redirect_uri,
+                    state,
+                    code_challenge,
+                    resource=resource,
+                    scope=scope,
+                    error="授权状态无法持久化，请稍后重试",
+                ),
+                status_code=503,
+                headers={
+                    "Retry-After": "5",
+                    "Cache-Control": "no-store",
+                },
+            )
+        if not activated:
+            with _oauth_grant_state_lock:
+                _oauth_codes.pop(code, None)
+            return HTMLResponse(
+                _oauth_authorize_html(
+                    client_id,
+                    redirect_uri,
+                    state,
+                    code_challenge,
+                    resource=resource,
+                    scope=scope,
+                    error="客户端注册已失效，请重新连接",
+                ),
+                status_code=409,
+                headers={"Cache-Control": "no-store"},
+            )
         sep = "&" if "?" in redirect_uri else "?"
         location = f"{redirect_uri}{sep}code={_urlparse.quote(code)}"
         if state:
             location += f"&state={_urlparse.quote(state)}"
+        sh.logger.info(
+            "op=oauth_authorize phase=redirect trace_id=%s client_id=%s",
+            trace_id,
+            client_id[:24],
+        )
         return RedirectResponse(location, status_code=302)
 
     @mcp.custom_route("/oauth/token", methods=["POST"])
@@ -745,13 +1294,20 @@ def register(mcp) -> None:
             refresh_token = str(body.get("refresh_token", ""))
             if len(refresh_token) > 256:
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
-            refresh_data = _mcp_refresh_tokens.get(refresh_token)
+            with _oauth_grant_state_lock:
+                stored_refresh = _mcp_refresh_tokens.get(refresh_token)
+                refresh_data = (
+                    dict(stored_refresh)
+                    if isinstance(stored_refresh, dict)
+                    else None
+                )
             now = _time_mod.time()
             if not isinstance(refresh_data, dict):
                 return JSONResponse({"error": "invalid_grant", "error_description": "unknown refresh token"}, status_code=400)
             if refresh_data.get("expires", 0) < now:
-                _mcp_refresh_tokens.pop(refresh_token, None)
-                _save_mcp_tokens()
+                with _oauth_grant_state_lock:
+                    if _mcp_refresh_tokens.get(refresh_token) == refresh_data:
+                        _mcp_refresh_tokens.pop(refresh_token, None)
                 return JSONResponse({"error": "invalid_grant", "error_description": "refresh token expired"}, status_code=400)
             client_id = str(body.get("client_id", ""))
             stored_client_id = str(refresh_data.get("client_id", ""))
@@ -759,28 +1315,68 @@ def register(mcp) -> None:
                 return JSONResponse({"error": "invalid_grant", "error_description": "client_id mismatch"}, status_code=400)
             stored_resource = str(refresh_data.get("resource", ""))
             requested_resource = str(body.get("resource", ""))
-            resource_ok, canonical_resource = _mcp_resource(request, requested_resource)
+            resource_ok, canonical_resource = _mcp_resource(
+                request, requested_resource, oauth_public_origin
+            )
             if requested_resource and not resource_ok:
                 return JSONResponse({"error": "invalid_target", "error_description": "resource mismatch"}, status_code=400)
-            if requested_resource and stored_resource and (
-                _normalize_resource(canonical_resource) != _normalize_resource(stored_resource)
+            # A public-origin change invalidates an existing resource-bound
+            # refresh grant.  Never return HTTP 200 with a fresh access token
+            # that the MCP middleware must immediately reject; invalid_grant
+            # tells the client to begin a new authorization flow instead.
+            if stored_resource and (
+                _normalize_resource(canonical_resource)
+                != _normalize_resource(stored_resource)
             ):
-                return JSONResponse({"error": "invalid_target", "error_description": "resource mismatch"}, status_code=400)
+                return JSONResponse(
+                    {
+                        "error": "invalid_grant",
+                        "error_description": (
+                            "refresh token belongs to a previous MCP public URL; "
+                            "reauthorization required"
+                        ),
+                    },
+                    status_code=400,
+                    headers={"Cache-Control": "no-store"},
+                )
 
-            token = _issue_mcp_access_token(stored_resource or canonical_resource)
-            _save_mcp_tokens()
+            try:
+                rotated = _commit_refresh_token_rotation(
+                    refresh_token,
+                    refresh_data,
+                    stored_resource or canonical_resource,
+                )
+            except OAuthPersistenceError:
+                return JSONResponse(
+                    {"error": "temporarily_unavailable"},
+                    status_code=503,
+                    headers={"Retry-After": "5", "Cache-Control": "no-store"},
+                )
+            if rotated is None:
+                return JSONResponse(
+                    {
+                        "error": "invalid_grant",
+                        "error_description": "refresh token already used or revoked",
+                    },
+                    status_code=400,
+                )
+            token, replacement_refresh = rotated
             return JSONResponse(
-                _token_response(token, refresh_token=refresh_token),
+                _token_response(token, refresh_token=replacement_refresh),
                 headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
             )
 
         code = str(body.get("code", ""))
         code_verifier = str(body.get("code_verifier", ""))
-        code_data = _oauth_codes.get(code)
+        with _oauth_grant_state_lock:
+            stored_code = _oauth_codes.get(code)
+            code_data = dict(stored_code) if isinstance(stored_code, dict) else None
         if not code_data:
             return JSONResponse({"error": "invalid_grant", "error_description": "unknown or expired code"}, status_code=400)
         if code_data["expires"] < _time_mod.time():
-            _oauth_codes.pop(code, None)
+            with _oauth_grant_state_lock:
+                if _oauth_codes.get(code) == code_data:
+                    _oauth_codes.pop(code, None)
             return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
 
         client_id = str(body.get("client_id", ""))
@@ -791,26 +1387,53 @@ def register(mcp) -> None:
             return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
         stored_resource = str(code_data.get("resource", ""))
         requested_resource = str(body.get("resource", ""))
-        resource_ok, canonical_resource = _mcp_resource(request, requested_resource)
+        resource_ok, canonical_resource = _mcp_resource(
+            request, requested_resource, oauth_public_origin
+        )
         if requested_resource and not resource_ok:
             return JSONResponse({"error": "invalid_target", "error_description": "resource mismatch"}, status_code=400)
-        if requested_resource and stored_resource and (
-            _normalize_resource(canonical_resource) != _normalize_resource(stored_resource)
+        if stored_resource and (
+            _normalize_resource(canonical_resource)
+            != _normalize_resource(stored_resource)
         ):
-            return JSONResponse({"error": "invalid_target", "error_description": "resource mismatch"}, status_code=400)
+            return JSONResponse(
+                {
+                    "error": "invalid_grant",
+                    "error_description": (
+                        "authorization code belongs to a different MCP public URL"
+                    ),
+                },
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
 
         if code_data.get("code_challenge"):
             if not code_verifier or not _verify_pkce(code_verifier, code_data["code_challenge"]):
-                _oauth_codes.pop(code, None)
+                with _oauth_grant_state_lock:
+                    if _oauth_codes.get(code) == code_data:
+                        _oauth_codes.pop(code, None)
                 return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
-        _oauth_codes.pop(code, None)
         token_resource = stored_resource or canonical_resource
-        token = _issue_mcp_access_token(token_resource)
-        refresh_token = _issue_mcp_refresh_token(
-            str(code_data.get("client_id", "")), token_resource
-        )
-        _save_mcp_tokens()
+        try:
+            exchanged = _commit_authorization_code_exchange(
+                code, code_data, token_resource
+            )
+        except OAuthPersistenceError:
+            return JSONResponse(
+                {"error": "temporarily_unavailable"},
+                status_code=503,
+                headers={"Retry-After": "5", "Cache-Control": "no-store"},
+            )
+        if exchanged is None:
+            return JSONResponse(
+                {
+                    "error": "invalid_grant",
+                    "error_description": "authorization code already used or revoked",
+                },
+                status_code=400,
+            )
+        token, refresh_token = exchanged
         return JSONResponse(
             _token_response(token, refresh_token=refresh_token),
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},

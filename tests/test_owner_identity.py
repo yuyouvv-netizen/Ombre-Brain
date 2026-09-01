@@ -58,6 +58,7 @@ async def test_config_get_exposes_owner_fields(monkeypatch):
     monkeypatch.setattr(config_api.sh, "_require_auth", lambda request: None)
     monkeypatch.setattr(config_api.sh, "config", {})
     monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(config_api, "read_config_yaml", lambda: {})
 
     mcp = FakeMCP()
     config_api.register(mcp)
@@ -76,6 +77,7 @@ async def test_config_get_single_owner_defaults(monkeypatch):
     monkeypatch.setattr(config_api.sh, "_require_auth", lambda request: None)
     monkeypatch.setattr(config_api.sh, "config", {})
     monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(config_api, "read_config_yaml", lambda: {})
 
     mcp = FakeMCP()
     config_api.register(mcp)

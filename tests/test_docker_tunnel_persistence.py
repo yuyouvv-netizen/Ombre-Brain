@@ -11,6 +11,9 @@ EDGE_DEFAULT = (
     "${TUNNEL_EDGE-region1.v2.argotunnel.com:7844,"
     "region2.v2.argotunnel.com:7844}"
 )
+TRUSTED_PROXY_DEFAULT = (
+    "${OMBRE_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}"
+)
 
 
 def _compose(name: str) -> dict:
@@ -46,6 +49,7 @@ def test_single_instance_compose_has_dns_fallback_and_persistent_bind(
 
     assert environment["TUNNEL_EDGE"] == EDGE_DEFAULT
     assert environment["TUNNEL_TRANSPORT_PROTOCOL"] == "${TUNNEL_TRANSPORT_PROTOCOL:-http2}"
+    assert environment["OMBRE_TRUSTED_PROXY_CIDRS"] == TRUSTED_PROXY_DEFAULT
     assert environment["OMBRE_HOST_VAULT_DIR"] == "${OMBRE_HOST_VAULT_DIR:-}"
     assert service["volumes"] == [
         {"type": "bind", "source": source, "target": "/app/buckets"}
@@ -63,6 +67,7 @@ def test_multi_instance_compose_keeps_vaults_isolated_and_uses_dns_fallback():
         environment = _environment(service)
         assert environment["TUNNEL_EDGE"] == EDGE_DEFAULT
         assert environment["TUNNEL_TRANSPORT_PROTOCOL"] == "${TUNNEL_TRANSPORT_PROTOCOL:-http2}"
+        assert environment["OMBRE_TRUSTED_PROXY_CIDRS"] == TRUSTED_PROXY_DEFAULT
         assert environment["OMBRE_HOST_VAULT_DIR"] == f"${{{source_var}:-}}"
         assert service["volumes"] == [{
             "type": "bind",
@@ -89,3 +94,4 @@ def test_env_example_uses_current_container_mount_and_tunnel_endpoints():
     assert "region1.v2.argotunnel.com:7844" in text
     assert "region2.v2.argotunnel.com:7844" in text
     assert "TUNNEL_TRANSPORT_PROTOCOL=http2" in text
+    assert "OMBRE_TRUSTED_PROXY_CIDRS" in text

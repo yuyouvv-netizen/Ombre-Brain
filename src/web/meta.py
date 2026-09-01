@@ -17,10 +17,11 @@ import os
 import re
 import sys
 import asyncio as _asyncio
+import threading
 import httpx
 
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 
 from . import _shared as sh
 
@@ -98,6 +99,121 @@ _MAX_UPDATE_MEMBER_BYTES = 16 * 1024 * 1024
 _MAX_UPDATE_TOTAL_BYTES = 128 * 1024 * 1024
 _MAX_UPDATE_COMPRESSION_RATIO = 500.0
 _MAX_UPDATE_MANIFEST_BYTES = 2 * 1024 * 1024
+_MAX_DEPENDENCY_MANIFEST_BYTES = 2 * 1024 * 1024
+_DEPENDENCY_MANIFEST_NAMES = ("requirements.txt", "requirements.lock.txt")
+_DEPENDENCY_ABSENCE_PREFIX = ".absent-"
+
+# A hot update mutates the live source tree and its single ``_prev`` rollback
+# point.  The reservation therefore has to be process-wide, rather than an
+# asyncio.Lock created inside ``register`` (FastMCP may serve more than one
+# event loop/thread).  Acquisition is deliberately non-blocking: a second
+# updater must fail before it downloads or touches any file.
+_UPDATE_JOB_LOCK = threading.Lock()
+_UPDATE_RESTART_TASKS: set[_asyncio.Task] = set()
+
+
+class _UpdateJobReservation:
+    """Idempotent owner for the process-wide hot-update reservation."""
+
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self._held = False
+        self._deferred_to_restart = False
+
+    def acquire(self) -> bool:
+        with self._state_lock:
+            if self._held or not _UPDATE_JOB_LOCK.acquire(blocking=False):
+                return False
+            self._held = True
+            return True
+
+    def release(self) -> None:
+        with self._state_lock:
+            if not self._held:
+                return
+            self._held = False
+            self._deferred_to_restart = False
+            _UPDATE_JOB_LOCK.release()
+
+    def defer_to_restart(self) -> None:
+        """Keep the reservation through the short SSE-to-exec hand-off."""
+        with self._state_lock:
+            if self._held:
+                self._deferred_to_restart = True
+
+    def release_unless_deferred(self) -> None:
+        with self._state_lock:
+            should_release = self._held and not self._deferred_to_restart
+        if should_release:
+            self.release()
+
+
+class _UpdateStreamingResponse(StreamingResponse):
+    """Streaming response that cannot leak the update reservation.
+
+    Starlette normally closes a response body after a client disconnect, but
+    exceptions can happen before/around body iteration too.  Releasing in both
+    the generator's ``finally`` and this ASGI boundary is safe because the
+    reservation owner is idempotent.
+    """
+
+    def __init__(self, content, reservation: _UpdateJobReservation, **kwargs):
+        self._update_reservation = reservation
+        super().__init__(content, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._update_reservation.release_unless_deferred()
+
+
+_UPDATE_WORKER_NO_RESULT = object()
+
+
+async def _await_update_worker(
+    func,
+    *args,
+    _cancel_result_cleanup=None,
+    **kwargs,
+):
+    """Run a blocking update step off-loop and reap it before cancellation.
+
+    ``asyncio.to_thread`` cannot stop its worker.  If an SSE client disconnects
+    while a filesystem copy, rollback, compile, fsync, or subprocess is still
+    running, releasing the update reservation immediately would let a second
+    request race that worker.  Shielding and reaping keeps the reservation held
+    until the step has genuinely stopped.
+    """
+
+    worker = _asyncio.create_task(_asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await _asyncio.shield(worker)
+    except _asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await _asyncio.shield(worker)
+            except _asyncio.CancelledError:
+                continue
+        result = _UPDATE_WORKER_NO_RESULT
+        try:
+            result = worker.result()
+        except BaseException:
+            pass
+        if (
+            _cancel_result_cleanup is not None
+            and result is not _UPDATE_WORKER_NO_RESULT
+        ):
+            # Resource-producing workers (mkdtemp/open) may finish after the
+            # caller was cancelled.  Clean their otherwise-lost result before
+            # propagating cancellation and releasing the update reservation.
+            try:
+                await _await_update_worker(_cancel_result_cleanup, result)
+            except _asyncio.CancelledError:
+                raise
+            except BaseException:
+                pass
+        raise
 
 
 def _update_repo_allowed(repo: str) -> bool:
@@ -130,26 +246,52 @@ def _is_version_downgrade(current: str, target: str) -> bool:
     return current_key + (0,) * (width - len(current_key)) > target_key + (0,) * (width - len(target_key))
 
 
-async def _download_update_archive(client: httpx.AsyncClient, url: str) -> bytes:
-    """Download an update archive without buffering an unbounded response."""
-    payload = bytearray()
-    async with client.stream("GET", url) as response:
-        response.raise_for_status()
-        declared = response.headers.get("content-length", "").strip()
-        if declared:
-            try:
-                declared_bytes = int(declared)
-            except ValueError as exc:
-                raise ValueError("更新服务器返回了无效的 Content-Length") from exc
-            if declared_bytes < 0:
-                raise ValueError("更新服务器返回了无效的 Content-Length")
-            if declared_bytes > _MAX_UPDATE_ARCHIVE_BYTES:
-                raise ValueError("更新压缩包超过 64 MiB 上限")
-        async for chunk in response.aiter_bytes():
-            payload.extend(chunk)
-            if len(payload) > _MAX_UPDATE_ARCHIVE_BYTES:
-                raise ValueError("更新压缩包超过 64 MiB 上限")
-    return bytes(payload)
+def _flush_and_fsync(handle) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+async def _download_update_archive_to_file(
+    client: httpx.AsyncClient,
+    url: str,
+    destination: str,
+) -> int:
+    """Stream a bounded update archive to disk without a 64 MiB RAM copy."""
+
+    downloaded = 0
+    handle = await _await_update_worker(
+        open,
+        destination,
+        "wb",
+        _cancel_result_cleanup=lambda orphan: orphan.close(),
+    )
+    try:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            declared = response.headers.get("content-length", "").strip()
+            if declared:
+                try:
+                    declared_bytes = int(declared)
+                except ValueError as exc:
+                    raise ValueError(
+                        "更新服务器返回了无效的 Content-Length"
+                    ) from exc
+                if declared_bytes < 0:
+                    raise ValueError("更新服务器返回了无效的 Content-Length")
+                if declared_bytes > _MAX_UPDATE_ARCHIVE_BYTES:
+                    raise ValueError("更新压缩包超过 64 MiB 上限")
+            async for chunk in response.aiter_bytes():
+                downloaded += len(chunk)
+                if downloaded > _MAX_UPDATE_ARCHIVE_BYTES:
+                    raise ValueError("更新压缩包超过 64 MiB 上限")
+                # Local/NFS volume writes can stall.  Keep them out of the
+                # server loop and do not release the job while a cancelled
+                # write is still running.
+                await _await_update_worker(handle.write, chunk)
+        await _await_update_worker(_flush_and_fsync, handle)
+    finally:
+        await _await_update_worker(handle.close)
+    return downloaded
 
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
@@ -378,14 +520,240 @@ def _restore_from_prev(repo_root: str, prev_dir: str, src_root: str, frontend_ro
                     shutil.copy2(prev_ver, _vp)
                 except OSError:
                     pass
-        prev_requirements = os.path.join(prev_dir, "requirements.txt")
-        if os.path.isfile(prev_requirements):
-            shutil.copy2(
-                prev_requirements, os.path.join(repo_root, "requirements.txt")
+        for root_name in _DEPENDENCY_MANIFEST_NAMES:
+            previous = os.path.join(prev_dir, root_name)
+            current = os.path.join(repo_root, root_name)
+            absent_marker = os.path.join(
+                prev_dir, f"{_DEPENDENCY_ABSENCE_PREFIX}{root_name}"
             )
+            if os.path.isfile(previous):
+                shutil.copy2(previous, current)
+            elif os.path.isfile(absent_marker) and os.path.isfile(current):
+                # 本次更新可能给旧版运行目录首次补入 lock。回滚必须恢复“原本不存在”
+                # 的状态，否则下次更新会把失败版本的清单误当成当前基线。
+                os.remove(current)
         return True
     except Exception:
         return False
+
+
+def _inspect_update_archive(archive_path: str) -> dict:
+    """Validate/plan a downloaded archive in a worker thread."""
+
+    import zipfile
+
+    with zipfile.ZipFile(archive_path) as zf:
+        names = zf.namelist()
+        top = (
+            names[0].split("/", 1)[0] + "/"
+            if names
+            else "Ombre-Brain-main/"
+        )
+        try:
+            version_bytes = _read_bounded_zip_member(zf, top + "VERSION", 128)
+        except KeyError:
+            version_bytes = None
+        try:
+            requirements_bytes = _read_bounded_zip_member(
+                zf, top + "requirements.txt", _MAX_DEPENDENCY_MANIFEST_BYTES
+            )
+        except KeyError:
+            requirements_bytes = None
+        try:
+            requirements_lock_bytes = _read_bounded_zip_member(
+                zf,
+                top + "requirements.lock.txt",
+                _MAX_DEPENDENCY_MANIFEST_BYTES,
+            )
+        except KeyError:
+            requirements_lock_bytes = None
+        return {
+            "top": top,
+            "target_version": (
+                version_bytes.decode("utf-8", "ignore").strip()
+                if version_bytes is not None
+                else ""
+            ),
+            "version_bytes": version_bytes,
+            "requirements_bytes": requirements_bytes,
+            "requirements_lock_bytes": requirements_lock_bytes,
+            "plan": _plan_update_files(zf, top),
+        }
+
+
+def _backup_update_tree(
+    repo_root: str,
+    src_root: str,
+    frontend_root: str,
+    prev_dir: str,
+) -> None:
+    """Create the sole rollback point; caller owns the global update lock."""
+
+    import shutil
+
+    if not os.path.isdir(src_root):
+        raise FileNotFoundError(f"当前源码目录不存在：{src_root}")
+    shutil.rmtree(prev_dir, ignore_errors=True)
+    os.makedirs(prev_dir, exist_ok=True)
+    shutil.copytree(src_root, os.path.join(prev_dir, "src"))
+    if os.path.isdir(frontend_root):
+        shutil.copytree(frontend_root, os.path.join(prev_dir, "frontend"))
+    for root_name in ("VERSION",):
+        current = os.path.join(repo_root, root_name)
+        if os.path.isfile(current):
+            shutil.copy2(current, os.path.join(prev_dir, root_name))
+    for root_name in _DEPENDENCY_MANIFEST_NAMES:
+        current = os.path.join(repo_root, root_name)
+        if os.path.isfile(current):
+            shutil.copy2(current, os.path.join(prev_dir, root_name))
+        else:
+            marker = os.path.join(
+                prev_dir, f"{_DEPENDENCY_ABSENCE_PREFIX}{root_name}"
+            )
+            with open(marker, "wb"):
+                pass
+
+
+def _apply_update_files(
+    plan: dict,
+    repo_root: str,
+    src_root: str,
+    frontend_root: str,
+    version_bytes: bytes | None,
+) -> int:
+    """Write one validated plan and its version files from a worker thread."""
+
+    updated = 0
+    dest_roots = {"src": src_root, "frontend": frontend_root}
+    for rel, data in plan["files"].items():
+        segment, _, subpath = rel.partition("/")
+        dest_root = dest_roots.get(segment)
+        if not dest_root:
+            continue
+        dest = os.path.join(dest_root, subpath)
+        root_abs = os.path.abspath(dest_root)
+        dest_abs = os.path.abspath(dest)
+        if dest_abs != root_abs and not dest_abs.startswith(root_abs + os.sep):
+            raise ValueError(f"更新目标越界：{rel}")
+        _atomic_write_bytes(dest, data)
+        updated += 1
+
+    if version_bytes is not None:
+        for version_path in (
+            os.path.join(repo_root, "VERSION"),
+            os.path.join(src_root, "VERSION"),
+        ):
+            _atomic_write_bytes(version_path, version_bytes)
+    return updated
+
+
+def _normalize_dependency_manifest(data: bytes | None) -> bytes:
+    """只消除跨平台换行差异，不改写任何依赖或 hash 内容。"""
+
+    if not data:
+        return b""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").strip()
+
+
+def _read_dependency_baseline(repo_root: str, root_name: str) -> bytes | None:
+    """读取当前依赖基线；持久代码目录缺文件时回退镜像内置根目录。"""
+
+    roots = [os.path.abspath(repo_root)]
+    configured_image_root = os.environ.get("OMBRE_IMAGE_ROOT", "").strip()
+    if configured_image_root:
+        image_root = os.path.abspath(configured_image_root)
+        if image_root not in roots:
+            roots.append(image_root)
+    elif sh.in_docker():
+        image_root = os.path.abspath("/app")
+        if image_root not in roots:
+            roots.append(image_root)
+
+    for root in roots:
+        path = os.path.join(root, root_name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as handle:
+            data = handle.read(_MAX_DEPENDENCY_MANIFEST_BYTES + 1)
+        if len(data) > _MAX_DEPENDENCY_MANIFEST_BYTES:
+            raise ValueError(f"当前 {root_name} 超过 2 MiB 上限")
+        if data.strip():
+            return data
+    return None
+
+
+def _requirements_changed(
+    repo_root: str,
+    new_requirements: bytes | None,
+    new_requirements_lock: bytes | None = None,
+) -> bool:
+    """依据正式发布 lock 判断依赖是否变化，旧包缺 lock 时兼容原判定。"""
+
+    new_lock = _normalize_dependency_manifest(new_requirements_lock)
+    if new_lock:
+        old_lock = _read_dependency_baseline(repo_root, "requirements.lock.txt")
+        # 新包声明了正式发布 lock，就只能与同类型基线比较。基线缺失时不能拿
+        # requirements.txt 猜测传递依赖是否相同，必须按真实变化 fail closed。
+        return old_lock is None or (
+            new_lock != _normalize_dependency_manifest(old_lock)
+        )
+
+    new_source = _normalize_dependency_manifest(new_requirements)
+    if not new_source:
+        return False
+    old_source = _read_dependency_baseline(repo_root, "requirements.txt")
+    return new_source != _normalize_dependency_manifest(old_source)
+
+
+def _sync_update_dependency_manifests(
+    repo_root: str,
+    requirements_bytes: bytes | None,
+    requirements_lock_bytes: bytes | None,
+) -> None:
+    """成功更新时同步根级依赖清单，使后续热更新拥有稳定本地基线。"""
+
+    for root_name, data in (
+        ("requirements.txt", requirements_bytes),
+        ("requirements.lock.txt", requirements_lock_bytes),
+    ):
+        if data is not None and data.strip():
+            _atomic_write_bytes(os.path.join(repo_root, root_name), data)
+
+
+def _install_update_requirements(
+    requirements_path: str,
+    data: bytes,
+    *,
+    require_hashes: bool = False,
+):
+    """原子保存依赖清单，并在工作线程中执行受约束的 pip 安装。"""
+
+    import subprocess
+
+    _atomic_write_bytes(requirements_path, data)
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+    ]
+    if require_hashes:
+        command.append("--require-hashes")
+    command.extend(("-r", requirements_path))
+    return subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=600,
+        check=False,
+    )
+
+
+def _cleanup_update_temp(path: str) -> None:
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _path_is_mounted_volume(path: str, mountinfo_path: str = "/proc/self/mountinfo") -> bool:
@@ -439,6 +807,17 @@ def _hot_update_persistence() -> dict:
     返回 {persistent, mode, repo_root, note}。
     """
     repo_root = str(getattr(sh, "repo_root", "") or "")
+    if os.environ.get("RENDER", "").strip().lower() == "true":
+        return {
+            "persistent": False,
+            "mode": "render-ephemeral",
+            "repo_root": repo_root,
+            "note": (
+                "Render 的源码目录属于临时文件系统；Dashboard 热更新只对当前实例有效，"
+                "平台重启或重新部署后会回到 Git/Blueprint 部署的版本。请通过 Render 的"
+                "正式部署流程升级版本。"
+            ),
+        }
     if not sh.in_docker():
         return {
             "persistent": True,
@@ -518,11 +897,13 @@ def register(mcp) -> None:
         if err:
             return err
         is_docker = os.path.exists("/.dockerenv")
+        is_render = os.environ.get("RENDER", "").strip().lower() == "true"
         container_name = os.environ.get("OMBRE_CONTAINER_NAME", "ombre-brain")
         persistence = _hot_update_persistence()
         return JSONResponse({
             "version": sh.version,
             "is_docker": is_docker,
+            "is_render": is_render,
             "container_name": container_name,
             "port": int(sh.config.get("port") or 8000),
             "data_dir": str(sh.config.get("buckets_dir") or "（未知）"),
@@ -535,17 +916,50 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/do-update", methods=["POST"])
     async def api_do_update(request: Request) -> Response:
-        from starlette.responses import StreamingResponse
-        import asyncio as _asyncio
-        import io as _io
-        import os as _os
-        import zipfile as _zipfile
+        from starlette.responses import JSONResponse
+        import tempfile as _tempfile
 
         err = sh._require_auth(request)
         if err:
             return err
 
+        # Reserve synchronously before the first await or network request.  A
+        # second updater must never share the live tree or the sole _prev slot.
+        reservation = _UpdateJobReservation()
+        if not reservation.acquire():
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "busy": True,
+                    "error": "已有热更新任务正在运行，请等待其完成后重试",
+                },
+                status_code=409,
+            )
+
         async def _stream():
+            temp_dir = ""
+            repo_root = ""
+            src_root = ""
+            frontend_root = ""
+            prev_dir = ""
+            source_touched = False
+            committed = False
+
+            async def _rollback_if_needed() -> bool | None:
+                nonlocal source_touched
+                if not source_touched or not prev_dir:
+                    return None
+                restored = await _await_update_worker(
+                    _restore_from_prev,
+                    repo_root,
+                    prev_dir,
+                    src_root,
+                    frontend_root,
+                )
+                if restored:
+                    source_touched = False
+                return bool(restored)
+
             try:
                 yield "data: 正在连接 GitHub…\n\n"
                 await _asyncio.sleep(0.1)
@@ -590,28 +1004,38 @@ def register(mcp) -> None:
                         except Exception as _rel_e:
                             yield f"data: 查询 Release 失败（{_rel_e}），回退到分支下载…\n\n"
                     yield f"data: 正在下载 {_label} …\n\n"
-                    zip_bytes = await _download_update_archive(client, _zip_url)
+                    temp_dir = await _await_update_worker(
+                        _tempfile.mkdtemp,
+                        prefix="ombre-update-",
+                        _cancel_result_cleanup=_cleanup_update_temp,
+                    )
+                    archive_path = os.path.join(temp_dir, "update.zip")
+                    await _download_update_archive_to_file(
+                        client, _zip_url, archive_path
+                    )
+
+                # ZIP traversal/size/ratio/manifest/hash validation and member
+                # reads are CPU/disk work; keep the server loop responsive.
+                inspected = await _await_update_worker(
+                    _inspect_update_archive, archive_path
+                )
+                plan = inspected["plan"]
+                target_version = inspected["target_version"]
+                requirements_bytes = inspected.get("requirements_bytes")
+                requirements_lock_bytes = inspected.get("requirements_lock_bytes")
 
                 # Refuse a valid-but-older archive before creating _prev or
                 # touching any runtime file.  Explicit release-channel users
                 # are protected too when GitHub's Latest marker is stale.
-                with _zipfile.ZipFile(_io.BytesIO(zip_bytes)) as _version_zip:
-                    _version_names = _version_zip.namelist()
-                    _version_top = (
-                        _version_names[0].split("/", 1)[0] + "/"
-                        if _version_names else "Ombre-Brain-main/"
-                    )
-                    try:
-                        _target_version = _read_bounded_zip_member(
-                            _version_zip, _version_top + "VERSION", 128
-                        ).decode("utf-8", "ignore").strip()
-                    except KeyError:
-                        _target_version = ""
-                if _target_version and _is_version_downgrade(sh.version, _target_version):
+                if target_version and _is_version_downgrade(sh.version, target_version):
                     yield (
                         f"data: ERROR:拒绝降级：当前版本 v{sh.version}，更新包版本 "
-                        f"v{_target_version}。未改动任何文件。\n\n"
+                        f"v{target_version}。未改动任何文件。\n\n"
                     )
+                    return
+
+                if plan["abort"]:
+                    yield f"data: ERROR:{plan['abort']}（已中止，未改动任何文件）\n\n"
                     return
 
                 yield "data: 下载完成，正在解压文件…\n\n"
@@ -619,180 +1043,209 @@ def register(mcp) -> None:
 
                 # 目标根目录用注入的 sh.repo_root（Docker 下 = /app；裸机/VPS = 实际安装目录）。
                 # 绝不能在这里用 __file__：本文件在 src/web/ 下，算出来会差一层。
-                _repo_root = sh.repo_root
-                src_root      = _os.path.join(_repo_root, "src")
-                frontend_root = _os.path.join(_repo_root, "frontend")
+                repo_root = sh.repo_root
+                src_root = os.path.join(repo_root, "src")
+                frontend_root = os.path.join(repo_root, "frontend")
 
                 # #4a ②：覆盖前把当前 src/frontend 备份成回滚点 _prev，坏更新崩溃时 entrypoint 还原。
-                import shutil as _shutil
-                _prev = _os.path.join(_repo_root, "_prev")
+                prev_dir = os.path.join(repo_root, "_prev")
                 try:
-                    if not _os.path.isdir(src_root):
-                        raise FileNotFoundError(f"当前源码目录不存在：{src_root}")
-                    _shutil.rmtree(_prev, ignore_errors=True)
-                    _os.makedirs(_prev, exist_ok=True)
-                    _shutil.copytree(src_root, _os.path.join(_prev, "src"))
-                    if _os.path.isdir(frontend_root):
-                        _shutil.copytree(frontend_root, _os.path.join(_prev, "frontend"))
-                    for _root_name in ("VERSION", "requirements.txt"):
-                        _current = _os.path.join(_repo_root, _root_name)
-                        if _os.path.isfile(_current):
-                            _shutil.copy2(_current, _os.path.join(_prev, _root_name))
+                    await _await_update_worker(
+                        _backup_update_tree,
+                        repo_root,
+                        src_root,
+                        frontend_root,
+                        prev_dir,
+                    )
                     yield "data: 已备份当前版本为回滚点…\n\n"
                 except Exception as _bk:
                     yield f"data: ERROR:备份回滚点失败，已中止且未覆盖任何文件：{_bk}\n\n"
                     return
 
-                with _zipfile.ZipFile(_io.BytesIO(zip_bytes)) as zf:
-                    # 从 zip 顶层目录名推前缀（随分支/标签变化，不能写死 -main）。
-                    _names = zf.namelist()
-                    _top = (_names[0].split("/", 1)[0] + "/") if _names else "Ombre-Brain-main/"
+                if plan["verified"]:
+                    yield "data: 已通过 sha256 完整性校验…\n\n"
+                else:
+                    yield "data: 未提供 update_manifest.json，已按路径保护过滤但跳过 sha256 校验…\n\n"
 
-                    # 安全加固 #1：先收集到内存 + 路径保护过滤 + 可选 sha256 清单校验，
-                    # 通过后才落盘。校验失败则整体中止，一个字节都不写（现有 _prev/自愈回滚仍在）。
-                    _plan = _plan_update_files(zf, _top)
-                    if _plan["abort"]:
-                        yield f"data: ERROR:{_plan['abort']}（已中止，未改动任何文件）\n\n"
-                        return
-                    if _plan["verified"]:
-                        yield "data: 已通过 sha256 完整性校验…\n\n"
-                    else:
-                        yield "data: 未提供 update_manifest.json，已按路径保护过滤但跳过 sha256 校验…\n\n"
+                # All atomic writes/fsyncs run as one reaped worker step.  Mark
+                # the tree dirty before launching it so disconnects roll back
+                # even if cancellation lands during the first write.
+                source_touched = True
+                try:
+                    updated = await _await_update_worker(
+                        _apply_update_files,
+                        plan,
+                        repo_root,
+                        src_root,
+                        frontend_root,
+                        inspected["version_bytes"],
+                    )
+                except Exception as write_error:
+                    restored = await _rollback_if_needed()
+                    state = "已回滚" if restored else "回滚失败"
+                    yield f"data: ERROR:写入更新失败（{write_error}），{state}。\n\n"
+                    return
 
-                    updated = 0
-                    _dest_roots = {"src": src_root, "frontend": frontend_root}
-                    try:
-                        for rel, data in _plan["files"].items():
-                            _seg, _, _sub = rel.partition("/")
-                            dest_root = _dest_roots.get(_seg)
-                            if not dest_root:
-                                continue
-                            dest = _os.path.join(dest_root, _sub)
-                            # Zip-Slip 二次防护：写盘路径必须仍在目标根目录内。
-                            _root_abs = _os.path.abspath(dest_root)
-                            _dest_abs = _os.path.abspath(dest)
-                            if _dest_abs != _root_abs and not _dest_abs.startswith(_root_abs + _os.sep):
-                                raise ValueError(f"更新目标越界：{rel}")
-                            _atomic_write_bytes(dest, data)
-                            updated += 1
-                    except Exception as _write_error:
-                        restored = _restore_from_prev(
-                            _repo_root, _prev, src_root, frontend_root
-                        )
-                        state = "已回滚" if restored else "回滚失败"
-                        yield f"data: ERROR:写入更新失败（{_write_error}），{state}。\n\n"
-                        return
-                    if _plan["skipped_unsafe"]:
-                        yield f"data: 已跳过 {_plan['skipped_unsafe']} 个路径异常/受保护的条目（安全防护）…\n\n"
-                    if _plan["skipped_unlisted"]:
-                        yield f"data: 已跳过 {_plan['skipped_unlisted']} 个不在校验清单内的文件（未经校验不落盘）…\n\n"
+                if plan["skipped_unsafe"]:
+                    yield f"data: 已跳过 {plan['skipped_unsafe']} 个路径异常/受保护的条目（安全防护）…\n\n"
+                if plan["skipped_unlisted"]:
+                    yield f"data: 已跳过 {plan['skipped_unlisted']} 个不在校验清单内的文件（未经校验不落盘）…\n\n"
+                if inspected["version_bytes"] is not None:
+                    yield f"data: 版本号已同步为 v{target_version}…\n\n"
 
-                    # --- 同步 VERSION：根目录 VERSION 为唯一真源，写到所有 get_version()
-                    #     会读的位置（<root>/VERSION 与 <root>/src/VERSION）。---
-                    # 历史坑：热更新只覆盖 src/ 和 frontend/，根目录 VERSION 不在其中；
-                    # 而 get_version() 还会读 src/VERSION。两个 VERSION 文件靠人手动同步，
-                    # 发版漏改一个就会出现「更新了一堆文件、版本号却原地不动」。这里在解压后
-                    # 显式把 zip 里的根 VERSION 强制写到两处，保证更新后版本号一定刷新、不再漂移。
-                    try:
-                        ver_bytes = _read_bounded_zip_member(
-                            zf, _top + "VERSION", 128
-                        )
-                        for _vpath in (
-                            _os.path.join(_repo_root, "VERSION"),
-                            _os.path.join(src_root, "VERSION"),
-                        ):
-                            _atomic_write_bytes(_vpath, ver_bytes)
-                        yield f"data: 版本号已同步为 v{ver_bytes.decode('utf-8', 'ignore').strip()}…\n\n"
-                    except KeyError:
-                        pass  # zip 里没有 VERSION（极少数情况）：跳过，不阻断更新
-                    except Exception as _version_error:
-                        restored = _restore_from_prev(
-                            _repo_root, _prev, src_root, frontend_root
-                        )
-                        state = "已回滚" if restored else "回滚失败"
-                        yield f"data: ERROR:版本文件写入失败（{_version_error}），{state}。\n\n"
-                        return
-
-                    # #4a ③：依赖变更 → best-effort pip install。
-                    # 热更新只覆盖 .py，新版若加了依赖、不装会 import 失败（被 ② 当启动失败回滚）。
-                    try:
-                        _new_req = _read_bounded_zip_member(
-                            zf, _top + "requirements.txt", 2 * 1024 * 1024
-                        )
-                        _req_path = _os.path.join(_repo_root, "requirements.txt")
-                        _old_req = b""
-                        if _os.path.isfile(_req_path):
-                            with open(_req_path, "rb") as _rf:
-                                _old_req = _rf.read()
-                        if _new_req.strip() and _new_req.strip() != _old_req.strip():
-                            # 安全闸门 #2：自动 pip install 默认关闭——否则远端 zip 里的
-                            # requirements.txt 能让本机装任意包。需 config update.allow_pip_install
-                            # 或 env OMBRE_UPDATE_ALLOW_PIP=1 显式开启。
-                            if not _pip_install_allowed():
-                                if _restore_from_prev(_repo_root, _prev, src_root, frontend_root):
-                                    yield ("data: ERROR:新版依赖清单有变化，自动 pip 安装处于关闭状态；"
-                                           "为避免重启后缺包，已回滚本次热更新。请重建镜像，或明确设置 "
-                                           "OMBRE_UPDATE_ALLOW_PIP=1 后重试。\n\n")
-                                else:
-                                    yield "data: ERROR:依赖发生变化且自动安装关闭，回滚失败，请手动恢复 _prev。\n\n"
-                                return
-                            else:
-                                _atomic_write_bytes(_req_path, _new_req)
-                                yield "data: 依赖清单有变化，正在 pip install…\n\n"
-                                import subprocess as _sp
-                                import sys as _sys
-                                _p = _sp.run(
-                                    [_sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", _req_path],
-                                    capture_output=True, text=True, timeout=600,
+                # #4a ③：先判定并同步清单，再完成代码编译自检；只有这些可回滚步骤
+                # 全部成功后才允许 pip 改动解释器环境，避免后续失败留下半更新依赖。
+                requirements_changed = False
+                install_lock = False
+                install_name = ""
+                install_bytes = None
+                try:
+                    requirements_changed = await _await_update_worker(
+                        _requirements_changed,
+                        repo_root,
+                        requirements_bytes,
+                        requirements_lock_bytes,
+                    )
+                    if requirements_changed:
+                        if not _pip_install_allowed():
+                            restored = await _rollback_if_needed()
+                            if restored:
+                                yield (
+                                    "data: ERROR:新版依赖清单有变化，自动 pip 安装处于关闭状态；"
+                                    "为避免重启后缺包，已回滚本次热更新。请重建镜像，或明确设置 "
+                                    "OMBRE_UPDATE_ALLOW_PIP=1 后重试。\n\n"
                                 )
-                                if _p.returncode != 0:
-                                    restored = _restore_from_prev(
-                                        _repo_root, _prev, src_root, frontend_root
-                                    )
-                                    state = "已回滚" if restored else "回滚失败"
-                                    yield f"data: ERROR:依赖安装失败，{state}；服务不会重启。\n\n"
-                                    return
-                                yield "data: 依赖安装完成…\n\n"
-                    except KeyError:
-                        pass  # zip 里没有 requirements.txt：跳过
-                    except Exception as _rqe:
-                        restored = _restore_from_prev(
-                            _repo_root, _prev, src_root, frontend_root
+                            else:
+                                yield "data: ERROR:依赖发生变化且自动安装关闭，回滚失败，请手动恢复 _prev。\n\n"
+                            return
+
+                        install_lock = bool(
+                            requirements_lock_bytes
+                            and requirements_lock_bytes.strip()
                         )
-                        state = "已回滚" if restored else "回滚失败"
-                        yield f"data: ERROR:依赖处理失败（{_rqe}），{state}。\n\n"
-                        return
+                        install_name = (
+                            "requirements.lock.txt"
+                            if install_lock
+                            else "requirements.txt"
+                        )
+                        install_bytes = (
+                            requirements_lock_bytes
+                            if install_lock
+                            else requirements_bytes
+                        )
+                        if not install_bytes:
+                            raise ValueError("更新包缺少可安装的依赖清单")
+
+                    await _await_update_worker(
+                        _sync_update_dependency_manifests,
+                        repo_root,
+                        requirements_bytes,
+                        requirements_lock_bytes,
+                    )
+                except Exception as requirements_error:
+                    restored = await _rollback_if_needed()
+                    state = "已回滚" if restored else "回滚失败"
+                    yield f"data: ERROR:依赖处理失败（{requirements_error}），{state}。\n\n"
+                    return
 
                 # B2：重启前先验证新代码能编译。不通过就从 _prev 自动还原、放弃重启，
                 # 保住当前可用状态——尤其裸机没有别的守护会兜底。
-                _compile_err = _compile_check_dir(src_root)
-                if _compile_err:
-                    yield f"data: 新代码自检未通过（{_compile_err}）。正在还原到更新前的版本…\n\n"
-                    if _restore_from_prev(_repo_root, _prev, src_root, frontend_root):
+                compile_error = await _await_update_worker(
+                    _compile_check_dir, src_root
+                )
+                if compile_error:
+                    yield f"data: 新代码自检未通过（{compile_error}）。正在还原到更新前的版本…\n\n"
+                    if await _rollback_if_needed():
                         yield "data: 已还原上一版，服务保持当前运行、不重启。可稍后重试或联系维护者。\n\n"
                     else:
                         yield "data: ⚠️ 自动还原失败，请检查 _prev 备份目录并手动恢复。\n\n"
                     yield "data: ERROR:更新已中止（新代码自检失败，已回滚，未重启）\n\n"
                     return
 
+                if requirements_changed:
+                    yield "data: 依赖清单有变化，正在 pip install…\n\n"
+                    try:
+                        pip_result = await _await_update_worker(
+                            _install_update_requirements,
+                            os.path.join(repo_root, install_name),
+                            install_bytes,
+                            require_hashes=install_lock,
+                        )
+                    except Exception as requirements_error:
+                        restored = await _rollback_if_needed()
+                        state = "已回滚" if restored else "回滚失败"
+                        yield f"data: ERROR:依赖处理失败（{requirements_error}），{state}。\n\n"
+                        return
+                    if pip_result.returncode != 0:
+                        restored = await _rollback_if_needed()
+                        state = "已回滚" if restored else "回滚失败"
+                        yield f"data: ERROR:依赖安装失败，{state}；服务不会重启。\n\n"
+                        return
+                    yield "data: 依赖安装完成…\n\n"
+
+                # Remove the downloaded ZIP before handing the reservation to
+                # the restart task.  This also keeps failed/successful updates
+                # from accumulating temp archives.
+                await _await_update_worker(_cleanup_update_temp, temp_dir)
+                temp_dir = ""
+
                 yield f"data: 已更新 {updated} 个文件，即将重启服务…\n\n"
                 await _asyncio.sleep(0.5)
-                yield "data: RESTART\n\n"
 
                 async def _restart():
                     # 先睡 0.8s 让上面的 SSE "RESTART" 行刷给前端，再原地自重启。
-                    await _asyncio.sleep(0.8)
+                    try:
+                        await _asyncio.sleep(0.8)
+                    finally:
+                        # No second update may start during this hand-off.
+                        reservation.release()
                     _restart_self()
-                _asyncio.create_task(_restart())
 
+                restart_task = _asyncio.create_task(_restart())
+                _UPDATE_RESTART_TASKS.add(restart_task)
+                restart_task.add_done_callback(_UPDATE_RESTART_TASKS.discard)
+                reservation.defer_to_restart()
+                committed = True
+                yield "data: RESTART\n\n"
+
+            except _asyncio.CancelledError:
+                raise
             except Exception as e:
-                yield f"data: ERROR:{e}\n\n"
+                restored = await _rollback_if_needed()
+                suffix = "，已回滚" if restored else ""
+                yield f"data: ERROR:{e}{suffix}\n\n"
+            finally:
+                # ``aclose`` injects GeneratorExit rather than CancelledError;
+                # the central rollback therefore lives here as well.  Reaped
+                # worker calls ensure the lock is never released while a
+                # cancelled copy/write/rollback is still running.
+                if source_touched and not committed:
+                    try:
+                        await _rollback_if_needed()
+                    except BaseException:
+                        pass
+                if temp_dir:
+                    try:
+                        await _await_update_worker(
+                            _cleanup_update_temp, temp_dir
+                        )
+                    except BaseException:
+                        pass
+                reservation.release_unless_deferred()
 
-        return StreamingResponse(
-            _stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        try:
+            return _UpdateStreamingResponse(
+                _stream(),
+                reservation,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except BaseException:
+            reservation.release()
+            raise
 
     @mcp.custom_route("/api/maintenance/fix-pinned-desync", methods=["GET", "POST"])
     async def api_fix_pinned_desync(request: Request) -> Response:
@@ -837,23 +1290,18 @@ def register(mcp) -> None:
         gem_cfg = bool((sh.config.get("dehydration", {}) or {}).get("api_key", "")) or \
             bool((sh.config.get("embedding", {}) or {}).get("api_key", ""))
 
-        deployment = sh.config.get("deployment")
-        deployment_cfg = deployment if isinstance(deployment, dict) else {}
-        deployment_completed = bool(deployment_cfg.get("onboarding_completed"))
-
         first_run = (not dash_env and not dash_file) and (not gem_env and not gem_cfg)
 
-        return JSONResponse({
-            "first_run": first_run,
-            "dashboard_password_set": dash_env or dash_file,
-            "dashboard_password_source": "env" if dash_env else ("file" if dash_file else "none"),
-            "gemini_key_set": gem_env or gem_cfg,
-            "gemini_key_source": "env" if gem_env else ("config" if gem_cfg else "none"),
-            "embedding_enabled": sh.embedding_engine.enabled,
-            "deployment_onboarding_completed": deployment_completed,
-            "deployment_profile": deployment_cfg.get("profile") or "unconfigured",
-            "deployment_onboarding_url": "/onboarding",
-        })
+        # Public first-run UI needs only these display booleans.  Credential
+        # source, deployment profile and detailed capability state belong to
+        # authenticated /api/status rather than a remotely enumerable route.
+        return JSONResponse(
+            {
+                "first_run": first_run,
+                "embedding_enabled": bool(sh.embedding_engine.enabled),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     @mcp.custom_route("/api/status", methods=["GET"])
     async def api_system_status(request: Request) -> Response:
