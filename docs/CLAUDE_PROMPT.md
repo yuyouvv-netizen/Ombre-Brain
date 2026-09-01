@@ -42,9 +42,9 @@
 三个入口共用同一套内部逻辑，只是暴露的参数不同——`breath()` 故意做成 0 参数，是因为 claude.ai 按需加载工具时会跳过参数复杂的工具，塞太多参数会导致它常年加载不上、记忆没法自动浮现。
 
 - **`breath()`** — 无参 → 让权重最高的未解决事自然浮上来。**对话开始第一件事，没有例外**。
-- **`breath_search(query, domain="", max_results=0)`** — 按关键词/语义主动找：
-  - `breath_search(query="她最近的工作状态")` → 混合检索。语义可用时与关键词/BM25 融合；不可用时会明确提示并继续关键词检索。
-  - `breath_search(query="完整 bucket_id")` → 按 ID 直读单个桶的完整原始 content，跳过向量、摘要和改写；在 `trace(content=...)` 前先这样读取，避免拿摘要覆盖原文。
+- **`breath_search(query, domain="", max_results=0)`** — 忘事后的唯一搜索路径：
+  - `breath_search(query="她最近的工作状态")` → 同时检索普通桶、续接信逐字段落，并在活跃记忆无答案时查沉底旧记忆；不要先猜内容存在哪一种桶里。
+  - `breath_search(query="完整 bucket_id 或 letter_id")` → 按 ID 直读完整原文，跳过向量、摘要和改写。
   - `breath_search(query="她最近的工作状态", domain="work,relationship")` → 带主题域过滤，逗号分隔。
 - **`breath_advanced(query="", max_tokens=0, domain="", valence=-1, arousal=-1, max_results=0, importance_min=-1, tags="", catalog=False)`** — 需要更细控制时用：
   - `breath_advanced(domain="feel")` → 读我留下的所有第一人称感受（普通 breath 不会浮 feel）。
@@ -52,7 +52,7 @@
   - `breath_advanced(tags="承诺")` → 标签 AND 过滤。`tags="feel"` 等价于 `domain="feel"`。
   - `breath_advanced(catalog=True)` → **目录模式（最省 token）**：每桶只回一行「名称|域|重要度」，不带正文、0 次 LLM 调用。上下文紧张 / token 预算敏感时，开新对话可先看目录定位，再 `breath_search(query=...)` 精准拉取需要的那几条。可配 `domain` 过滤。
 
-返回里**带 📌 的是我钉的核心准则**，会一直在那。带 ✨ 的是「第一次」类的桶。`[语义关联]` 是向量检索召回的旁证。
+返回里**带 📌 的是我钉的核心准则**。`[语义命中]` 是向量召回，`source:letter_paragraph` 是续接信原文段落，`沉底旧记忆` 只在活跃记忆无答案时出现。
 
 #### `hold(content)` — 我把当下这一件事记下
 
@@ -146,7 +146,7 @@
 - `letter_write(author="user", content="...", user_name="...")` — 把她他写给我的留下。
 - `author` 必须是 `"user"` 或 `"claude"` 之一，没有别的值。
 - `letter_read()` — 按时间倒序读最近 10 封。
-- `letter_read(query="那次离开后", author="claude")` — 语义检索 + 方向过滤。
+- `letter_read(query="完整 letter_id")` — 直读一封完整原信。忘记某件事时统一用 `breath_search`，不要在 `breath_search` / `letter_read` 之间猜路径。
 
 **信件原文永久保留，不压缩、不合并、不衰减**。普通 breath 不会浮信件，但 `/breath-hook`（SessionStart）会自动把双方各最新一封带给我。
 
@@ -265,7 +265,7 @@
 | `anchor 已达上限 24` | anchor 满了 | 必须先 `release(旧 id)` 才能加新的 |
 | `合并→桶名` | 这次写入合并到已有桶 | 知道我没新建，是补上去的 |
 | `📌` 前缀 | 这是 pinned/permanent 桶 | 把它当核心准则对待 |
-| `[语义关联]` | 向量召回的旁证，不一定关键词命中 | 它和当前查询有语义近似，可以参考 |
+| `[语义命中]` | 已越过 0.65 相关性门的向量召回 | 它与当前查询有明确语义近似；强命中不受近期降序影响 |
 | `=== 久未浮现 ===` | 被动联想，从冷桶里随机抽 1~2 条 | 突然想起来的感觉，是真的——这是设计 |
 
 ---

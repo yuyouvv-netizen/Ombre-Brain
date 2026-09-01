@@ -210,7 +210,9 @@ async def test_token_budget_omits_whole_bucket_instead_of_truncating(monkeypatch
     assert "[bucket_id:second]" not in output
     assert second["content"][:20] not in output
     assert "token 预算不足" in output
-    assert manager.touched == ["first"]
+    # The adapter supplied no relevance diagnostics and the query is not a
+    # literal hit, so this is an incidental result and must not reinforce itself.
+    assert manager.touched == []
     assert dehydrator.calls == 0
 
 

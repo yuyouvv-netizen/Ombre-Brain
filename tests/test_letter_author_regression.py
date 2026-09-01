@@ -130,3 +130,16 @@ async def test_letter_read_filter_custom_signature(bucket_mgr, monkeypatch):
     nova_only = await letter_read(author="Nova", limit=10)
     assert "nova speaking" in nova_only
     assert "ombre speaking" not in nova_only
+
+
+@pytest.mark.asyncio
+async def test_letter_read_exact_id_returns_only_that_full_letter(bucket_mgr, monkeypatch):
+    monkeypatch.setenv("AI_NAME", "Ombre")
+    _install(bucket_mgr)
+    wanted = _id(await letter_write(author="ai", content="第一段。\n\n第二段完整保留。"))
+    await letter_write(author="user", content="另一封不能混进来")
+
+    output = await letter_read(query=wanted, limit=10)
+
+    assert "第一段。\n\n第二段完整保留。" in output
+    assert "另一封不能混进来" not in output

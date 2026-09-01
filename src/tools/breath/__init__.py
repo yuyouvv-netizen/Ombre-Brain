@@ -10,7 +10,7 @@ breath 是「我睁眼看看自己记得什么」。这个文件根据参数把�
 - feel.py：domain="feel"（或 tags 含 feel/__feel__）→ 拉所有 feel 桶
 - importance.py：importance_min >= 1 → 跳过语义，按 importance 拉前 20
 - surface.py：query 为空 → 浮现模式（pinned + 加权采样未解决桶 + passive）
-- search.py：有 query → 检索模式（关键词 + 向量双通道 + 随机漂浮）
+- search.py：有 query → 统一检索（普通桶 + 续接信段落 + 沉底旧记忆）
 
 关键行为：
 - 入口 dispatch() 做参数 null-safe 兜底、token/result 上限归一化、
@@ -96,8 +96,20 @@ async def dispatch(
         return await surface_catalog(domain_filter=domain_filter or None)
 
     surfacing_cfg = rt.config.get("surfacing", {}) or {}
-    default_results = int(surfacing_cfg.get("breath_max_results") or 20)
-    default_tokens = int(surfacing_cfg.get("breath_max_tokens") or 10000)
+    is_search = bool(query and query.strip())
+    if is_search:
+        # 检索与无参 breath 是两种任务：前者默认少而准，后者保留用户既有的
+        # 浮现桶数量。显式传 max_* 时仍完全尊重调用方。
+        matching_cfg = rt.config.get("matching", {}) or {}
+        default_results = int(
+            surfacing_cfg.get("search_max_results")
+            or matching_cfg.get("max_results")
+            or 4
+        )
+        default_tokens = int(surfacing_cfg.get("search_max_tokens") or 6000)
+    else:
+        default_results = int(surfacing_cfg.get("breath_max_results") or 20)
+        default_tokens = int(surfacing_cfg.get("breath_max_tokens") or 10000)
     if max_results <= 0:
         max_results = default_results
     if max_tokens <= 0:

@@ -123,7 +123,7 @@ async def test_semantic_only_candidate_is_recalled_with_one_vector_query(
     result = await run_search("entirely different query terms")
 
     assert bucket_id in result
-    assert "[语义关联]" in result
+    assert "[语义命中]" in result
     assert embedding.strict_calls == 1
     assert embedding.compat_calls == 0
 

@@ -543,7 +543,7 @@ async def breath_search(
     domain: Optional[str] = "",
     max_results: Optional[int] = 0,
 ) -> str:
-    """按关键词/语义检索记忆桶,融合关键词/BM25+语义检索,向量不可用时明确提示并退回关键词检索。命中后逐字返回桶内当前 content，不调用 LLM 摘要/改写。domain 逗号分隔,按主题域预筛。max_results=返回条数上限(默认 config.surfacing.breath_max_results,fallback 20,最大 50)。需要 tags/importance_min/valence/arousal/max_tokens/catalog 等更多过滤维度用 breath_advanced(...)。"""
+    """忘记人物或事件时的统一检索入口：同时查普通记忆、续接信逐字段落，并在活跃记忆无答案时查沉底旧记忆。先过相关性门槛，重要度/近期性只打破同分；逐字返回并跨来源去重。完整 bucket/letter id 可直读原文。max_results 默认 search_max_results（fallback matching.max_results/4）。"""
     return await _with_notice(
         _t_breath.dispatch(query=query, domain=domain, max_results=max_results),
         op="breath_search",
@@ -563,7 +563,7 @@ async def breath_advanced(
     tags: Optional[str] = "",
     catalog: Optional[bool] = False,
 ) -> str:
-    """breath 的完整参数版,给需要精细控制的场景用(日常用 breath()/breath_search() 就够了)。不传 query=返回权重最高的未解决记忆;传 query=融合关键词/BM25+语义检索，向量不可用时明确提示并退回关键词检索。命中后逐字返回桶内当前 content，不调用 LLM 摘要/改写；max_tokens 不足时整桶省略，绝不截断正文。catalog=True=目录模式:只返回每桶一行元数据(名称|域|重要度,0 LLM 调用,最省 token),适合开新对话先看目录再 breath_search(query=...) 精准拉取,可配 domain 过滤。max_tokens=单次返回总 token 上限(默认 config.surfacing.breath_max_tokens,fallback 10000)。domain 逗号分隔,valence/arousal 0~1(-1 忽略)。max_results=返回条数上限(默认 config.surfacing.breath_max_results,fallback 20,最大 50)。importance_min>=1=跳过语义检索,按重要度降序返回最多 20 条高重要度记忆。tags 逗号分隔,AND 过滤;tags=\"feel\" 或 \"__feel__\" 等价于 domain=\"feel\",返回所有 feel 类记忆。"""
+    """breath 完整参数版。无 query 保留既有浮现策略与 breath 配额；有 query 使用普通桶+续接信段落+沉底旧记忆的统一检索及独立 search 配额。命中逐字返回且不摘要；catalog=True 只返元数据。valence/arousal 只作相关候选同分项，importance_min 按稳定重要度读取，tags 为 AND 过滤。"""
     return await _with_notice(
         _t_breath.dispatch(
             query=query, max_tokens=max_tokens, domain=domain,
@@ -764,7 +764,7 @@ async def letter_read(
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
 ) -> str:
-    """检索历史信件。query=语义检索(可选);author 按署名过滤(\"user\"=用户侧,\"ai\"=AI 侧,也可传具体署名字符串);date_from/date_to=ISO 日期范围(可选)。无 query 时按时间倒序返回最近 limit 封。返回完整原文,不压缩。"""
+    """按时间/署名读历史信件全文。日常忘事只用 breath_search；letter_read 保留给近期信列表、日期/署名筛选，以及 query=完整 letter id 的全文直读。语义候选有最低阈值；返回原文，不压缩。"""
     return await _with_notice(
         _t_plan.letter_read(
             query=query, limit=limit, author=author,

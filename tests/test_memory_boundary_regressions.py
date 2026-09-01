@@ -92,7 +92,7 @@ async def test_bucket_manager_hold_fallback_keeps_markdown_without_embedding(tmp
 
 
 @pytest.mark.asyncio
-async def test_hold_merge_appends_raw_text_and_never_calls_llm_merge(tmp_path, monkeypatch):
+async def test_hold_creates_a_separate_bucket_for_semantically_similar_text(tmp_path, monkeypatch):
     manager = BucketManager(
         {"buckets_dir": str(tmp_path / "vault")}, embedding_engine=None
     )
@@ -105,10 +105,7 @@ async def test_hold_merge_appends_raw_text_and_never_calls_llm_merge(tmp_path, m
     )
 
     async def fake_search(*_args, **_kwargs):
-        bucket = await manager.get(bucket_id)
-        assert bucket is not None
-        bucket["score"] = 100
-        return [bucket]
+        raise AssertionError("hold must not run semantic auto-merge search")
 
     class NoCompression:
         async def merge(self, *_args, **_kwargs):
@@ -134,12 +131,26 @@ async def test_hold_merge_appends_raw_text_and_never_calls_llm_merge(tmp_path, m
         raw_merge=True,
         source_tool="hold",
     )
-    bucket = await manager.get(bucket_id)
+    old_bucket = await manager.get(bucket_id)
+    new_bucket = await manager.get(result_id)
 
-    assert merged is True
-    assert result_id == bucket_id
-    assert bucket is not None
-    assert bucket["content"] == f"{old}\n\n---\n{new}"
+    assert merged is False
+    assert result_id != bucket_id
+    assert old_bucket is not None and old_bucket["content"] == old
+    assert new_bucket is not None and new_bucket["content"] == new
+
+    retry_id, retry_reused, _ = await common.merge_or_create(
+        content=new,
+        tags=[],
+        importance=5,
+        domain=["测试"],
+        valence=0.5,
+        arousal=0.3,
+        raw_merge=True,
+        source_tool="hold",
+    )
+    assert retry_reused is True
+    assert retry_id == result_id
 
 
 @pytest.mark.asyncio

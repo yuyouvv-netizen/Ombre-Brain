@@ -1,18 +1,16 @@
 """
 ========================================
-tools/hold/core.py — hold 普通存入分支（含自动合并）
+tools/hold/core.py — hold 普通存入分支（一调用一桶）
 ========================================
 
 非 feel、非 pinned 时走这里：优先调 LLM 自动打标，失败则用本地中性元数据，
-再用检索找近似桶，
-超过 merge_threshold 则合并（hold 用 raw_merge=True 拼接原文，不压缩），
-否则新建。
+然后新建独立桶。只有正文完全相同的重试会幂等复用原桶；语义相近不合并。
 
 关键行为：
 - analyze() 失败（API key/限流/网络不可用）时仍逐字保存正文，只降级元数据
 - 她/他显式 valence/arousal 优先于 LLM 打标
-- 调 _common.merge_or_create 走合并/新建
-- iter 2.0：source_tool 写 ``hold``；合并到老桶时只更新 ``last_merged_by``
+- 调 _common.merge_or_create 走“精确重复复用 / 其它一律新建”
+- source_tool 写 ``hold``
 - embedding 失败时桶正常创建，返回追加向量化降级警告
 - 写完 fire-and-forget：plan 自动闭环判断 + 新桶疑似重复扫描
 

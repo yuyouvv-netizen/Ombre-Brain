@@ -82,6 +82,33 @@ _MAX_INPUT_CHARS = 2000
 # content）。同一 (text, model) 恒定映射到同一向量，缓存最近 N 条查询结果即可
 # 把这些重复请求拦在进程内，不用每次都打真实向量 API。
 _QUERY_CACHE_MAXSIZE = 32
+_LETTER_CHUNK_MAX_CHARS = 900
+_LETTER_CHUNK_OVERLAP_CHARS = 100
+
+
+def split_letter_chunks(content: str) -> list[str]:
+    """Return verbatim paragraph chunks suitable for long-letter retrieval.
+
+    Paragraph boundaries are preserved.  Only an exceptionally long single
+    paragraph is windowed, with a small overlap so a sentence at the boundary
+    remains searchable.  The original letter is never rewritten.
+    """
+    paragraphs = [part.strip() for part in str(content or "").split("\n\n") if part.strip()]
+    chunks: list[str] = []
+    step = _LETTER_CHUNK_MAX_CHARS - _LETTER_CHUNK_OVERLAP_CHARS
+    for paragraph in paragraphs:
+        if len(paragraph) <= _LETTER_CHUNK_MAX_CHARS:
+            chunks.append(paragraph)
+            continue
+        start = 0
+        while start < len(paragraph):
+            chunk = paragraph[start:start + _LETTER_CHUNK_MAX_CHARS].strip()
+            if chunk:
+                chunks.append(chunk)
+            if start + _LETTER_CHUNK_MAX_CHARS >= len(paragraph):
+                break
+            start += step
+    return chunks
 
 
 def _norm_model(name: str) -> str:
@@ -485,6 +512,20 @@ class EmbeddingEngine:
                     value TEXT NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS letter_chunks (
+                    bucket_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (bucket_id, chunk_index)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_letter_chunks_bucket ON letter_chunks(bucket_id)"
+            )
             conn.commit()
         finally:
             conn.close()
@@ -613,6 +654,105 @@ class EmbeddingEngine:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
+    def letter_chunks_current(self, bucket_id: str, content: str) -> bool:
+        """Whether every stored paragraph vector belongs to this exact letter body."""
+        chunks = split_letter_chunks(content)
+        if not chunks:
+            return True
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT content_hash), MIN(content_hash) "
+                "FROM letter_chunks WHERE bucket_id = ?",
+                (bucket_id,),
+            ).fetchone()
+            return bool(row and row[0] == len(chunks) and row[1] == 1 and row[2] == digest)
+        finally:
+            conn.close()
+
+    async def generate_and_store_letter_chunks(self, bucket_id: str, content: str) -> bool:
+        """Build/refresh the derived paragraph index for one immutable letter."""
+        if not self.enabled or not content or not content.strip():
+            return False
+        if self.letter_chunks_current(bucket_id, content):
+            return True
+        chunks = split_letter_chunks(content)
+        vectors: list[list[float]] = []
+        for chunk in chunks:
+            vector = await self._generate_async(chunk)
+            if not vector:
+                return False
+            vectors.append(vector)
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        try:
+            from utils import now_iso  # type: ignore
+        except ImportError:
+            from .utils import now_iso  # type: ignore
+        updated_at = now_iso()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM letter_chunks WHERE bucket_id = ?", (bucket_id,))
+            conn.executemany(
+                """INSERT INTO letter_chunks
+                   (bucket_id, chunk_index, chunk_text, embedding, content_hash, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (bucket_id, index, chunk, json.dumps(vector), digest, updated_at)
+                    for index, (chunk, vector) in enumerate(zip(chunks, vectors))
+                ],
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    async def search_letter_chunks(self, query: str, top_k: int = 10) -> list[dict]:
+        """Return paragraph hits with verbatim text and cosine score."""
+        if not self.enabled:
+            raise RuntimeError("embedding is disabled")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT bucket_id, chunk_index, chunk_text, embedding FROM letter_chunks"
+            ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return []
+        query_embedding = await self._generate_async(query)
+        if not query_embedding:
+            raise RuntimeError("embedding provider returned an empty query vector")
+        valid_rows: list[tuple[str, int, str]] = []
+        vectors: list[list[float]] = []
+        for bucket_id, chunk_index, chunk_text, raw_vector in rows:
+            try:
+                vector = [float(value) for value in json.loads(raw_vector)]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if len(vector) != len(query_embedding):
+                continue
+            valid_rows.append((str(bucket_id), int(chunk_index), str(chunk_text)))
+            vectors.append(vector)
+        if not vectors:
+            return []
+        scores = self._cosine_similarity_batch(query_embedding, vectors)
+        ranked = [
+            {
+                "bucket_id": bucket_id,
+                "chunk_index": chunk_index,
+                "text": chunk_text,
+                "score": float(score),
+            }
+            for (bucket_id, chunk_index, chunk_text), score in zip(valid_rows, scores)
+        ]
+        ranked.sort(key=lambda item: item["score"], reverse=True)
+        return ranked[:max(1, int(top_k))]
+
     def _store_embedding(
         self, bucket_id: str, embedding: list[float], content_hash: str = ""
     ) -> None:
@@ -675,6 +815,7 @@ class EmbeddingEngine:
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
+            conn.execute("DELETE FROM letter_chunks WHERE bucket_id = ?", (bucket_id,))
             conn.commit()
         finally:
             conn.close()
@@ -887,4 +1028,5 @@ __all__ = [
     "APIEmbeddingEngine",
     "GeminiNativeEmbeddingEngine",
     "EmbeddingEngine",
+    "split_letter_chunks",
 ]

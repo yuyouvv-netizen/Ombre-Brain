@@ -179,8 +179,9 @@ _RIPPLE_BOOST = 0.3        # 唤醒时 activation_count 增量
 # --- search 评分 ---
 _VECTOR_TOPK = 50          # embedding 预取 top_k（仅作 semantic 分源，不窄化候选集）
 _VECTOR_RECALL_THRESHOLD = 0.65  # 纯语义候选进入结果池的最低余弦相似度
-_RESOLVED_RANK_PENALTY = 0.3   # resolved 桶仅在排序时降权
-_LITERAL_MATCH_BONUS = 25.0    # 查询串原样命中 name/tags/domain/正文时的召回加分（修短查询召回）
+_STRONG_VECTOR_THRESHOLD = 0.78  # 强语义命中可绕过短期重复抑制、允许一次 touch
+_TOPIC_RECALL_THRESHOLD = 0.50   # 模糊主题本身必须足够相关，重要/近期不能帮它过门槛
+_BM25_RECALL_THRESHOLD = 0.25    # 稀疏关键词召回最低归一化分
 
 # topic/emotion/time/touch 四个评分维度的纯函数 + 权重常量已拆到
 # bucket_scoring.py（search() 和 _calc_*_score 兼容 wrapper 都从那边导入）。
@@ -254,16 +255,15 @@ class BucketManager:
         }
         self.wikilink_stopwords |= {w.lower() for w in self.wikilink_exclude_keywords}
 
-        # --- Search scoring weights / 检索权重配置 ---
+        # --- Legacy scoring fields / 旧调试接口兼容 ---
+        # search() 已改为显式相关性门控；这些属性继续保留，避免旧 Dashboard/
+        # 插件读取时报错，但不再让 emotion/touch/importance 混合制造相关性。
         scoring = config.get("scoring_weights", {})
         self.w_topic = scoring.get("topic_relevance", 4.0)
         self.w_emotion = scoring.get("emotion_resonance", 2.0)
         self.w_time = scoring.get("time_proximity", 1.5)
         self.w_importance = scoring.get("importance", 1.0)
         self.content_weight = scoring.get("content_weight", 1.0)  # body×1, per spec
-        # iter 2.1: touch + semantic 两个新维度
-        # touch: 被主动召回越多加分越高（上限 10 次归一化）
-        # semantic: embedding 余弦相似度（仅 embedding 启用时生效）
         self.w_touch = scoring.get("touch_weight", 1.0)
         self.w_semantic = scoring.get("semantic_weight", 2.5)
         # BM25: TF-IDF 加权关键词匹配（rank_bm25+jieba，软依赖）
@@ -1167,7 +1167,7 @@ class BucketManager:
 
         bump_active=False（默认）：纯元数据/内容编辑（trace、plan、anchor、后台
         自动 resolve、导入等）——**不**刷新 last_active，也不动 activation_count。
-        bump_active=True：把这次写入视作一次真实激活（如 hold/grow 合并近邻桶），
+        bump_active=True：把这次写入视作一次真实激活（如 grow 合并、hold 精确重试），
         同步刷新 last_active 并累加 activation_count，语义与 touch() 一致。
         """
         file_path = self._find_bucket_file(bucket_id)
@@ -1662,21 +1662,12 @@ class BucketManager:
                     continue
 
     # ---------------------------------------------------------
-    # Multi-dimensional search (core feature)
-    # 多维搜索（核心功能）
+    # Relevance-gated search (core feature)
+    # 相关性门控检索（核心功能）
     #
-    # Strategy: domain pre-filter → weighted multi-dim ranking
-    # 策略：主题域预筛 → 多维加权精排
-    #
-    # Ranking formula:
-    #   total = topic(×w_topic) + emotion(×w_emotion)
-    #           + time(×w_time) + importance(×w_importance)
-    #
-    # Per-dimension scores (normalized to 0~1):
-    #   topic     = rapidfuzz weighted match (name/tags/domain/body)
-    #   emotion   = 1 - Euclidean distance (query v/a vs bucket v/a)
-    #   time      = e^(-0.02 × days) (recent memories first)
-    #   importance = importance / 10
+    # Stage 1: literal / topic / BM25 / semantic evidence decides eligibility.
+    # Stage 2: stable importance and recency settle close ties only.
+    # Emotion and activation count never create relevance.
     # ---------------------------------------------------------
     async def search(
         self,
@@ -1686,6 +1677,7 @@ class BucketManager:
         query_valence: Optional[float] = None,
         query_arousal: Optional[float] = None,
         vector_scores: Optional[dict[str, float]] = None,
+        include_archive: bool = False,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -1700,7 +1692,7 @@ class BucketManager:
         limit = limit or self.max_results
         # 字面召回：把查询原样（小写、去空白）留作子串匹配，保证显式搜的词必被召回
         q_norm = query.strip().lower()
-        all_buckets = await self.list_all(include_archive=False)
+        all_buckets = await self.list_all(include_archive=include_archive)
 
         if not all_buckets:
             return []
@@ -1739,7 +1731,7 @@ class BucketManager:
         #   - 任何缺少 embedding 的桶（落盘时 embed key 失败 / 旧脚本批量导入未补向量）
         #     只要查询命中过任意向量，就会被整体过滤掉 → breath 检索数对不上 pulse。
         # 修复：保留 vector_scores 给 Layer 2 的 semantic 维度用，但不动 candidates。
-        # 没 embedding 的桶 semantic_score=0，仍可凭 topic/emotion/time/importance 命中。
+        # 没 embedding 的桶 semantic_score=0，仍可凭 literal/topic/BM25 命中。
         # ``None`` means this caller wants BucketManager to query the engine.
         # An explicit dict (including {}) lets an orchestration layer perform
         # the query once and reuse the same scores for ranking and recall.
@@ -1795,70 +1787,61 @@ class BucketManager:
                 # Dim 1: topic relevance (fuzzy text, 0~1)
                 topic_score = self._calc_topic_score(query, bucket)
 
-                # Dim 2: emotion resonance (coordinate distance, 0~1)
+                # Emotion, time, and importance are tie-breakers only.  They
+                # cannot make a weakly related bucket eligible for retrieval.
                 emotion_score = self._calc_emotion_score(
                     query_valence, query_arousal, meta
                 )
-
-                # Dim 3: time proximity (exponential decay, 0~1)
                 time_score = self._calc_time_score(meta)
-
-                # Dim 4: importance (direct normalization)
                 importance_score = max(1, min(10, int(meta.get("importance") or 5))) / 10.0
-
-                # Dim 5: touch frequency (召回频率, 0~1) — iter 2.1
-                touch_score = self._calc_touch_score(meta)
-
-                # --- Weighted sum / 加权求和 ---
-                total = (
-                    topic_score * self.w_topic
-                    + emotion_score * self.w_emotion
-                    + time_score * self.w_time
-                    + importance_score * self.w_importance
-                    + touch_score * self.w_touch
-                )
-                weight_sum = (
-                    self.w_topic + self.w_emotion + self.w_time
-                    + self.w_importance + self.w_touch
-                )
-                # Dim 6: semantic similarity — only when embedding is available (iter 2.1)
-                # 仅 embedding 可用时加入语义相似度维度；不可用时不影响 weight_sum 平衡
                 semantic_score = vector_scores.get(bucket["id"])
-                if semantic_score is not None:
-                    total += semantic_score * self.w_semantic
-                    weight_sum += self.w_semantic
-                # Dim 7: BM25 TF-IDF 关键词分（rank_bm25+jieba，软依赖，缺包时 bm25_scores={}）
-                if bm25_scores:
-                    total += bm25_scores.get(bucket["id"], 0.0) * self.w_bm25
-                    weight_sum += self.w_bm25
-                # Normalize to 0~100 for readability
-                normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
+                bm25_score = bm25_scores.get(bucket["id"], 0.0)
 
-                # 字面命中加分 + 召回保障：修复短查询（如 2 字"杭州"）即使正文里有也
-                # 因加权分被各维度稀释到 fuzzy_threshold 以下而整条搜不到。
-                # 用户显式搜的词必须召回，故 literal_hit 直接放行（OR），并给排序加分。
-                if literal_hit:
-                    normalized = min(100.0, normalized + _LITERAL_MATCH_BONUS)
-
-                # Threshold check uses raw (pre-penalty) score so resolved buckets
-                # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
-                # remain reachable by keyword (penalty applied only to ranking).
-                text_match = normalized >= self.fuzzy_threshold or literal_hit
+                # Stage 1 — relevance gate.  Only evidence from the query may
+                # open the gate; recency, importance, emotion and read count
+                # are intentionally absent.
+                topic_match = topic_score >= _TOPIC_RECALL_THRESHOLD
+                keyword_match = bm25_score >= _BM25_RECALL_THRESHOLD
                 semantic_match = (
                     semantic_score is not None
                     and semantic_score >= _VECTOR_RECALL_THRESHOLD
                 )
-                if text_match or semantic_match:
-                    # Resolved buckets get ranking penalty (but still reachable by keyword)
-                    # 已解决的桶仅在排序时降权
-                    if meta.get("resolved", False):
-                        normalized *= _RESOLVED_RANK_PENALTY
-                    bucket["score"] = round(normalized, 2)
-                    if semantic_match and not text_match:
-                        bucket["vector_match"] = True
-                    else:
-                        bucket.pop("vector_match", None)
-                    scored.append(bucket)
+                if not (literal_hit or topic_match or keyword_match or semantic_match):
+                    continue
+
+                # Stage 2 — rank relevant candidates.  Query relevance owns
+                # 97% of the readable score; stable importance and recency only
+                # settle close calls. Explicit emotion coordinates get a tiny
+                # tie-break, never eligibility.
+                relevance = max(
+                    1.0 if literal_hit else 0.0,
+                    topic_score if topic_match else 0.0,
+                    bm25_score if keyword_match else 0.0,
+                    float(semantic_score or 0.0) if semantic_match else 0.0,
+                )
+                tie_break = importance_score * 2.0 + time_score
+                if query_valence is not None and query_arousal is not None:
+                    tie_break += emotion_score * 0.25
+                normalized = relevance * 97.0 + tie_break
+                if meta.get("resolved", False):
+                    normalized -= 0.5
+
+                direct_match = bool(
+                    literal_hit
+                    or bm25_score >= 0.75
+                    or float(semantic_score or 0.0) >= _STRONG_VECTOR_THRESHOLD
+                )
+                hit = dict(bucket)
+                hit["score"] = round(max(0.0, min(100.0, normalized)), 2)
+                hit["vector_match"] = bool(semantic_match and not literal_hit)
+                hit["_search_match"] = {
+                    "literal": literal_hit,
+                    "topic": round(topic_score, 4),
+                    "bm25": round(bm25_score, 4),
+                    "semantic": round(float(semantic_score or 0.0), 4),
+                    "direct": direct_match,
+                }
+                scored.append(hit)
             except Exception as e:
                 logger.warning(
                     f"Scoring failed for bucket {bucket.get('id', '?')} / "

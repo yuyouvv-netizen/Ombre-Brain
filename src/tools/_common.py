@@ -542,7 +542,8 @@ async def merge_or_create(
     """
     检查是否有相似桶可合并，有则合并，无则新建。返回 (桶ID或名称, 是否合并, embed警告信息)。
 
-    raw_merge=True (hold)：原文追加，不调 LLM 压缩。
+    raw_merge=True (hold)：一次调用固定新建一桶；只对完全相同正文做幂等复用，
+    不再把“语义相近”自动揉进旧桶。
     raw_merge=False (grow)：LLM 压缩老+新内容。
 
     iter 2.0 来源追踪：
@@ -585,11 +586,14 @@ async def _merge_or_create_inner(
 ) -> Tuple[str, bool, str]:
     """实际的 search→merge/create 逻辑，由 merge_or_create 在 Lock 保护下调用。"""
     exact_storage_match = False
-    try:
-        existing = await rt.bucket_mgr.search(content, limit=1, domain_filter=domain or None)
-    except Exception as e:
-        rt.logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
-        existing = []
+    existing = []
+    # hold 是用户明确写下的一次经历：相近不等于同一件事。grow 仍保留语义
+    # 合并，用来整理长日记；hold 只允许下面的 exact-content 幂等通道复用。
+    if source_tool != "hold":
+        try:
+            existing = await rt.bucket_mgr.search(content, limit=1, domain_filter=domain or None)
+        except Exception as e:
+            rt.logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
 
     # Cache invalidation and a concurrent list_all() refresh can cross: an old
     # parsed snapshot may briefly hide a bucket that is already durable on disk.
