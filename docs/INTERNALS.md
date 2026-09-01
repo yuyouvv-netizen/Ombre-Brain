@@ -287,7 +287,7 @@ feel 桶自身：
 1. **Feel 通道**（`domain="feel"` 或 `tags` 含 `"feel"`/`"__feel__"`，仅 `breath_advanced`）：直接拉所有 `type==feel` 桶，按 `created` 倒序展示原文，按 `surfacing.feel_max_tokens`（默认 6000）做 token 预算；**超出预算的旧 feel 折叠为 60 字符单行摘要**，并在末尾追加 `更早的 feel 摘要（N 条，已折叠）` 段。**不排除 anchor 桶**（设计：feel 通道只看 type=feel）。
 2. **重要度批量模式**（`importance_min >= 1`，仅 `breath_advanced`）：跳过语义搜索，按 importance 降序返回 ≤20 条；过滤 `feel/plan/letter` 与 `dont_surface=True`；**不过滤 anchor、不过滤 pinned**（设计：主动按 importance 检索时希望能找到所有重要桶）。
 3. **浮现模式**（无 `query`；`breath()` 固定走这里）：钉选桶始终展示为「核心准则」+ 未解决桶按衰减分排序，**冷启动**（`activation_count==0 && importance>=8`）的桶最多 2 个插到最前；后续排序**有两条互斥路径**：当 `surfacing.sampling.enabled=true` 时走加权无放回采样（`top_k` / `sample_k` / `temperature` 控制；详见 §7.1），否则走原 Top-1 固定 + Top-2~20 随机洗牌；按 `max_results` 硬截断。**排除 anchor 桶**（设计：anchor 是坐标系，不该随机冒泡干扰日常浮现；这是浮现模式独有的过滤）。浮现**不调用** `touch()`。**末尾追加 `=== 久未浮现 ===`** 段（iter 1.6 §7 被动联想）：从 `activation_count==0 && importance>=8` 或 `importance>=9 && 距 last_active>7天` 的桶里随机抽 1~2 条，模拟「突然想起来」。
-4. **检索模式**（有 `query`；`breath_search()` 固定走这里）：每个 query 只生成一次查询向量，与 rapidfuzz/BM25 多维评分共同进入 `BucketManager.search()` → 过滤 `feel/plan/letter`，**pinned/permanent 仍可被检索命中（不过滤），命中后加 📌 前缀** → 纯语义候选相似度 `>=0.65` 标 `[语义关联]`，且不能绕过 domain/tags/type 过滤 → 命中时 `touch()` → 结果不足 3 条时 40% 概率随机漂浮 1~3 条低权重旧桶。embedding 不可用时明确提示后继续关键词/BM25；桶一旦命中，返回层直接使用当前存储的完整 `content`，不调用 dehydrate、不剥除 wikilink、不截断或改写。**不过滤 anchor**（设计：主动检索时希望能找到坐标系桶）。
+4. **检索模式**（有 `query`；`breath_search()` 固定走这里）：统一检索普通桶、letter 的派生逐字段落索引，并在活跃记忆无命中时回退 archive。第一阶段只允许字面/BM25/主题模糊/语义相关性让候选过门槛；第二阶段才用稳定 importance 与近期性打破同分，情绪/读取次数不能制造相关性。结果做近重复抑制；最近 12 小时已由无参 breath 展示的弱联想降序，但字面/强语义/ID 直达永远绕过。只有直接命中最多每 12 小时 `touch()` 一次，随机 drift 已移除。正文及信件命中段落均逐字返回，不调用 LLM 摘要/改写。
 
 (实现注意：`tags="feel"` 在第一个分支被映射为 `domain="feel"` 后清出 tag_filter；其它 tag 走 AND 过滤；`max_tokens` 上限 20000，`max_results` 上限 50；`importance_min` 模式下硬上限 20 条不可调；浮现模式中钉选桶**不计入** `max_results` 上限。)
 
@@ -298,7 +298,7 @@ feel 桶自身：
 两种路径：
 
 - **Feel 模式** (`feel=True`)：跳过 LLM 分析，自动注入 `__feel__` 标签，写入 `feel/沉淀物/`。`source_bucket` 提供时把源桶标记为 `digested=True` 并写 `model_valence`。返回 `🫧feel→{id}`。
-- **普通模式**：`analyze()` → 用户传入的 `valence`/`arousal` 优先于 LLM 结果（B-09 修复）→ `_merge_or_create(raw_merge=True)`（相似度 > `merge_threshold` 时以分隔线追加原文，否则新建）→ 原文落盘后投递 embedding outbox → 异步触发 `_check_plan_resolution()` 扫 active plans。返回 `合并→{name}` 或 `新建→{name}`。`analyze()` 或 embedding 不可用时只降级元数据/向量索引，正文仍原样落盘；**hold 永远不调 `dehydrate()`/`merge()` 压缩正文**。
+- **普通模式**：`analyze()` → 用户传入的 `valence`/`arousal` 优先于 LLM 结果 → `_merge_or_create(raw_merge=True)`；完全相同正文的重试幂等复用，其它每次 hold 都建独立桶，不做语义自动合并 → 原文落盘后投递 embedding outbox → 异步检查 active plans。**hold 永远不压缩正文**。
 
 (改动注意：`pinned=True` 走单独分支直接创建到 `permanent/`，importance 强制锁 10，不走合并；用户显式传 valence/arousal=0.0 也算「有效」，必须走 `0 <= v <= 1` 判定，不能用 `if valence` 否则 0.0 会被忽略——这就是 B-09。)
 
@@ -361,7 +361,7 @@ feel 桶自身：
 
 `letter_write(author, content, user_name="", title="", date="")` —— `author` 必填且仅 `user`/`claude`；写入 `letters/history/`，**硬编码** `importance=10` / `valence=0.5` / `arousal=0.3`（设计：信件不开放给用户调这三项），原文永久保留。**不接受 `why_remembered`**——信件本身就是「为什么记得」的载体。
 
-`letter_read(query="", limit=10, author="", date_from="", date_to="")` —— 无 query 时按 `letter_date` 或 `created` 倒序；有 query 且 embedding 启用时用向量相似度排序。
+`letter_read(query="", limit=10, author="", date_from="", date_to="")` —— 无 query 时按 `letter_date` 或 `created` 倒序；完整 letter id 可靠直读全文；其它语义候选必须达到 0.65。忘记事件时的推荐路径是 `breath_search`，它按段检索 letter。
 
 信件特性：永不衰减（`calculate_score` 固定 50）、永不合并、不参与压缩；普通 `breath` 不浮现（被 `feel/plan/letter` 过滤）；`/breath-hook`（SessionStart）末尾追加双方各最新一封。
 
@@ -1233,22 +1233,17 @@ docker compose -f deploy/docker-compose.yml up -d
 ### 5.1 衰减分（decay_engine.calculate_score）
 
 ```
-final_score = importance × activation_count^0.3
+final_score = stable_importance
               × e^(-λ × days_since)
-              × combined_weight
+              × time_weight
               × resolved_factor
-              × urgency_boost
 ```
 
-**权重分段（关键设计）**：
+`importance` 是用户可读、可改的稳定价值判断；`valence/arousal` 只描述体验，`activation_count` 只作诊断，两者都不再把一条记忆越读越重。
 
-- 短期（`days_since ≤ 3`）：`combined_weight = time_weight × 0.7 + emotion_weight × 0.3`（时间主导）
-- 长期（`days_since > 3`）：`combined_weight = emotion_weight × 0.7 + time_weight × 0.3`（情感主导）
-
-**子权重**：
+**时间项**：
 
 - `time_weight = 1.0 + e^(-hours/36)` —— t=0→×2.0，~36h 半衰，72h 后 ≈×1.14，∞→×1.0
-- `emotion_weight = base(1.0) + arousal × arousal_boost(0.8)` —— arousal=0 → 1.0；arousal=1 → 1.8
 
 **修正因子**：
 
@@ -1297,23 +1292,22 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 **子分**：
 
 - `topic_score = (name×3 + domain×2.5 + tag×2 + body×content_weight(1.0)) / 100×(3+2.5+2+content_weight)` —— 全部用 `rapidfuzz.fuzz.partial_ratio()`；正文截前 1000 字
-- `emotion_score = max(0, 1 - dist/√2)`，欧氏距离基于 (valence, arousal)；query 不带情感时返回 0.5
-- `time_score = e^(-0.02 × days)` —— 30 天后 ≈ 0.55（B-05 修复值，曾经是 0.1 太快）
-- `importance_score = importance / 10`
+- `time_score = e^(-0.02 × days)` —— 只用于检索候选同分，不决定相关性
 
 **阈值与降权**：
 
-- `normalized ≥ fuzzy_threshold(50)` 才进入候选
-- `resolved=True` 桶通过阈值后，排序分 `× 0.3`（不影响是否被检出，只影响排名）
+- 相关性门：literal，或 `topic≥0.50`，或 `BM25≥0.25`，或 `semantic≥0.65`
+- 过门后：`relevance×97 + importance×2 + time×1`；显式情绪坐标最多加 0.25，同样只作同分项
+- `resolved=True` 仅减 0.5 分，不影响是否被检出
 
 **多层流程**：
 
 1. domain 预筛（domain_filter 命中的桶；空集合时回退全量）
 2. embedding 评分（如果 `embedding_engine.enabled`，取 top 50 向量近邻；分数注入 Layer 2 的 `semantic` 维度）—— **不再窄化候选集**
-3. 多维加权精排（topic / emotion / time / importance / touch [+ semantic] [+ bm25]）—— BM25 稀疏召回作为 Dim 7（`bm25_index.py`，软依赖未装则该维度 0 分）
-4. 截断到 `limit`
+3. 相关性门控（literal / topic / BM25 / semantic），与价值/近期/读取次数彻底分开
+4. importance/time 小幅打破同分，截断到 `limit`
 
-(改动注意：iter 2.1+ 起 embedding 不再用作候选预筛。历史实现把候选集替换成「在 embeddings.db 里的桶」，导致缺失向量的桶在 breath 检索里整体消失，pulse 总数与 breath 命中数对不上。修复后没向量的桶 `semantic_score=0`，仍可凭 topic/emotion/time/importance 命中。现在 Markdown 是唯一写入真源；`bucket_manager.create()/update(content=...)` 落盘后把 id 与正文 hash 投递到 `.embedding_outbox.json`，后台单 worker 负责生成、失败重试和启动对账。`pulse` 会把“排队中”与真正的索引漂移分开显示。)
+(embedding 不再用作候选预筛。没向量的桶 `semantic_score=0`，仍可凭 literal/topic/BM25 命中。Markdown 是唯一写入真源；向量与 letter_chunks 都是可按正文重建的派生索引。)
 
 ---
 
@@ -1418,12 +1412,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 |---|---|---|
 | `999.0` | `calculate_score` | pinned/protected/permanent 桶分数 |
 | `50.0` | `calculate_score` | feel/plan/letter 桶固定分 |
-| `0.3` (指数) | `calculate_score` | `activation_count^0.3` 巩固指数 |
-| `3.0` (天) | `calculate_score` | 短期/长期切换阈值 |
-| `0.7 / 0.3` | `calculate_score` | 短/长期权重分配 |
 | `36.0` (小时) | `_calc_time_weight` | 新鲜度半衰期 |
-| `0.7` | `calculate_score` | urgency 触发 arousal 阈值 |
-| `1.5` | `calculate_score` | urgency_boost 倍数 |
 | `0.05 / 0.02` | `calculate_score` | resolved / resolved+digested 因子 |
 | `4` / `30 天` | `run_decay_cycle` | auto-resolve 阈值 |
 
@@ -1434,7 +1423,8 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `×3 / ×2.5 / ×2 / ×1` | `_calc_topic_score` | name / domain / tag / body 权重 |
 | `1000` 字符 | `_calc_topic_score` | 正文截取长度 |
 | `0.02` | `_calc_time_score` | `e^(-0.02×days)`（B-05） |
-| `0.3` | `search` | resolved 桶排序降权 |
+| `0.50 / 0.25 / 0.65` | `search` | topic / BM25 / semantic 相关性门槛 |
+| `97 / 2 / 1` | `search` | relevance / importance / time 排序占比 |
 | `48.0h` | `_time_ripple` | 时间涟漪窗口 |
 | `+0.3` | `_time_ripple` | 邻近桶 activation_count 增量 |
 | `5` | `_time_ripple` | 单次涟漪最大桶数 |
@@ -1444,13 +1434,13 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | 值 | 位置 | 用途 |
 |---|---|---|
 | `10000` / `20000` | `breath` | max_tokens 默认 / 上限 |
-| `20` / `50` | `breath` | max_results 默认 / 上限 |
+| `20` / `4` / `50` | `breath` / `breath_search` | 无参浮现默认 / 搜索默认 / 共同上限 |
 | `2` | `breath` 浮现 | 冷启动桶数上限 |
 | `8` | 冷启动 | importance >= 8 才进入冷启动 |
 | `20` | `breath` 浮现 | top-1 固定 + top-2~20 随机 |
 | `0.65` | `breath` 检索 | 纯语义候选进入结果池的余弦相似度下限 |
-| `0.2` | `breath` 检索 | 情感重构系数 `(q_v - 0.5) × 0.2`，最大 ±0.1 |
-| `3` / `0.4` / `2.0` / `1~3` | `breath` 检索 | 随机漂浮触发条件 / 概率 / 池阈值 / 数量 |
+| `0.50` / `0.25` / `0.65` | `breath` 检索 | topic / BM25 / semantic 相关性门槛 |
+| `12h` | `breath` → search | 近期已展示弱联想的降序窗口；直接命中绕过 |
 | `30` 字符 | `grow` | 短内容快速路径阈值 |
 | `0.7` | `_check_plan_resolution` | plan 自动结案向量预筛 |
 | `0.7` | dream | feel 结晶相似度阈值 |
@@ -1482,10 +1472,8 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `breath` 检索 | `search` 异常 | 返回「检索过程出错，请稍后重试。」 |
 | `breath` 检索 | embedding 不可用 / 查询失败 | 明确附加「检索降级」提示，跳过向量通道，继续 rapidfuzz + BM25 |
 | `breath` 检索展示 | embedding 不可用 | 明确附加「检索降级」提示，使用关键词/BM25；命中正文仍逐字完整返回 |
-| `breath` 检索 | 结果 < 3 | 40% 概率随机漂浮 1~3 条低权重旧桶 |
 | `hold` `analyze` 失败 | API 异常 | 正文逐字落盘，元数据使用本地中性默认值并明确提示；绝不压缩正文 |
-| `hold` 合并搜索失败 | search 异常 | 直接走新建路径 |
-| `hold` 合并融合失败 | merge 异常 | 直接走新建路径 |
+| `hold` 精确重复检查失败 | storage 异常 | 报错并保留已落盘事实，不做语义合并 |
 | `hold` embedding | API 异常 / 未配置 | 桶先创建成功，任务留在耐久 outbox；后台恢复后自动补齐 |
 | `grow` digest 失败 | API 异常 | **直接 RuntimeError**，不创建任何桶，返回「API key 未配置或调用失败，日记拆分无法完成，桶未创建。请检查 OMBRE_COMPRESS_API_KEY。」 |
 | `grow` 单条失败 | 单 item 异常 | 标 `⚠️条目名`，其它继续 |
@@ -1547,8 +1535,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 
 | 症状 | 文件 | 函数 |
 |---|---|---|
-| `hold` 应合并却新建了 | `tools/hold/` + `tools/_common.py` | `merge_or_create`；检查 `merge_threshold` + `bucket_mgr.search(content, limit=1)` 返回的 score |
-| `hold` 应新建却合并到无关桶 | `bucket_manager.py` | `_calc_topic_score` content_weight 是否被改回 3.0；query 用了 content 全文导致正文相似度爆表 |
+| `hold` 相近事件各建一桶 | 设计如此 | 仅完全相同正文的重试复用；需要整理多条时用 `grow` |
 | 用户传入 valence=0.0 被忽略 | `tools/hold/` | 必须用 `0 <= valence <= 1` 判定，不能 `if valence`（B-09） |
 | `grow` 短内容报「digest 失败」 | `tools/grow/` | 短内容 `< 30` 字应走 `shortpath` 快速路径；检查长度判断 |
 | 桶名乱码 / 文件名错误 | `utils.py` | `sanitize_name`；检查正则 `[^\w\s\u4e00-\u9fff-]` |
@@ -1614,7 +1601,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 
 10. **冷启动检测最多 2 个**。`importance >= 8` 的新桶超过 2 个时，第 3 个开始按普通衰减分排队，可能被压在 top-20 后随机洗牌。如果用户一次性钉选 5 条核心准则后又新建 3 个 importance=10 的事件桶，会感到「我刚建的核心事件没浮现」。
 
-11. **Letter 不参与压缩但仍生成 embedding**。原文如果非常长（>2000 字符）embedding 只看前 2000 字符——长信件的语义检索会偏向开头。这是已知 trade-off，未来若需要可改为分段 embedding。
+11. **Letter 不参与压缩，原信之外另建派生段落索引**。每个自然段独立生成 embedding；过长单段按 900 字、100 字重叠切片。`breath_search` 返回命中的原字段落，完整 letter id 才返回全文。旧信在首次搜索时按正文哈希幂等补建索引。
 
 ---
 
@@ -1632,7 +1619,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 
 ### 13.3 分段 letter embedding
 
-长信件按段落生成多 embedding，检索时合并最高相似度段。需要 SQLite schema 改为支持一对多。
+长信件分段索引已落地在 `letter_chunks` 派生表；原信仍是唯一真相源，索引可按正文哈希重建。
 
 ---
 

@@ -109,6 +109,7 @@ decay:
   lambda: 0.05                    # Decay rate / 衰减速率（越大遗忘越快）
   threshold: 0.3                  # Archive threshold / 归档阈值
   check_interval_hours: 24        # Check interval (hours) / 衰减检查间隔（小时）
+  # Legacy fields kept for config compatibility. Emotion no longer changes value/surface priority.
   emotion_weights:
     base: 1.0                     # Base weight / 基础权重
     arousal_boost: 0.8            # Arousal boost coefficient / 唤醒度加成系数
@@ -130,8 +131,9 @@ embedding:
   timeout_seconds: 120             # Embedding request timeout seconds / 向量化请求超时秒数
   # api_key: ""                   # Use OMBRE_EMBED_API_KEY / 使用 OMBRE_EMBED_API_KEY
 
-# --- Scoring weights / 检索权重参数 ---
-# total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)
+# --- Legacy scoring fields / 旧配置兼容 ---
+# Retrieval now uses an explicit relevance gate. Importance/time only break
+# close ties; emotion and touch never make an unrelated memory eligible.
 scoring_weights:
   topic_relevance: 4.0
   emotion_resonance: 2.0
@@ -150,6 +152,9 @@ matching:
 surfacing:
   breath_max_results: 20          # 1-50, hard cap of buckets returned per breath
   breath_max_tokens: 10000        # 500-20000, total token cap per breath
+  search_max_results: 4           # Search is intentionally compact; breath count is unchanged
+  search_max_tokens: 6000         # Verbatim total budget across buckets and letter paragraphs
+  recent_search_inhibition_hours: 12  # Demote loose associations just shown by breath; direct hits bypass
   feel_max_tokens: 6000           # 500-20000, full-text budget for feel history; older feels collapse to one-line summaries
   # iter 1.8: weighted sampling for breath surfacing mode（无参数浮现）
   # 加权采样：从 top_k 候选里按 score**(1/temperature) 抽 sample_k 个，让"想起"带轻微随机性。

@@ -310,70 +310,54 @@ def register(mcp) -> None:
 
         try:
             all_buckets = await sh.bucket_mgr.list_all(include_archive=False)
-            results = []
             w = {
-                "topic": sh.bucket_mgr.w_topic,
-                "emotion": sh.bucket_mgr.w_emotion,
-                "time": sh.bucket_mgr.w_time,
-                "importance": sh.bucket_mgr.w_importance,
+                "literal": 1.0,
+                "topic": 1.0,
+                "bm25": 1.0,
+                "semantic": 1.0,
+                "importance": 0.02,
+                "time": 0.01,
             }
-            w_sum = sum(w.values())
-
-            for bucket in all_buckets:
+            ranked = await sh.bucket_mgr.search(
+                query,
+                limit=max(1, len(all_buckets)),
+                query_valence=q_valence,
+                query_arousal=q_arousal,
+            ) if query else []
+            results = []
+            for bucket in ranked:
                 meta = bucket.get("metadata", {})
-                bid = bucket["id"]
-                try:
-                    topic = sh.bucket_mgr._calc_topic_score(query, bucket) if query else 0.0
-                    emotion = sh.bucket_mgr._calc_emotion_score(q_valence if q_valence is not None else 0.5, q_arousal if q_arousal is not None else 0.5, meta)
-                    time_s = sh.bucket_mgr._calc_time_score(meta)
-                    imp = max(1, min(10, int(meta.get("importance") or 5))) / 10.0
-
-                    raw_total = (
-                        topic * w["topic"]
-                        + emotion * w["emotion"]
-                        + time_s * w["time"]
-                        + imp * w["importance"]
-                    )
-                    normalized = (raw_total / w_sum) * 100 if w_sum > 0 else 0
-                    resolved = meta.get("resolved", False)
-                    if resolved:
-                        normalized *= 0.3
-
-                    results.append({
-                        "id": bid,
-                        "name": meta.get("name", bid),
-                        "domain": meta.get("domain", []),
-                        "type": meta.get("type", "dynamic"),
-                        "resolved": resolved,
-                        "pinned": meta.get("pinned", False),
-                        "scores": {
-                            "topic": round(topic, 4),
-                            "emotion": round(emotion, 4),
-                            "time": round(time_s, 4),
-                            "importance": round(imp, 4),
-                        },
-                        "weights": w,
-                        "raw_total": round(raw_total, 4),
-                        "normalized": round(normalized, 2),
-                        "passed_threshold": normalized >= sh.bucket_mgr.fuzzy_threshold,
-                    })
-                except Exception as _score_exc:
-                    logger.error(
-                        f"Scoring failed for bucket {bid!r}: {type(_score_exc).__name__}: {_score_exc}",
-                        exc_info=True,
-                    )
-                    continue
-
-            results.sort(key=lambda x: x["normalized"], reverse=True)
-            passed = [r for r in results if r["passed_threshold"]]
+                match = bucket.get("_search_match", {}) or {}
+                imp = max(1, min(10, int(meta.get("importance") or 5))) / 10.0
+                time_s = sh.bucket_mgr._calc_time_score(meta)
+                results.append({
+                    "id": bucket["id"],
+                    "name": meta.get("name", bucket["id"]),
+                    "domain": meta.get("domain", []),
+                    "type": meta.get("type", "dynamic"),
+                    "resolved": meta.get("resolved", False),
+                    "pinned": meta.get("pinned", False),
+                    "scores": {
+                        "literal": 1.0 if match.get("literal") else 0.0,
+                        "topic": float(match.get("topic") or 0.0),
+                        "bm25": float(match.get("bm25") or 0.0),
+                        "semantic": float(match.get("semantic") or 0.0),
+                        "importance": round(imp, 4),
+                        "time": round(time_s, 4),
+                    },
+                    "weights": w,
+                    "normalized": float(bucket.get("score") or 0.0),
+                    "passed_threshold": True,
+                    "direct": bool(match.get("direct")),
+                })
             return JSONResponse({
                 "query": query,
                 "valence": q_valence,
                 "arousal": q_arousal,
                 "weights": w,
-                "threshold": sh.bucket_mgr.fuzzy_threshold,
-                "total_candidates": len(results),
-                "passed_count": len(passed),
+                "threshold": "literal | topic≥0.50 | BM25≥0.25 | semantic≥0.65",
+                "total_candidates": len(all_buckets),
+                "passed_count": len(results),
                 "results": results[:50],  # top 50 for debug
             })
         except Exception as e:

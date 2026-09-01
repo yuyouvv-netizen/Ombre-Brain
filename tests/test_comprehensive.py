@@ -777,13 +777,13 @@ class TestDecayEngineScore:
             < decay_engine.calculate_score(resolved_only)
         )
 
-    def test_high_arousal_unresolved_gets_urgency_boost(self, decay_engine):
+    def test_arousal_does_not_override_stable_importance(self, decay_engine):
         calm = self._base_meta()
         calm["arousal"] = 0.3
         urgent = self._base_meta()
         urgent["arousal"] = 0.9
         urgent["resolved"] = False
-        assert decay_engine.calculate_score(urgent) > decay_engine.calculate_score(calm)
+        assert decay_engine.calculate_score(urgent) == decay_engine.calculate_score(calm)
 
     def test_urgency_boost_not_applied_when_resolved(self, decay_engine):
         urgent_resolved = self._base_meta()

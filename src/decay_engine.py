@@ -7,9 +7,8 @@ decay_engine.py — 记忆衰减引擎，模拟人类遗忘曲线
 的桶搬到 archive。后台一个 asyncio 任务每隔 N 小时跑一次。
 
 关键行为：
-- 打分公式（改进版艾宾浩斯 + 情感坐标）：
-    Score = Importance × (activation_count^0.3) × e^(-λ×days) × emotion_weight
-- 情感权重 = base + arousal × arousal_boost；唤醒度高的记忆衰减得慢
+- 打分公式：Score = 稳定 Importance × 近期系数 × e^(-λ×days)
+- 情绪坐标与被检索次数不参与价值判断；它们不会把一条记忆越搜越重要
 - pinned / protected 桶不参与衰减、不被归档
 - ensure_started() 幂等启动后台循环；可被测试 monkeypatch 成 noop
 
@@ -47,8 +46,6 @@ logger = logging.getLogger("ombre_brain.decay")
 _DEFAULT_LAMBDA = 0.05            # 指数衰减率：每过一天分数 × e^(-λ)
 _DEFAULT_THRESHOLD = 0.3          # 低于此分数 → 归档
 _DEFAULT_CHECK_INTERVAL_HRS = 24  # 后台循环间隔（小时）
-_DEFAULT_EMOTION_BASE = 1.0       # 情感权重基准
-_DEFAULT_AROUSAL_BOOST = 0.8      # arousal 每 +1 → 情感权重 +0.8
 
 # --- 锁分：某些桶不参与衰减 ---
 _SCORE_PINNED = 999.0    # pinned / protected / permanent 桶恒高分（永不归档）
@@ -63,31 +60,16 @@ _BACKFILL_MAX_PER_CYCLE = 50
 _FRESHNESS_HALF_LIFE_HRS = 36.0  # 36h 半衰：刚存 ×2.0，36h 后 ×1.5，72h 后 ≈×1.14
 _FRESHNESS_AMPLITUDE = 1.0       # bonus 上限增量（0 → 无加成；1 → 最多 ×2）
 
-# --- 短期 vs 长期权重分配（核心心理模型）---
-# 短期：刚发生的事 time 占主导（"印象很新"）
-# 长期：超过这个分界后 emotion 占主导（"刻骨铭心 vs 已经无所谓"）
-_SHORT_TERM_DAYS = 3.0
-_SHORT_TERM_TIME_RATIO = 0.7
-_LONG_TERM_EMOTION_RATIO = 0.7
-
-# --- Activation count 的次线性放大：访问越多越鲜活，但不线性 ---
-_ACTIVATION_EXPONENT = 0.3
-
 # --- Resolved/digested 衰减加速因子 ---
 _FACTOR_RESOLVED_DIGESTED = 0.02  # 已处理 + 已写 feel → 加速淡化到背景
 _FACTOR_RESOLVED_ONLY = 0.05      # 仅已处理（未写 feel）→ 中度淡化
-
-# --- Urgency boost：高 arousal 且未处理 → 临时加重，避免被错误归档 ---
-_AROUSAL_URGENCY_THRESHOLD = 0.7
-_URGENCY_BOOST = 1.5
 
 # --- Auto-resolve 触发条件 ---
 _AUTO_RESOLVE_IMPORTANCE_MAX = 4   # 重要度 ≤ 4 才允许自动结案
 _AUTO_RESOLVE_DAYS_MIN = 30        # 且 30 天未被激活
 _AUTO_RESOLVE_FALLBACK_DAYS = 999  # 时间字段坏掉时，按"很久以前"对待，触发自动结案
 
-# --- Arousal/importance 兜底 ---
-_DEFAULT_AROUSAL = 0.3
+# --- Importance/time 兜底 ---
 _DEFAULT_IMPORTANCE = 5
 _DEFAULT_DAYS_FALLBACK = 30  # calculate_score 时间字段坏 → 按 30 天处理（保守）
 
@@ -136,12 +118,6 @@ class DecayEngine:
         self.threshold = decay_cfg.get("threshold", _DEFAULT_THRESHOLD)
         self.check_interval = decay_cfg.get("check_interval_hours", _DEFAULT_CHECK_INTERVAL_HRS)
 
-        # --- Emotion weight params (continuous arousal coordinate) ---
-        # --- 情感权重参数（基于连续 arousal 坐标）---
-        emotion_cfg = decay_cfg.get("emotion_weights", {})
-        self.emotion_base = emotion_cfg.get("base", _DEFAULT_EMOTION_BASE)
-        self.arousal_boost = emotion_cfg.get("arousal_boost", _DEFAULT_AROUSAL_BOOST)
-
         self.bucket_mgr = bucket_mgr
 
         # --- Background task control / 后台任务控制 ---
@@ -182,12 +158,10 @@ class DecayEngine:
         Calculate current activity score for a memory bucket.
         计算一个记忆桶的当前活跃度得分。
 
-        New model: short-term vs long-term weight separation.
-        新模型：短期/长期权重分离。
-        - Short-term (≤3 days): time_weight dominates, emotion amplifies
-        - Long-term (>3 days): emotion_weight dominates, time decays to floor
-        短期（≤3天）：时间权重主导，情感放大
-        长期（>3天）：情感权重主导，时间衰减到底线
+        ``importance`` is the user's stable judgement of meaning.  This method
+        only derives a temporary surfacing priority from importance and time;
+        arousal and activation_count are descriptive/diagnostic metadata, not
+        votes that silently change value.
         """
         if not isinstance(metadata, dict):
             return 0.0
@@ -213,43 +187,13 @@ class DecayEngine:
             importance = max(1, min(10, int(metadata.get("importance", _DEFAULT_IMPORTANCE))))
         except (TypeError, ValueError):
             importance = _DEFAULT_IMPORTANCE
-        activation_count = max(1.0, float(metadata.get("activation_count") or 1))
-
         # --- Days since last activation ---
         days_since = _days_since_active(metadata, fallback_days=_DEFAULT_DAYS_FALLBACK)
-
-        # --- Emotion weight ---
-        try:
-            arousal = max(0.0, min(1.0, float(metadata.get("arousal", _DEFAULT_AROUSAL))))
-        except (ValueError, TypeError):
-            arousal = _DEFAULT_AROUSAL
-        emotion_weight = self.emotion_base + arousal * self.arousal_boost
-
-        # --- Time weight ---
         time_weight = self._calc_time_weight(days_since)
-
-        # --- Short-term vs Long-term weight separation ---
-        # 短期（≤3天）：time_weight 占 70%，emotion 占 30%
-        # 长期（>3天）：emotion 占 70%，time_weight 占 30%
-        if days_since <= _SHORT_TERM_DAYS:
-            # Short-term: time dominates, emotion amplifies
-            combined_weight = (
-                time_weight * _SHORT_TERM_TIME_RATIO
-                + emotion_weight * (1.0 - _SHORT_TERM_TIME_RATIO)
-            )
-        else:
-            # Long-term: emotion dominates, time provides baseline
-            combined_weight = (
-                emotion_weight * _LONG_TERM_EMOTION_RATIO
-                + time_weight * (1.0 - _LONG_TERM_EMOTION_RATIO)
-            )
-
-        # --- Base score ---
         base_score = (
             importance
-            * (activation_count ** _ACTIVATION_EXPONENT)
             * math.exp(-self.decay_lambda * days_since)
-            * combined_weight
+            * time_weight
         )
 
         # --- Weight pool modifiers ---
@@ -263,13 +207,7 @@ class DecayEngine:
             resolved_factor = _FACTOR_RESOLVED_ONLY
         else:
             resolved_factor = 1.0
-        urgency_boost = (
-            _URGENCY_BOOST
-            if (arousal > _AROUSAL_URGENCY_THRESHOLD and not resolved)
-            else 1.0
-        )
-
-        return round(base_score * resolved_factor * urgency_boost, 4)
+        return round(base_score * resolved_factor, 4)
 
     # ---------------------------------------------------------
     # Execute one decay cycle

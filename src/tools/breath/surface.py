@@ -31,6 +31,7 @@ from ombrebrain.policy.surfacing import SurfacePolicyVM
 from .. import _runtime as rt
 from utils import parse_bool, parse_iso_datetime
 from ._verbatim import render_stored_bucket
+from .recent import record_surfaced
 
 # U-07 fix: throttle the sampling-fallback INFO log to once per 5 minutes.
 # 库小且 sampling=ON 时此分支每次 breath 都触发，原本会刷屏；改为 ≥300s
@@ -60,6 +61,8 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         return "记忆系统暂时无法访问。"
 
     surfacing_cfg = rt.config.get("surfacing", {}) or {}
+    recent_hours = float(surfacing_cfg.get("recent_search_inhibition_hours") or 12)
+    shown_ordinary_ids: list[str] = []
 
     # --- pinned/protected 桶置顶（排除 letter 桶：letter 的 importance=10 不代表核心准则）---
     # 注意：pinned 提取在 anchor 过滤 *之前*，保证 anchor+pinned 桶也能出现在核心准则段。
@@ -119,8 +122,9 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         """F-05: 二级排序 key，消除同分时浮现随机抖动。
         主键：decay_score（降序）
         次键：last_active 时间戳（越新越高）
-        三键：arousal × valence（情感强度，越高越先浮现）
-        四键：importance
+        三键：稳定 importance
+
+        情感坐标只描述体验，不决定一段经历的价值或浮现顺序。
         """
         meta = b["metadata"]
         score = rt.decay_engine.calculate_score(meta)
@@ -130,9 +134,8 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
             ).timestamp()
         except (ValueError, TypeError):
             last_ts = 0.0
-        av = float(meta.get("arousal") or 0.3) * float(meta.get("valence") or 0.5)
         imp = int(meta.get("importance") or 5)
-        return (score, last_ts, av, imp)
+        return (score, last_ts, imp)
 
     scored = sorted(unresolved, key=_sort_key, reverse=True)
 
@@ -215,6 +218,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                 budget_blocked = True
                 break
             dynamic_results.append(rendered)
+            shown_ordinary_ids.append(b["id"])
             token_budget -= entry_tokens
         except Exception as e:
             rt.logger.warning(f"Failed to render surfaced bucket / 浮现渲染失败: {e}")
@@ -276,6 +280,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                         budget_blocked = True
                         break
                     passive_results.append(rendered)
+                    shown_ordinary_ids.append(b["id"])
                     token_budget -= entry_tokens
                 except Exception as e:
                     rt.logger.warning(f"passive association render failed: {e}")
@@ -309,6 +314,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                             budget_blocked = True
                             break
                         dream_results.append(rendered)
+                        shown_ordinary_ids.append(b["id"])
                         token_budget -= entry_tokens
                         rt.logger.info(f"Dream surface triggered / 偶遇机制触发: {b['id']}")
                     except Exception as e:
@@ -327,4 +333,5 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         parts.append("=== 偶然想起 ===\n" + "\n---\n".join(dream_results))
     if budget_blocked:
         parts.append(_BUDGET_NOTICE)
+    record_surfaced(shown_ordinary_ids, hours=recent_hours)
     return "\n\n".join(parts)

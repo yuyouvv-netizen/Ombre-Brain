@@ -3,10 +3,10 @@
 bucket_scoring.py — 检索多维评分子函数
 ========================================
 
-从 bucket_manager.py 拆出。BucketManager.search() 用加权多维评分给候选桶
-排序：文本相关性(topic) + 情感共鸣(emotion) + 时间亲近(time) + 触碰频率
-(touch)，这四维是纯函数（只读传入参数 + 本模块常量），不碰文件系统/网络，
-所以独立成模块，方便单测和复用。
+从 bucket_manager.py 拆出的纯评分函数。当前检索先用 topic（配合 literal /
+BM25 / semantic）做相关性门控，再用 time 作很小的同分项；emotion 仅在调用方
+明确给出情绪坐标时作同分项。touch 保留为兼容/诊断 helper，不再决定检索资格
+或记忆价值。
 
 importance / semantic(embedding) / bm25 三个维度的计算逻辑较短，仍留在
 bucket_manager.search() 内联（importance 是一行归一化，semantic/bm25 依赖

@@ -156,12 +156,11 @@ class TestDecayScoreModifiers:
         # resolved=0.05, both=0.02
         assert both / resolved == pytest.approx(0.02 / 0.05, rel=0.01)
 
-    def test_high_arousal_urgency_boost(self, decay_eng):
-        """Arousal>0.7 and not resolved → 1.5× urgency boost."""
+    def test_arousal_does_not_change_memory_value(self, decay_eng):
+        """Emotion describes the experience; it does not vote on importance."""
         calm = decay_eng.calculate_score(self._base_meta(arousal=0.5))
         urgent = decay_eng.calculate_score(self._base_meta(arousal=0.8))
-        # urgent should be higher due to both emotion_weight and urgency_boost
-        assert urgent > calm
+        assert urgent == calm
 
     def test_urgency_not_applied_when_resolved(self, decay_eng):
         """High arousal but resolved → no urgency boost."""

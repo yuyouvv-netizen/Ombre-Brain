@@ -31,6 +31,8 @@ from .. import _runtime as rt
 from .._common import check_content_size, check_metadata_size, check_query_size
 from utils import strip_wikilinks, get_ai_name
 
+_LETTER_SEMANTIC_THRESHOLD = 0.65
+
 
 async def plan_create(
     content: str,
@@ -182,8 +184,15 @@ async def letter_write(
         await rt.bucket_mgr.update(bucket_id, **extra_meta)
     except Exception as e:
         rt.logger.warning(f"letter_write update meta failed: {e}")
-    # 注意：bucket_mgr.create() 已在 content 落盘后投递 embedding outbox
-    # 向量，这里不需要也不应该重复调用 generate_and_store。
+    # 整封信的向量仍由 create() 的 outbox 管；这里额外建立“派生段落索引”。
+    # 索引只存逐字段落与向量，原信正文永不改写。
+    chunk_indexer = getattr(rt.embedding_engine, "generate_and_store_letter_chunks", None)
+    if callable(chunk_indexer) and getattr(rt.embedding_engine, "enabled", False):
+        try:
+            await chunk_indexer(bucket_id, content.strip())
+        except Exception as e:
+            # 信已经安全落盘；索引失败只降级为关键词分段搜索，不能把写信判失败。
+            rt.logger.warning(f"letter paragraph indexing failed: {e}")
     return f"💌letter→{bucket_id} [{a}]"
 
 
@@ -249,6 +258,12 @@ async def letter_read(
 
     query_text = query.strip()
 
+    # 完整 id 是信件地址：可靠返回原信全文，不走向量阈值，也不受相似信干扰。
+    exact_letter = next((b for b in letters if b.get("id") == query_text), None)
+    if exact_letter is not None:
+        letters = [exact_letter]
+        query_text = ""
+
     def _matches_query(b):
         if not query_text:
             return True
@@ -265,7 +280,10 @@ async def letter_read(
     if query_text and rt.embedding_engine and getattr(rt.embedding_engine, "enabled", False):
         try:
             sims = await rt.embedding_engine.search_similar(query_text, top_k=limit * 3)
-            id_score = {bid: sc for bid, sc in sims}
+            id_score = {
+                bid: float(sc) for bid, sc in sims
+                if float(sc) >= _LETTER_SEMANTIC_THRESHOLD
+            }
             vector_matches = [b for b in letters if b["id"] in id_score]
             if vector_matches:
                 letters = vector_matches

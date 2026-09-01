@@ -165,7 +165,7 @@ async def test_merge_updates_embedding_exactly_once(tmp_path, monkeypatch):
         valence=0.5,
         arousal=0.3,
         raw_merge=True,
-        source_tool="hold",
+        source_tool="grow",
     )
 
     assert merged is True

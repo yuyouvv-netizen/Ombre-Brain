@@ -101,8 +101,8 @@ _DEFAULT_VALENCE = 0.5  # 0=极负, 1=极正
 _DEFAULT_AROUSAL = 0.3  # 0=完全平静, 1=极激动
 
 # --- 输出截断长度 ---
-_TAGS_MAX = 15           # tags 最多保留几个
-_DOMAIN_MAX = 3          # domain 最多保留几个（rule.md 推荐选 1~2 个）
+_TAGS_MAX = 6            # 只保留原文直接支持的精确标签
+_DOMAIN_MAX = 2          # domain 只选最精确的 1~2 个
 _NAME_MAX_CHARS = 20     # suggested_name 上限
 _PLAN_REASON_MAX = 200   # plan 判定 reason 上限
 _PARSE_ERR_PREVIEW = 200  # JSON 解析失败时日志中 raw 预览长度
@@ -111,6 +111,35 @@ _PARSE_ERR_PREVIEW = 200  # JSON 解析失败时日志中 raw 预览长度
 _IMPORTANCE_MIN = 1
 _IMPORTANCE_MAX = 10
 _DEFAULT_IMPORTANCE = 5
+
+_ALLOWED_DOMAINS = {
+    "饮食", "穿搭", "出行", "居家", "购物",
+    "家庭", "恋爱", "友谊", "社交",
+    "工作", "学习", "考试", "求职",
+    "健康", "心理", "睡眠", "运动",
+    "游戏", "影视", "音乐", "阅读", "创作", "手工",
+    "编程", "AI", "硬件", "网络",
+    "财务", "计划", "待办",
+    "情绪", "回忆", "梦境", "自省",
+    "未分类",
+}
+
+
+def _clean_string_list(value, *, limit: int, allowed: set[str] | None = None) -> list[str]:
+    """Normalize untrusted LLM list fields without preserving broad junk tags."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    cleaned: list[str] = []
+    for raw in value:
+        item = re.sub(r"\[\[|\]\]", "", str(raw or "")).strip()
+        if not item or (allowed is not None and item not in allowed) or item in cleaned:
+            continue
+        cleaned.append(item)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
 
 
 # --- Dehydration prompt: instructs cheap LLM to compress information ---
@@ -180,12 +209,12 @@ DIGEST_PROMPT = """你是一个日记整理专家。她/他会发送一段包含
     "domain": ["主题域1"],
     "valence": 0.7,
     "arousal": 0.4,
-    "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2"],
+    "tags": ["原文核心词1", "原文核心词2", "原文核心词3"],
     "importance": 5
   }
 ]
 
-tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 5~8 个语义相关词（近义词、上位词、关联场景词），合并为一个数组。
+tags 生成规则：只从原文直接支持的信息中提取 3~6 个精确核心词。禁止补近义词、上位词、联想场景词或原文没有出现/暗示的概念。
 
 主题域可选（选最精确的 1~2 个，只选真正相关的）：
   日常: ["饮食", "穿搭", "出行", "居家", "购物"]
@@ -198,7 +227,8 @@ tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 
   内心: ["情绪", "回忆", "梦境", "自省"]
 importance: 1-10，根据内容重要程度判断
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
-arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
+arousal: 0~1（0=平静, 0.5=普通, 1=激动）
+主题边界：只有正文主要在谈代码、软件、系统或部署实现时才能选“编程”；只有明确进行有意识的自我审视时才能选“自省”。普通感受或关系回想优先选“情绪”“恋爱”“回忆”等直接主题。"""
 
 
 # --- Merge prompt: instruct LLM to blend old and new memories ---
@@ -232,19 +262,17 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    内心: ["情绪", "回忆", "梦境", "自省"]
 2. valence（情感效价）：0.0~1.0，0=极度消极 → 0.5=中性 → 1.0=极度积极
 3. arousal（情感唤醒度）：0.0~1.0，0=非常平静 → 0.5=普通 → 1.0=非常激动
-4. tags（关键词标签）：分两步生成，合并为一个数组：
-   第一步—精准提取：从原文抽取 3~5 个真正的核心词，不泛化、不遗漏
-   第二步—引申扩展：自动补充 8~10 个与当前场景语义相关的词，包括近义词、上位词、关联场景词、她/他可能用不同措辞搜索的词
-   两步合并为一个 tags 数组，总计 10~15 个
+4. tags（关键词标签）：只从原文直接支持的信息中提取 3~6 个精确核心词；禁止补近义词、上位词、关联场景词或为了“方便搜索”而扩写概念
 5. suggested_name（建议桶名）：10字以内的简短标题
 6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+7. 主题边界：“编程”仅用于正文主要在谈代码、软件、系统或部署实现；“自省”仅用于明确、有意识的自我审视。普通感受或关系回想优先选“情绪”“恋爱”“回忆”等直接主题
 
 输出格式（纯 JSON，无其他内容）：
 {
   "domain": ["主题域1", "主题域2"],
   "valence": 0.7,
   "arousal": 0.4,
-  "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
+  "tags": ["原文核心词1", "原文核心词2", "原文核心词3"],
   "suggested_name": "简短标题"
 }"""
 
@@ -883,11 +911,15 @@ class Dehydrator:
         # --- Validate and clamp value ranges / 校验并钳制数值范围 ---
         valence, arousal = self._clamp_va(result)
 
+        domains = _clean_string_list(
+            result.get("domain"), limit=_DOMAIN_MAX, allowed=_ALLOWED_DOMAINS
+        ) or ["未分类"]
+        tags = _clean_string_list(result.get("tags"), limit=_TAGS_MAX)
         return {
-            "domain": result.get("domain", ["未分类"])[:_DOMAIN_MAX],
+            "domain": domains,
             "valence": valence,
             "arousal": arousal,
-            "tags": result.get("tags", [])[:_TAGS_MAX],
+            "tags": tags,
             "suggested_name": str(result.get("suggested_name", ""))[:_NAME_MAX_CHARS],
         }
 
@@ -987,13 +1019,17 @@ class Dehydrator:
                 importance = _DEFAULT_IMPORTANCE
             valence, arousal = self._clamp_va(item)
 
+            domains = _clean_string_list(
+                item.get("domain"), limit=_DOMAIN_MAX, allowed=_ALLOWED_DOMAINS
+            ) or ["未分类"]
+            tags = _clean_string_list(item.get("tags"), limit=_TAGS_MAX)
             validated.append({
                 "name": str(item.get("name", ""))[:_NAME_MAX_CHARS],
                 "content": str(item.get("content", "")),
-                "domain": item.get("domain", ["未分类"])[:_DOMAIN_MAX],
+                "domain": domains,
                 "valence": valence,
                 "arousal": arousal,
-                "tags": item.get("tags", [])[:_TAGS_MAX],
+                "tags": tags,
                 "importance": importance,
             })
         return validated
