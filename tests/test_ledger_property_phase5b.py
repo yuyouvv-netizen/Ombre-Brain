@@ -1,4 +1,4 @@
-from ledger_property import LedgerReplayPropertyRunner
+from ombrebrain.eventsourcing.ledger_property import LedgerReplayPropertyRunner
 
 
 def test_property_runner_generates_deterministic_strictly_ordered_event_streams():

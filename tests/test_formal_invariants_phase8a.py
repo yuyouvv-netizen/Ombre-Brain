@@ -1,4 +1,4 @@
-from ledger_mirror import LedgerMirror
+from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
 
 
 def _bucket(bucket_id="b1", **metadata):
@@ -65,6 +65,67 @@ def test_formal_invariants_accept_physical_erasure_with_tombstone(tmp_path):
 
     assert report.ok is True
     assert report.violations == ()
+
+
+def test_formal_invariants_accept_only_creation_marked_test_cleanup(tmp_path):
+    from ombrebrain.policy.formal_invariants import FormalInvariantChecker
+
+    ledger = LedgerMirror(tmp_path / "events.jsonl")
+    ledger.append_event(
+        event_type="TraceCreated",
+        trace_id="test-1",
+        trace_kind="dynamic",
+        payload={
+            "provenance": {
+                "kind": "test",
+                "created_by": "hold",
+                "erasable": True,
+            }
+        },
+        body="synthetic test body",
+    )
+    ledger.append_event(
+        event_type="TraceHardDeleted",
+        trace_id="test-1",
+        trace_kind="dynamic",
+        payload={"reason": "test cleanup", "content_erased": True},
+        body="",
+    )
+
+    report = FormalInvariantChecker.default().evaluate_ledger(ledger.iter_events())
+
+    assert report.ok is True
+    assert report.violations == ()
+
+
+def test_delete_event_cannot_self_claim_test_provenance_to_bypass_tombstone(
+    tmp_path,
+):
+    from ombrebrain.policy.formal_invariants import FormalInvariantChecker
+
+    ledger = LedgerMirror(tmp_path / "events.jsonl")
+    ledger.append_event(
+        event_type="TraceCreated",
+        trace_id="real-1",
+        trace_kind="plan",
+        payload={"type": "plan"},
+        body="real plan body",
+    )
+    ledger.append_event(
+        event_type="TraceHardDeleted",
+        trace_id="real-1",
+        trace_kind="plan",
+        payload={
+            "provenance": {"kind": "test", "erasable": True},
+            "reason": "forged test cleanup",
+        },
+        body="",
+    )
+
+    report = FormalInvariantChecker.default().evaluate_ledger(ledger.iter_events())
+
+    assert report.ok is False
+    assert any(v.code == "no_silent_erasure" for v in report.violations)
 
 
 def test_formal_invariants_detect_similarity_bypassing_dont_surface():

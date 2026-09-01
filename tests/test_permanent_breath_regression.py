@@ -159,7 +159,9 @@ async def test_search_breath_returns_raw_content_without_dehydration(
 
 
 @pytest.mark.asyncio
-async def test_search_breath_filters_terminal_states_but_keeps_dont_surface(decay_eng, monkeypatch):
+async def test_search_breath_keeps_dont_surface_and_defers_archive_when_active_exists(
+    decay_eng, monkeypatch
+):
     bucket_mgr = SearchPolicyBucketManager()
     install_search_runtime(bucket_mgr, decay_eng, EchoDehydrator())
 
@@ -183,6 +185,7 @@ async def test_search_breath_filters_terminal_states_but_keeps_dont_surface(deca
     assert "Deleted query memory" not in result
     assert "Tombstone query memory" not in result
     assert "Archived query memory" not in result
+    assert "restore=True" not in result
     assert bucket_mgr.touched == ["visible", "hidden"]
 
 

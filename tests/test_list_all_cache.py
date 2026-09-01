@@ -3,7 +3,10 @@
 缓存必须：命中返回、写操作后失效、touch 就地更新、返回副本不污染缓存。
 不能改变任何可见语义（桶数/内容/元数据都要与直读磁盘一致）。
 """
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
 
 import frontmatter
 import pytest
@@ -172,6 +175,27 @@ async def test_external_physical_delete_cleans_derived_index(bucket_mgr):
 
 
 @pytest.mark.asyncio
+async def test_external_archive_move_keeps_pending_and_existing_vector(bucket_mgr):
+    bucket_mgr.external_change_poll_seconds = 0
+    bucket_id = await bucket_mgr.create(content="moved to archive outside OB")
+    outbox = _OutboxProbe()
+    bucket_mgr.attach_embedding_outbox(outbox)
+    await bucket_mgr.list_all()
+    assert bucket_id in bucket_mgr.embedding_engine._store
+
+    source = Path(bucket_mgr._find_bucket_file(bucket_id))
+    destination = Path(bucket_mgr.archive_dir) / source.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(destination)
+
+    refreshed = await bucket_mgr.list_all()
+
+    assert refreshed == []
+    assert bucket_id not in outbox.discarded
+    assert bucket_id in bucket_mgr.embedding_engine._store
+
+
+@pytest.mark.asyncio
 async def test_internal_touch_updates_file_fingerprint_without_false_external_event(bucket_mgr):
     bucket_mgr.external_change_poll_seconds = 0
     bucket_id = await bucket_mgr.create(content="touch fingerprint")
@@ -181,3 +205,52 @@ async def test_internal_touch_updates_file_fingerprint_without_false_external_ev
     await bucket_mgr.list_all()
 
     assert bucket_mgr.external_change_status()["detected"] == 0
+
+
+def test_cache_builder_cannot_publish_stale_content_after_invalidation(
+    bucket_mgr,
+    monkeypatch,
+):
+    bucket_id = asyncio.run(
+        bucket_mgr.create("AAAA same-size body", name="cache-race", domain=["test"])
+    )
+    path = Path(bucket_mgr._find_bucket_file(bucket_id))
+    bucket_mgr._invalidate_bm25()
+    parsed_old = threading.Event()
+    release_builder = threading.Event()
+    original_load = bucket_mgr._load_bucket
+    blocked = False
+    fixed_state = bucket_mgr._scan_active_file_state()
+
+    def coordinated_load(file_path):
+        nonlocal blocked
+        bucket = original_load(file_path)
+        if not blocked and Path(file_path) == path:
+            blocked = True
+            parsed_old.set()
+            release_builder.wait(timeout=2)
+        return bucket
+
+    monkeypatch.setattr(bucket_mgr, "_load_bucket", coordinated_load)
+    # Hide the file change from the mtime/size fingerprint to prove the
+    # managed-write generation CAS, rather than the external poll, rejects the
+    # stale publish.
+    monkeypatch.setattr(
+        bucket_mgr,
+        "_scan_active_file_state",
+        lambda: dict(fixed_state),
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(lambda: asyncio.run(bucket_mgr.list_all()))
+        assert parsed_old.wait(timeout=2)
+
+        post = frontmatter.load(path)
+        post.content = "BBBB same-size body"
+        path.write_text(frontmatter.dumps(post), encoding="utf-8")
+        bucket_mgr._invalidate_bm25()
+        release_builder.set()
+        [result] = future.result(timeout=2)
+
+    assert result["content"] == "BBBB same-size body"
+    [cached] = asyncio.run(bucket_mgr.list_all())
+    assert cached["content"] == "BBBB same-size body"

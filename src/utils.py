@@ -23,6 +23,7 @@ utils.py — 整个项目共享的小工具集合
 ========================================
 """
 
+import errno
 import os
 import re
 import sys
@@ -32,9 +33,10 @@ import yaml
 import logging
 import math
 import tempfile
+import threading
 from pathlib import Path
 from datetime import date, datetime
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ============================================================
@@ -70,15 +72,80 @@ BOOT_ENV_CONFIG: frozenset[str] = frozenset(
     k for k, v in os.environ.items()
     if (k.startswith("OMBRE_") or k == "AI_NAME") and str(v).strip()
 )
-BOOT_ENV_OMBRE: frozenset[str] = frozenset(
-    k for k in BOOT_ENV_CONFIG if k.startswith("OMBRE_")
-)
-
-
 def _project_root() -> str:
     """Return absolute path to the project root (parent of src/ where utils.py lives).
     项目根目录（src/ 的上一层）。"""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+_config_yaml_lock = threading.RLock()
+
+
+def _migrate_legacy_render_config(legacy_path: str, persistent_path: str) -> None:
+    """Copy an old Render cwd config into the data disk without overwriting it.
+
+    Render services created before ``OMBRE_CONFIG_PATH`` was added already have
+    ``OMBRE_BUCKETS_DIR`` pointing at the persistent disk, but Dashboard hot
+    updates do not apply new ``render.yaml`` environment variables.  Those
+    instances therefore kept writing ``<cwd>/config.yaml`` on Render's
+    ephemeral code filesystem.  Validate the legacy YAML, then publish a copy
+    through a same-directory temporary file so an interrupted migration cannot
+    leave a partial persistent config.  The legacy file is intentionally kept
+    as a rollback copy.
+    """
+    legacy_abs = os.path.abspath(legacy_path)
+    persistent_abs = os.path.abspath(persistent_path)
+    if os.path.normcase(legacy_abs) == os.path.normcase(persistent_abs):
+        return
+
+    tmp = ""
+    with _config_yaml_lock:
+        if os.path.exists(persistent_abs) or not os.path.isfile(legacy_abs):
+            return
+        try:
+            with open(legacy_abs, "r", encoding="utf-8") as source:
+                legacy_config = yaml.safe_load(source) or {}
+            if not isinstance(legacy_config, dict):
+                raise ValueError("legacy config.yaml top level is not a mapping")
+
+            parent = os.path.dirname(persistent_abs)
+            os.makedirs(parent, exist_ok=True)
+            descriptor, tmp = tempfile.mkstemp(
+                prefix=f".{os.path.basename(persistent_abs)}.migrate.",
+                dir=parent,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as target:
+                yaml.safe_dump(
+                    legacy_config,
+                    target,
+                    allow_unicode=True,
+                    default_flow_style=False,
+                )
+                target.flush()
+                os.fsync(target.fileno())
+
+            # Publish with true no-clobber semantics.  ``exists`` followed by
+            # ``replace`` has a TOCTOU window and can overwrite a config another
+            # worker creates between those calls.  The temp file lives in the
+            # same directory/filesystem, so link(2) atomically either creates
+            # the target name or raises FileExistsError without touching it.
+            try:
+                os.link(tmp, persistent_abs)
+            except FileExistsError:
+                pass
+        except Exception as exc:
+            logging.warning(
+                "Failed to migrate Render config.yaml from %s to %s: %s",
+                legacy_abs,
+                persistent_abs,
+                exc,
+            )
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 def config_file_path() -> str:
@@ -87,8 +154,10 @@ def config_file_path() -> str:
     顺序：
       1. $OMBRE_CONFIG_PATH —— 显式指定即采纳，**即便文件尚不存在**
          （entrypoint 会在服务启动前据此创建；Dashboard 写配置时也据此落盘）。
-      2. <cwd>/config.yaml —— 存在才用。
-      3. <project_root>/config.yaml —— 兜底默认。
+      2. Render 旧实例未设 OMBRE_CONFIG_PATH 时，跟随已有的
+         OMBRE_BUCKETS_DIR / OMBRE_VAULT_DIR 落到持久盘，并安全复制旧 cwd 配置。
+      3. <cwd>/config.yaml —— 存在才用。
+      4. <project_root>/config.yaml —— 兜底默认。
 
     为什么独立成函数：load_config 读、Dashboard（config_api/buckets/github/
     embedding）写、entrypoint 初始化——以前各处都硬编码 <repo_root>/config.yaml。
@@ -98,10 +167,187 @@ def config_file_path() -> str:
     env_cfg = os.environ.get("OMBRE_CONFIG_PATH", "").strip()
     if env_cfg:
         return env_cfg
+
+    is_render = str(os.environ.get("RENDER", "")).strip().lower() in _BOOL_TRUE
+    render_data_dir = (
+        os.environ.get("OMBRE_BUCKETS_DIR", "").strip()
+        or os.environ.get("OMBRE_VAULT_DIR", "").strip()
+    )
+    if is_render and render_data_dir:
+        persistent_cfg = os.path.join(
+            os.path.abspath(os.path.expanduser(render_data_dir)),
+            "config.yaml",
+        )
+        _migrate_legacy_render_config(
+            os.path.join(os.getcwd(), "config.yaml"),
+            persistent_cfg,
+        )
+        return persistent_cfg
+
     cwd_cfg = os.path.join(os.getcwd(), "config.yaml")
     if os.path.exists(cwd_cfg):
         return cwd_cfg
     return os.path.join(_project_root(), "config.yaml")
+
+
+# 所有往 config.yaml 写东西的 Dashboard 接口（github/tunnel/config_api/buckets……）
+# 共用这一把锁 + 同一套原子写：谁都不能绕开它自己再开 open(path, "w") 整份覆盖。
+# 背景：github 备份配置曾经用「open(w) 直接整份覆盖、写失败只记 warning 但仍回 200」
+# 这种不安全写法，写失败时用户会看到「保存成功」、下次重启却发现配置又清空了。
+
+
+_MOUNTINFO_ESCAPES = {
+    "040": " ",
+    "011": "\t",
+    "012": "\n",
+    "134": "\\",
+}
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return re.sub(
+        r"\\(040|011|012|134)",
+        lambda match: _MOUNTINFO_ESCAPES[match.group(1)],
+        value,
+    )
+
+
+def _is_exact_linux_mount_point(path: str) -> bool:
+    """Return whether ``path`` is a regular-file mount point on Linux."""
+    if not sys.platform.startswith("linux") or not os.path.isfile(path):
+        return False
+    target = os.path.realpath(os.path.abspath(path))
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                fields = line.split()
+                if len(fields) > 4:
+                    mounted_at = _decode_mountinfo_path(fields[4])
+                    if os.path.realpath(mounted_at) == target:
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def _write_bytes_and_sync(path: str, payload: bytes) -> None:
+    with open(path, "wb") as target:
+        target.write(payload)
+        target.flush()
+        os.fsync(target.fileno())
+
+
+def _overwrite_mounted_config(tmp: str, config_path: str) -> bytes:
+    """Overwrite an unreplaceable file mount and return bytes for rollback."""
+    with open(config_path, "rb") as current:
+        previous_payload = current.read()
+    with open(tmp, "rb") as source:
+        next_payload = source.read()
+    try:
+        _write_bytes_and_sync(config_path, next_payload)
+    except Exception as write_error:
+        try:
+            _write_bytes_and_sync(config_path, previous_payload)
+        except Exception as restore_error:
+            raise OSError(
+                "config.yaml bind-mount write failed and restoring the previous "
+                f"file also failed: {restore_error}"
+            ) from write_error
+        raise
+    return previous_payload
+
+
+def read_config_yaml() -> dict:
+    """Read the persisted config under the same lock used by atomic writers.
+
+    A normal ``os.replace`` reader is already protected from partial files, but
+    Docker's single-file bind-mount fallback must overwrite the mounted inode
+    in place.  Sharing ``_config_yaml_lock`` prevents Dashboard readers from
+    observing that short write window and gives every route one desired-config
+    snapshot instead of stale per-route caches.
+    """
+    config_path = config_file_path()
+    with _config_yaml_lock:
+        if not os.path.exists(config_path):
+            return {}
+        with open(config_path, "r", encoding="utf-8") as handle:
+            persisted = yaml.safe_load(handle) or {}
+        if not isinstance(persisted, dict):
+            raise ValueError("config.yaml top level must be a mapping")
+        return persisted
+
+
+def atomic_update_config_yaml(mutate: Callable[[dict], None]) -> dict:
+    """线程安全地读改写 config.yaml：加锁读现有内容，交给 ``mutate`` 原地 patch。
+
+    普通文件通过临时文件 + ``os.replace`` 原子落盘。Docker 的旧式单文件
+    bind mount 是一个不可替换的挂载点，Linux 会对 ``os.replace`` 返回
+    ``EBUSY``；这种情况下退回到锁内覆盖、flush + fsync，并继续执行同一套
+    回读校验。降级路径不具备崩溃原子性，但能兼容无法 rename 的挂载点，且
+    仍由全局锁避免应用内部的并发读改写互相覆盖。
+
+    任何一步失败都直接抛异常——调用方必须把异常转成对用户如实的错误响应，
+    不能吞掉后仍然回「保存成功」，那样用户会以为配置在，其实只在内存里，
+    下次进程重启（崩溃/热更新/手动重启按钮）就会被磁盘上没写成功的旧内容盖掉。
+
+    返回值是写入后的完整 config dict（等价于重新读盘一次）。"""
+    config_path = config_file_path()
+    tmp = ""
+    with _config_yaml_lock:
+        save_config: dict = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                save_config = yaml.safe_load(f) or {}
+        if not isinstance(save_config, dict):
+            save_config = {}
+        mutate(save_config)
+        try:
+            parent = os.path.dirname(os.path.abspath(config_path))
+            os.makedirs(parent, exist_ok=True)
+            descriptor, tmp = tempfile.mkstemp(
+                prefix=f".{os.path.basename(config_path)}.tmp.",
+                dir=parent,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as f:
+                yaml.dump(save_config, f, allow_unicode=True, default_flow_style=False)
+                f.flush()
+                os.fsync(f.fileno())
+            fallback_backup: bytes | None = None
+            try:
+                os.replace(tmp, config_path)
+            except OSError as e:
+                if (
+                    e.errno != errno.EBUSY
+                    or not _is_exact_linux_mount_point(config_path)
+                ):
+                    raise
+                # A bind-mounted file is itself a mount point and cannot be
+                # be replaced with rename(2).  It remains writable, so perform
+                # a lock-protected overwrite while keeping the old bytes for
+                # rollback if the write or verification fails.
+                fallback_backup = _overwrite_mounted_config(tmp, config_path)
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    persisted = yaml.safe_load(f) or {}
+                if persisted != save_config:
+                    raise OSError("config.yaml verification failed after write")
+            except Exception as verify_error:
+                if fallback_backup is not None:
+                    try:
+                        _write_bytes_and_sync(config_path, fallback_backup)
+                    except Exception as restore_error:
+                        raise OSError(
+                            "config.yaml verification failed and restoring the "
+                            f"previous bind-mounted file also failed: {restore_error}"
+                        ) from verify_error
+                raise
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+        return save_config
 
 
 def parse_bool(value, *, default=...) -> bool:

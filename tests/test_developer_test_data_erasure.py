@@ -1,6 +1,19 @@
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+
+import tools._runtime as rt
+from ombrebrain.policy.formal_invariants import FormalInvariantChecker
+from tools.trace.core import trace_core
+
+
+def _install_trace_runtime(bucket_mgr) -> None:
+    rt.config = {"limits": {}}
+    rt.bucket_mgr = bucket_mgr
+    rt.logger = MagicMock()
+    rt.mark_op = None
+    rt.v3_runtime = None
 
 
 @pytest.mark.asyncio
@@ -31,9 +44,97 @@ async def test_only_creation_marked_test_bucket_can_be_hard_deleted(bucket_mgr):
     assert await bucket_mgr.get(test_id) is None
 
 
+@pytest.mark.asyncio
+async def test_trace_hard_delete_refuses_normal_plan_without_archiving(bucket_mgr):
+    plan_id = await bucket_mgr.create(
+        content="a real plan that must remain recoverable",
+        domain=["plan"],
+        bucket_type="plan",
+        source_tool="plan",
+    )
+    before = await bucket_mgr.get(plan_id)
+    plan_path = Path(before["path"])
+    _install_trace_runtime(bucket_mgr)
+
+    result = await trace_core(
+        plan_id,
+        hard_delete=True,
+        delete_reason="reported cleanup request",
+    )
+
+    after = await bucket_mgr.get(plan_id)
+    assert "普通记忆桶（包括 plan）不可被 trace 物理删除" in result
+    assert "本次未删除、未归档" in result
+    assert after is not None
+    assert "deleted_at" not in after["metadata"]
+    assert plan_path.exists()
+    assert not any(
+        event["event_type"] == "TraceHardDeleted"
+        and event["trace_id"] == plan_id
+        for event in bucket_mgr.ledger_mirror.iter_events()
+    )
+
+
+@pytest.mark.asyncio
+async def test_test_data_cleanup_requires_reason_and_rejects_conflicting_modes(
+    bucket_mgr,
+):
+    test_id = await bucket_mgr.create(
+        content="synthetic gateway test payload",
+        domain=["test"],
+        source_tool="hold",
+        test_data=True,
+    )
+    test_bucket = await bucket_mgr.get(test_id)
+    test_path = Path(test_bucket["path"])
+    _install_trace_runtime(bucket_mgr)
+
+    missing = await bucket_mgr.hard_delete_test_bucket(test_id, reason="   ")
+    assert missing == {"ok": False, "error": "missing_delete_reason"}
+    assert test_path.exists()
+
+    missing_via_trace = await trace_core(test_id, hard_delete=True)
+    assert "必须提供非空 delete_reason" in missing_via_trace
+    assert test_path.exists()
+
+    too_long = await trace_core(
+        test_id,
+        hard_delete=True,
+        delete_reason="x" * 501,
+    )
+    assert "不能超过 500 个字符" in too_long
+    assert test_path.exists()
+
+    conflicting = await trace_core(
+        test_id,
+        delete=True,
+        hard_delete=True,
+        delete_reason="gateway test cleanup",
+    )
+    assert "参数冲突" in conflicting
+    assert "未删除、未归档" in conflicting
+    assert test_path.exists()
+    assert await bucket_mgr.get(test_id) is not None
+
+    deleted = await trace_core(
+        test_id,
+        hard_delete=True,
+        delete_reason="gateway test cleanup",
+    )
+    assert deleted == f"已永久删除测试桶: {test_id}"
+    assert not test_path.exists()
+
+    events = list(bucket_mgr.ledger_mirror.iter_events())
+    delete_event = next(
+        event for event in events if event["event_type"] == "TraceHardDeleted"
+    )
+    assert delete_event["payload"]["reason"] == "gateway test cleanup"
+    assert FormalInvariantChecker.default().evaluate_ledger(events).ok is True
+
+
 def test_dashboard_separates_normal_batch_actions_from_developer_erasure():
     text = Path("frontend/dashboard.html").read_text(encoding="utf-8")
-    assert "全选当前筛选" in text
+    assert "全选当前页" in text
     assert "/api/buckets/batch" in text
     assert "body.developer-mode .developer-only" in text
     assert "/api/developer/buckets/hard-delete" in text

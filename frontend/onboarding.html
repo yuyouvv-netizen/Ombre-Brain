@@ -120,8 +120,14 @@ function renderReport(report) {
   const lines = [
     '当前模式：' + report.profile,
     '配置文件：' + (report.config_path || '未识别'),
-    '实际 transport：' + report.effective.transport,
-    '实际 OAuth：' + (report.effective.mcp_require_auth ? '开启' : '关闭'),
+    '已保存 transport：' + report.saved.transport,
+    '当前生效 transport：' + report.effective.transport,
+    '已保存 OAuth：' + (report.saved.mcp_require_auth ? '开启' : '关闭'),
+    '当前生效 OAuth：' + (report.effective.mcp_require_auth ? '开启' : '关闭'),
+    '已保存鉴权模式：' + report.saved.mcp_auth_mode,
+    '当前生效鉴权模式：' + report.effective.mcp_auth_mode,
+    '已保存公网地址：' + (report.saved.public_url || '未设置'),
+    '当前生效公网地址：' + (report.effective.public_url || '未设置'),
     '记忆目录：' + report.effective.buckets_dir,
     '持久性：' + ((report.persistence || {}).persistent ? '已确认' : '需要处理'),
   ];

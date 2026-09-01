@@ -176,7 +176,9 @@ def test_bounded_zip_member_rejects_duplicate_root_file():
 
 
 @pytest.mark.asyncio
-async def test_update_download_stream_enforces_actual_byte_limit(monkeypatch):
+async def test_update_download_stream_enforces_actual_byte_limit(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(meta, "_MAX_UPDATE_ARCHIVE_BYTES", 10)
 
     def handler(_request):
@@ -184,7 +186,30 @@ async def test_update_download_stream_enforces_actual_byte_limit(monkeypatch):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(ValueError, match="64 MiB"):
-            await meta._download_update_archive(client, "https://updates.example/archive.zip")
+            await meta._download_update_archive_to_file(
+                client,
+                "https://updates.example/archive.zip",
+                str(tmp_path / "update.zip"),
+            )
+
+
+@pytest.mark.asyncio
+async def test_update_download_streams_complete_archive_to_disk(tmp_path):
+    payload = b"bounded-archive"
+
+    def handler(_request):
+        return httpx.Response(200, content=payload)
+
+    destination = tmp_path / "update.zip"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloaded = await meta._download_update_archive_to_file(
+            client,
+            "https://updates.example/archive.zip",
+            str(destination),
+        )
+
+    assert downloaded == len(payload)
+    assert destination.read_bytes() == payload
 
 
 def test_atomic_update_write_replaces_complete_file(tmp_path):

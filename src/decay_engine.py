@@ -238,10 +238,16 @@ class DecayEngine:
         for bucket in buckets:
             meta = bucket.get("metadata", {})
 
-            # Skip permanent / pinned / protected / feel / i buckets
+            # Skip permanent / pinned / protected / feel / i / plan / letter buckets
             # 跳过固化桶、钉选/保护桶、feel 桶和 i（自我认知）桶
             # i 桶承诺永不衰减（tools/i/core.py 注释）——必须在此显式排除
-            if meta.get("type") in ("permanent", "feel", "i") or meta.get("pinned") or meta.get("protected"):
+            # plan / letter 同样必须在此排除：calculate_score() 对它们恒定返回
+            # _SCORE_FEEL，本来就不会被下面的归档阈值判定动到，但下面的自动结案
+            # 分支跑在 calculate_score() 之前、不看 type，会直接把 plan/letter
+            # 也 resolved=True——plan 的生命周期只能由 status 字段驱动，letter
+            # 承诺永久保留原样，两者都不该被这条「重要度低+超期未解决」的通用
+            # 自动结案逻辑碰。
+            if meta.get("type") in ("permanent", "feel", "i", "plan", "letter") or meta.get("pinned") or meta.get("protected"):
                 continue
 
             checked += 1

@@ -1,5 +1,5 @@
-from ledger_mirror import LedgerMirror
-from ledger_replay import LedgerReplayValidator
+from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
+from ombrebrain.eventsourcing.ledger_replay import LedgerReplayValidator
 
 
 def test_ledger_replay_validator_accepts_rebuildable_lifecycle(tmp_path):

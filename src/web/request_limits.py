@@ -16,6 +16,14 @@ def is_mcp_endpoint_path(path: object) -> bool:
     return str(path or "").rstrip("/") == "/mcp"
 
 
+def is_sse_endpoint_path(path: object) -> bool:
+    """Match FastMCP's legacy SSE handshake and message endpoints."""
+    normalized = str(path or "").rstrip("/") or "/"
+    return normalized == "/sse" or normalized == "/messages" or normalized.startswith(
+        "/messages/"
+    )
+
+
 class MCPRequestBodyLimitMiddleware:
     """Reject oversized MCP requests before JSON-RPC parsing or tool dispatch."""
 
@@ -144,11 +152,17 @@ _LARGE_UPLOAD_PATHS = {
 class ManagementRequestBodyLimitMiddleware(MCPRequestBodyLimitMiddleware):
     """Bound normal Dashboard/OAuth mutations while preserving large upload APIs."""
 
-    def __init__(self, app, *, max_bytes: int) -> None:
+    def __init__(
+        self,
+        app,
+        *,
+        max_bytes: int,
+        mcp_path_matcher: Callable[[object], bool] = is_mcp_endpoint_path,
+    ) -> None:
         def should_limit(path: object) -> bool:
             normalized = str(path or "").rstrip("/") or "/"
             return (
-                not is_mcp_endpoint_path(normalized)
+                not mcp_path_matcher(normalized)
                 and normalized not in _LARGE_UPLOAD_PATHS
             )
 

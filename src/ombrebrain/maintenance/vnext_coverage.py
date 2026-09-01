@@ -69,7 +69,7 @@ class VNextCoverageMatrix:
 def _item(
     phase_key: str,
     title: str,
-    plan_slug: str,
+    _plan_slug: str,
     *,
     tests: tuple[str, ...],
     checks: tuple[str, ...] = (),
@@ -78,7 +78,7 @@ def _item(
     return VNextCoverageItem(
         phase_key=phase_key,
         title=title,
-        plan_path=f"docs/superpowers/plans/{plan_slug}",
+        plan_path="",
         test_files=tests,
         preflight_checks=checks,
         notes=notes,

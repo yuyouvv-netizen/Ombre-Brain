@@ -131,6 +131,7 @@ class FormalInvariantChecker:
     def evaluate_ledger(self, events: Iterable[Mapping[str, Any]]) -> InvariantReport:
         event_list = list(events)
         tombstoned: set[str] = set()
+        erasable_test_data: set[str] = set()
         physical_erasure: list[Mapping[str, Any]] = []
         created_body_hashes: dict[str, str] = {}
         violations: list[InvariantViolation] = []
@@ -144,6 +145,16 @@ class FormalInvariantChecker:
                 body_hash = _body_hash(event)
                 if body_hash:
                     created_body_hashes.setdefault(trace_id, body_hash)
+                provenance = payload.get("provenance")
+                if (
+                    isinstance(provenance, Mapping)
+                    and provenance.get("kind") == "test"
+                    and provenance.get("erasable") is True
+                ):
+                    # Test cleanup is the one deliberately erasable namespace.
+                    # Trust only immutable creation provenance, never a delete
+                    # event that claims test status after the fact.
+                    erasable_test_data.add(trace_id)
 
             if trace_id and (event_type in _TOMBSTONE_EVENTS or _truthy(payload.get("tombstone"))):
                 tombstoned.add(trace_id)
@@ -160,7 +171,7 @@ class FormalInvariantChecker:
 
         for event in physical_erasure:
             trace_id = str(event.get("trace_id") or "")
-            if trace_id not in tombstoned:
+            if trace_id not in tombstoned and trace_id not in erasable_test_data:
                 violations.append(
                     InvariantViolation(
                         code="no_silent_erasure",

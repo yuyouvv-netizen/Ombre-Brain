@@ -40,7 +40,7 @@
 - `OMBRE_MCP_TOKEN`：静态 Token 模式密钥。
 - `OMBRE_DASHBOARD_PASSWORD`：Dashboard 密码。
 - `OMBRE_DASHBOARD_SESSION_DAYS`：Dashboard 登录会话天数。
-- `OMBRE_TRUSTED_PROXY_CIDRS`：可信反向代理网段。
+- `OMBRE_TRUSTED_PROXY_CIDRS`：直接连接 OB 的最后一跳可信反向代理 CIDR；不是公网客户端 IP 或域名，禁止使用 `0.0.0.0/0`。官方 Compose 模板会从 `.env` 透传该值，修改后需要重新创建容器。
 
 ## Tunnel、Hook 与 GitHub
 

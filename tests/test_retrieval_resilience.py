@@ -40,6 +40,27 @@ class StrictEmbedding:
         self.compat_calls += 1
         raise AssertionError("surface_search must not issue a second vector query")
 
+    def status(self):
+        return {
+            "enabled": True,
+            "backend": "api",
+            "model": "test-embedding",
+            "vector_dim": 768,
+            "embedding_count": len(self.pairs),
+        }
+
+
+class OutboxStatus:
+    def status(self):
+        return {
+            "running": True,
+            "provider_ready": True,
+            "pending": 2,
+            "retrying": 1,
+            "last_success": "2026-07-19T12:00:00",
+            "last_error": "provider timeout",
+        }
+
 
 def install_runtime(bucket_mgr, decay_eng, dehydrator, embedding):
     rt.config = {"surfacing": {}}
@@ -47,6 +68,7 @@ def install_runtime(bucket_mgr, decay_eng, dehydrator, embedding):
     rt.decay_engine = decay_eng
     rt.dehydrator = dehydrator
     rt.embedding_engine = embedding
+    rt.embedding_outbox = None
     rt.logger = MagicMock()
     rt.fire_webhook = None
     rt.mark_op = None
@@ -126,6 +148,36 @@ async def test_semantic_only_candidate_is_recalled_with_one_vector_query(
     assert "[语义命中]" in result
     assert embedding.strict_calls == 1
     assert embedding.compat_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_logs_index_outbox_and_rank_diagnostics(
+    bucket_mgr, decay_eng
+):
+    bucket_id = await bucket_mgr.create(
+        content="A semantic diagnostic target.",
+        domain=["journal"],
+    )
+    embedding = StrictEmbedding(pairs=[(bucket_id, 0.91)])
+    install_runtime(bucket_mgr, decay_eng, EchoDehydrator(), embedding)
+    rt.embedding_outbox = OutboxStatus()
+
+    result = await run_search("diagnostic query")
+
+    assert bucket_id in result
+    semantic_call = next(
+        call for call in rt.logger.info.call_args_list
+        if call.args and "phase=semantic" in str(call.args[0])
+    )
+    diagnostics = semantic_call.args[1]
+    assert diagnostics["engine"]["model"] == "test-embedding"
+    assert diagnostics["engine"]["embedding_count"] == 1
+    assert diagnostics["outbox"]["pending"] == 2
+    assert diagnostics["outbox"]["retrying"] == 1
+    assert diagnostics["vector_top"] == [
+        {"bucket_id": bucket_id, "score": 0.91}
+    ]
+    assert "diagnostic query" not in str(diagnostics)
 
 
 @pytest.mark.asyncio

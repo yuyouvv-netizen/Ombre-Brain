@@ -134,6 +134,32 @@ async def test_dispatch_catalog_respects_domain_filter(bucket_mgr):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_catalog_respects_tags_and_max_results(bucket_mgr):
+    await bucket_mgr.create(content="x", name="命中高", tags=["拥抱"], importance=9)
+    await bucket_mgr.create(content="y", name="命中低", tags=["拥抱"], importance=5)
+    await bucket_mgr.create(content="z", name="不命中", tags=["其他"], importance=10)
+    install_runtime(bucket_mgr)
+
+    out = await dispatch(tags="拥抱", catalog=True, max_results=1)
+
+    assert "命中高" in out
+    assert "命中低" not in out
+    assert "不命中" not in out
+    assert "1 桶" in out
+
+
+@pytest.mark.asyncio
+async def test_dispatch_catalog_missing_tag_returns_empty(bucket_mgr):
+    await bucket_mgr.create(content="x", name="目录项", tags=["已存在"])
+    install_runtime(bucket_mgr)
+
+    out = await dispatch(tags="definitely_missing", catalog=True, max_results=5)
+
+    assert "没有匹配过滤条件" in out
+    assert "目录项" not in out
+
+
+@pytest.mark.asyncio
 async def test_catalog_empty_library(bucket_mgr):
     install_runtime(bucket_mgr)
     assert "记忆库为空" in await surface_catalog()

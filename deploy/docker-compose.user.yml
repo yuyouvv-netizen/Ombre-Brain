@@ -28,8 +28,9 @@ services:
     container_name: ombre-brain
     restart: unless-stopped
     ports:
-      # 对外默认 18001 → 容器内 8000（镜像固定）。换端口：.env 设 OMBRE_HOST_PORT。
-      - "${OMBRE_HOST_PORT:-18001}:8000"
+      # 默认只绑本机，避免首启设密页在公网被抢占。确需 LAN/公网直连时
+      # 在 .env 设 OMBRE_BIND_ADDRESS=0.0.0.0，并保持下方强密码。
+      - "${OMBRE_BIND_ADDRESS:-127.0.0.1}:${OMBRE_HOST_PORT:-18001}:8000"
     environment:
       - OMBRE_TRANSPORT=streamable-http
       # config 放进数据卷（./buckets），而不是单文件挂载 —— 见文件顶部说明。
@@ -41,7 +42,9 @@ services:
       - OMBRE_EMBED_API_KEY=${OMBRE_EMBED_API_KEY:-}
       - OMBRE_EMBED_BASE_URL=${OMBRE_EMBED_BASE_URL:-}
       - OMBRE_EMBED_MODEL=${OMBRE_EMBED_MODEL:-}
-      - OMBRE_DASHBOARD_PASSWORD=${OMBRE_DASHBOARD_PASSWORD}
+      - OMBRE_DASHBOARD_PASSWORD=${OMBRE_DASHBOARD_PASSWORD:?OMBRE_DASHBOARD_PASSWORD is required}
+      # Trust forwarded origin headers only from the configured last-hop proxy.
+      - "OMBRE_TRUSTED_PROXY_CIDRS=${OMBRE_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}"
       - OMBRE_HOST_VAULT_DIR=${OMBRE_HOST_VAULT_DIR:-}
       # 默认跳过 SRV edge discovery，兼容 VPN 提供的不完整 DNS resolver。
       - TUNNEL_EDGE=${TUNNEL_EDGE-region1.v2.argotunnel.com:7844,region2.v2.argotunnel.com:7844}

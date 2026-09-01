@@ -19,10 +19,13 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+
+from utils import _win_long_path
 
 logger = logging.getLogger("ombre_brain.github_sync")
 
@@ -30,7 +33,98 @@ _API = "https://api.github.com"
 _TIMEOUT = 60.0
 _MAX_FILE_BYTES = 5 * 1024 * 1024  # GitHub single blob 上限 ~100MB，这里保守限 5MB
 _TREE_CHUNK = 200                  # 每个 /git/trees 请求最多内联多少文件，避免单请求过大
+_TREE_CHUNK_BYTES = 2 * 1024 * 1024  # Bound decoded bodies retained by one request.
+_MAX_BACKUP_FILES = 10_000
+_MAX_BACKUP_PATH_BYTES = 1024
+_MAX_MANIFEST_PAYLOAD_BYTES = 4 * 1024 * 1024
+_MAX_MANIFEST_BASE64_BYTES = ((_MAX_MANIFEST_PAYLOAD_BYTES + 2) // 3) * 4 + 64 * 1024
+_MAX_RESTORE_TOTAL_BYTES = 512 * 1024 * 1024
 _MANIFEST_FILENAME = "_ombre_backup_manifest.json"
+
+
+class _LazyMarkdownFiles(Mapping[str, bytes]):
+    """A path index whose file bodies are read only when requested.
+
+    GitHub backup used to retain every Markdown file as ``bytes`` and then
+    retain a second decoded ``str`` copy for every tree entry.  On a 512 MiB
+    instance that makes the scheduled backup itself an OOM trigger.  Keeping
+    only paths here lets ``_batch_commit`` hold at most one bounded chunk of
+    bodies while preserving the historical mapping-shaped private API.
+    """
+
+    def __init__(self, paths: Mapping[str, str]) -> None:
+        self._paths = dict(paths)
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._paths)
+
+    def __getitem__(self, relative_path: str) -> bytes:
+        full_path = self._paths[relative_path]
+        if os.path.islink(full_path):
+            raise RuntimeError(
+                f"GitHub backup refuses symbolic-link file: {relative_path}"
+            )
+        size = os.path.getsize(full_path)
+        if size > _MAX_FILE_BYTES:
+            raise RuntimeError(
+                f"GitHub backup file grew beyond {_MAX_FILE_BYTES} bytes: "
+                f"{relative_path} ({size} bytes)"
+            )
+        # Re-check through a bounded read: a file may grow between stat() and
+        # open(), and an unbounded read here would defeat the memory guarantee.
+        with open(full_path, "rb") as handle:
+            content = handle.read(_MAX_FILE_BYTES + 1)
+        if len(content) > _MAX_FILE_BYTES:
+            raise RuntimeError(
+                f"GitHub backup file grew beyond {_MAX_FILE_BYTES} bytes: "
+                f"{relative_path}"
+            )
+        return content
+
+
+def _iter_markdown_paths(root_dir: str) -> Iterator[str]:
+    """Depth-first scandir traversal without materializing directory listings."""
+    iterators: list[os.ScandirIterator] = []
+    try:
+        try:
+            iterators.append(os.scandir(root_dir))
+        except OSError as exc:
+            logger.warning(f"[github_sync] cannot scan {root_dir}: {exc}")
+            return
+
+        while iterators:
+            current = iterators[-1]
+            try:
+                entry = next(current)
+            except StopIteration:
+                current.close()
+                iterators.pop()
+                continue
+            except OSError as exc:
+                logger.warning(f"[github_sync] directory scan failed: {exc}")
+                current.close()
+                iterators.pop()
+                continue
+
+            try:
+                # Match os.walk(..., followlinks=False): recurse into real
+                # directories, but never follow a symlinked directory tree.
+                if entry.is_dir(follow_symlinks=False):
+                    try:
+                        iterators.append(os.scandir(entry.path))
+                    except OSError as exc:
+                        logger.warning(f"[github_sync] cannot scan {entry.path}: {exc}")
+                    continue
+                if entry.name.endswith(".md") and entry.is_file(follow_symlinks=False):
+                    yield entry.path
+            except OSError as exc:
+                logger.warning(f"[github_sync] skip {entry.path}: {exc}")
+    finally:
+        for iterator in reversed(iterators):
+            iterator.close()
 
 
 class GitHubSync:
@@ -62,6 +156,9 @@ class GitHubSync:
         # A3：连续失败计数。自动备份可能连挂几次而用户毫无察觉（以为有备份其实没有）。
         # 每次成功归零、每次失败 +1，供诊断面板判断要不要升级为醒目告警。
         self.consecutive_failures: int = 0
+        # Manual and scheduled backups share one instance.  Serializing them
+        # prevents two bounded jobs from adding up to an unbounded peak.
+        self._sync_lock = asyncio.Lock()
 
     # --------------------------------------------------------
     # 公开接口
@@ -69,28 +166,29 @@ class GitHubSync:
 
     async def sync(self, buckets_dir: str) -> dict[str, Any]:
         """同步 buckets_dir 下所有 .md 到 GitHub。返回结果 dict。"""
-        try:
-            files = self._collect_files(buckets_dir)
-            if not files:
+        async with self._sync_lock:
+            try:
+                files = self._collect_files(buckets_dir)
+                if not files:
+                    self.last_status = "ok"
+                    self.last_error = ""
+                    self.last_sync = _now_iso()
+                    self.last_count = 0
+                    return {"ok": True, "uploaded": 0, "message": "无可同步文件"}
+
+                count = await self._batch_commit(files)
+                self.last_sync = _now_iso()
                 self.last_status = "ok"
                 self.last_error = ""
-                self.last_sync = _now_iso()
-                self.last_count = 0
-                return {"ok": True, "uploaded": 0, "message": "无可同步文件"}
-
-            count = await self._batch_commit(files)
-            self.last_sync = _now_iso()
-            self.last_status = "ok"
-            self.last_error = ""
-            self.last_count = count
-            self.consecutive_failures = 0
-            return {"ok": True, "uploaded": count}
-        except Exception as e:
-            self.last_status = "error"
-            self.last_error = str(e)
-            self.consecutive_failures += 1
-            logger.error(f"[github_sync] sync failed (连续 {self.consecutive_failures} 次): {e}")
-            return {"ok": False, "error": str(e)}
+                self.last_count = count
+                self.consecutive_failures = 0
+                return {"ok": True, "uploaded": count}
+            except Exception as e:
+                self.last_status = "error"
+                self.last_error = str(e)
+                self.consecutive_failures += 1
+                logger.error(f"[github_sync] sync failed (连续 {self.consecutive_failures} 次): {e}")
+                return {"ok": False, "error": str(e)}
 
     async def import_from_github(self, buckets_dir: str) -> dict[str, Any]:
         """从 GitHub 仓库把 path_prefix 下的所有 .md 拉回本地 buckets_dir（恢复 / 回滚）。
@@ -99,6 +197,11 @@ class GitHubSync:
         本地独有的文件保留不动。embeddings.db 不在仓库里，调用方应在导入后跑一次
         backfill 重建向量。带 path-traversal 防护（仓库内容不可信，防 ../ 逃逸）。
         """
+        async with self._sync_lock:
+            return await self._import_from_github_locked(buckets_dir)
+
+    async def _import_from_github_locked(self, buckets_dir: str) -> dict[str, Any]:
+        """Serialized implementation shared with the backup lock."""
         try:
             async with httpx.AsyncClient(headers=self._headers, timeout=_TIMEOUT) as c:
                 # 取 branch HEAD → commit tree → 递归列出全部 blob
@@ -122,6 +225,12 @@ class GitHubSync:
                 tj = r.json()
                 tree = tj.get("tree", [])
                 truncated = bool(tj.get("truncated"))
+                if truncated:
+                    raise RuntimeError(
+                        "GitHub returned a truncated tree; refusing an incomplete restore"
+                    )
+                if not isinstance(tree, list):
+                    raise RuntimeError("GitHub tree response is not a list")
 
                 prefix = (self.path_prefix + "/") if self.path_prefix else ""
                 manifest_path = f"{prefix}{_MANIFEST_FILENAME}"
@@ -133,11 +242,66 @@ class GitHubSync:
                     None,
                 )
                 backup_manifest = await self._read_backup_manifest_summary(c, manifest_item) if manifest_item else {"present": False}
+                if manifest_item and not backup_manifest.get("present"):
+                    raise RuntimeError(
+                        "GitHub backup manifest is unreadable; refusing an unverified restore"
+                    )
+                manifest_entries = backup_manifest.pop("_entries", None)
                 targets = [
                     t for t in tree
                     if t.get("type") == "blob" and t.get("path", "").startswith(prefix)
                     and t["path"].endswith(".md")
                 ]
+                if len(targets) > _MAX_BACKUP_FILES:
+                    raise RuntimeError(
+                        f"GitHub restore has more than {_MAX_BACKUP_FILES} Markdown files"
+                    )
+                target_by_rel: dict[str, dict[str, Any]] = {}
+                declared_total = 0
+                for target in targets:
+                    rel = str(target.get("path", ""))[len(prefix):]
+                    if (
+                        not rel
+                        or len(rel.encode("utf-8")) > _MAX_BACKUP_PATH_BYTES
+                        or rel in target_by_rel
+                    ):
+                        raise RuntimeError(f"unsafe or duplicate GitHub restore path: {rel[:200]}")
+                    try:
+                        declared_size = int(target.get("size", 0) or 0)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise RuntimeError(f"invalid GitHub blob size: {rel}") from exc
+                    if declared_size < 0 or declared_size > _MAX_FILE_BYTES:
+                        raise RuntimeError(
+                            f"GitHub restore file exceeds {_MAX_FILE_BYTES} bytes: {rel}"
+                        )
+                    declared_total += declared_size
+                    if declared_total > _MAX_RESTORE_TOTAL_BYTES:
+                        raise RuntimeError(
+                            "GitHub restore exceeds the total decoded-byte limit"
+                        )
+                    target_by_rel[rel] = target
+
+                expected_manifest: dict[str, dict[str, Any]] | None = None
+                if backup_manifest.get("present"):
+                    expected_manifest = self._validate_restore_manifest(
+                        manifest_entries, target_by_rel
+                    )
+                    manifest_total = sum(
+                        item["bytes"] for item in expected_manifest.values()
+                    )
+                    if (
+                        backup_manifest.get("schema_version") != 1
+                        or backup_manifest.get("file_count") != len(expected_manifest)
+                        or backup_manifest.get("total_bytes") != manifest_total
+                    ):
+                        raise RuntimeError("backup manifest summary is inconsistent")
+                    # Git Trees are cumulative; files deleted locally can remain
+                    # in an older base tree.  A valid manifest is the canonical
+                    # file set, so ignore stale remote Markdown outside it.
+                    target_by_rel = {
+                        rel: target_by_rel[rel] for rel in expected_manifest
+                    }
+                    targets = list(target_by_rel.values())
                 if not targets:
                     return {"ok": True, "imported": 0, "skipped": 0,
                             "message": f"GitHub 仓库 {self.repo} 的 {prefix or '/'} 下没有 .md 记忆文件",
@@ -146,6 +310,7 @@ class GitHubSync:
                 base = os.path.abspath(buckets_dir)
                 imported = 0
                 skipped = 0
+                restored_bytes = 0
                 errors: list[str] = []
                 for t in targets:
                     rel = t["path"][len(prefix):]
@@ -162,22 +327,45 @@ class GitHubSync:
                         rb.raise_for_status()
                         bj = rb.json()
                         if bj.get("encoding") == "base64":
-                            data = base64.b64decode(bj.get("content", ""))
+                            encoded = "".join(str(bj.get("content", "") or "").split())
+                            data = base64.b64decode(encoded, validate=True)
                         else:
                             data = (bj.get("content", "") or "").encode("utf-8")
-                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        if len(data) > _MAX_FILE_BYTES:
+                            raise RuntimeError(
+                                f"decoded file exceeds {_MAX_FILE_BYTES} bytes"
+                            )
+                        restored_bytes += len(data)
+                        if restored_bytes > _MAX_RESTORE_TOTAL_BYTES:
+                            raise RuntimeError("restore exceeds total decoded-byte limit")
+                        if expected_manifest is not None:
+                            expected = expected_manifest[rel]
+                            if (
+                                len(data) != expected["bytes"]
+                                or hashlib.sha256(data).hexdigest()
+                                != expected["sha256"]
+                            ):
+                                raise RuntimeError("backup manifest integrity mismatch")
+                        self._assert_safe_restore_destination(base, rel)
+                        # _win_long_path 前缀绕开 Windows 260 字符 MAX_PATH：恢复
+                        # 备份是这个前缀存在的头号场景——sanitize 后的深层 domain
+                        # 路径叠上一个本来就很长的安装目录，真的会超限（同款问题
+                        # utils.atomic_write_text 已经踩过并修过）。
+                        dest_long = _win_long_path(dest)
+                        os.makedirs(_win_long_path(os.path.dirname(dest)), exist_ok=True)
                         # 原子写：导入是覆盖本地记忆的操作，写到一半被中断绝不能留半截文件。
                         _tmp = f"{dest}.{uuid.uuid4().hex}.tmp"
+                        _tmp_long = _win_long_path(_tmp)
                         try:
-                            with open(_tmp, "wb") as f:
+                            with open(_tmp_long, "wb") as f:
                                 f.write(data)
                                 f.flush()
                                 os.fsync(f.fileno())
-                            os.replace(_tmp, dest)
+                            os.replace(_tmp_long, dest_long)
                         except Exception:
-                            if os.path.exists(_tmp):
+                            if os.path.exists(_tmp_long):
                                 try:
-                                    os.remove(_tmp)
+                                    os.remove(_tmp_long)
                                 except OSError:
                                     pass
                             raise
@@ -187,13 +375,14 @@ class GitHubSync:
                         errors.append(f"{rel}: {e}")
 
                 self.last_sync = _now_iso()
-                self.last_status = "ok"
+                restore_ok = skipped == 0
+                self.last_status = "ok" if restore_ok else "error"
                 return {
-                    "ok": True,
+                    "ok": restore_ok,
                     "imported": imported,
                     "skipped": skipped,
                     "total": len(targets),
-                    "truncated": truncated,
+                    "truncated": False,
                     "errors": errors[:10],
                     "backup_manifest": backup_manifest,
                 }
@@ -252,32 +441,114 @@ class GitHubSync:
     # 内部实现
     # --------------------------------------------------------
 
-    def _collect_files(self, buckets_dir: str) -> dict[str, bytes]:
-        """遍历 buckets_dir，收集所有 .md 文件。"""
-        result: dict[str, bytes] = {}
+    def _collect_files(self, buckets_dir: str) -> Mapping[str, bytes]:
+        """Index eligible Markdown paths without retaining their bodies."""
+        paths: dict[str, str] = {}
         if not os.path.isdir(buckets_dir):
-            return result
-        for root, _, filenames in os.walk(buckets_dir):
-            for fn in filenames:
-                if not fn.endswith(".md"):
+            return _LazyMarkdownFiles(paths)
+        base_real = os.path.realpath(buckets_dir)
+        for full in _iter_markdown_paths(buckets_dir):
+            try:
+                full_real = os.path.realpath(full)
+                if os.path.commonpath((base_real, full_real)) != base_real:
+                    logger.warning(
+                        "[github_sync] skip path outside vault: %s", full
+                    )
                     continue
-                full = os.path.join(root, fn)
-                try:
-                    size = os.path.getsize(full)
-                    if size > _MAX_FILE_BYTES:
-                        logger.warning(f"[github_sync] skip {fn}: too large ({size} bytes)")
-                        continue
-                    with open(full, "rb") as f:
-                        result[os.path.relpath(full, buckets_dir).replace("\\", "/")] = f.read()
-                except OSError as e:
-                    logger.warning(f"[github_sync] skip {fn}: {e}")
-        return result
+                size = os.path.getsize(full)
+                if size > _MAX_FILE_BYTES:
+                    logger.warning(
+                        f"[github_sync] skip {os.path.basename(full)}: "
+                        f"too large ({size} bytes)"
+                    )
+                    continue
+                relative = os.path.relpath(full, buckets_dir).replace("\\", "/")
+                if len(relative.encode("utf-8")) > _MAX_BACKUP_PATH_BYTES:
+                    raise RuntimeError(
+                        f"GitHub backup path exceeds {_MAX_BACKUP_PATH_BYTES} bytes: "
+                        f"{relative[:200]}"
+                    )
+                if relative not in paths and len(paths) >= _MAX_BACKUP_FILES:
+                    raise RuntimeError(
+                        f"GitHub backup has more than {_MAX_BACKUP_FILES} files; "
+                        "split or archive the vault before retrying"
+                    )
+                paths[relative] = full
+            except OSError as e:
+                logger.warning(f"[github_sync] skip {os.path.basename(full)}: {e}")
+        return _LazyMarkdownFiles(paths)
 
-    def _build_backup_manifest(self, files: dict[str, bytes]) -> dict[str, Any]:
+    @staticmethod
+    def _assert_safe_restore_destination(base: str, relative_path: str) -> None:
+        """Reject symlink/junction parents before a restore write."""
+        base_real = os.path.realpath(base)
+        current = base
+        parts = relative_path.replace("\\", "/").split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise RuntimeError("unsafe restore path components")
+        for part in parts:
+            current = os.path.join(current, part)
+            if os.path.lexists(current):
+                if os.path.islink(current):
+                    raise RuntimeError("restore path contains a symbolic link")
+                current_real = os.path.realpath(current)
+                if os.path.commonpath((base_real, current_real)) != base_real:
+                    raise RuntimeError("restore path resolves outside the vault")
+
+    @staticmethod
+    def _validate_restore_manifest(
+        raw_entries: object,
+        targets: Mapping[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw_entries, list) or len(raw_entries) > len(targets):
+            raise RuntimeError("backup manifest file set does not match GitHub tree")
+        expected: dict[str, dict[str, Any]] = {}
+        total = 0
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                raise RuntimeError("backup manifest entry must be an object")
+            path = item.get("path")
+            digest = item.get("sha256")
+            try:
+                size = int(item.get("bytes"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("backup manifest contains an invalid size") from exc
+            if (
+                not isinstance(path, str)
+                or path not in targets
+                or path in expected
+                or len(path.encode("utf-8")) > _MAX_BACKUP_PATH_BYTES
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdefABCDEF" for ch in digest)
+                or size < 0
+                or size > _MAX_FILE_BYTES
+            ):
+                raise RuntimeError("backup manifest contains an invalid entry")
+            total += size
+            if total > _MAX_RESTORE_TOTAL_BYTES:
+                raise RuntimeError("backup manifest exceeds total decoded-byte limit")
+            expected[path] = {"bytes": size, "sha256": digest.lower()}
+        return expected
+
+    def _build_backup_manifest(self, files: Mapping[str, bytes]) -> dict[str, Any]:
         """Build a JSON-safe manifest for the markdown files in one sync."""
+        if len(files) > _MAX_BACKUP_FILES:
+            raise RuntimeError(
+                f"GitHub backup has more than {_MAX_BACKUP_FILES} files; "
+                "split or archive the vault before retrying"
+            )
         entries = []
         total_bytes = 0
-        for rel_path, content in sorted(files.items()):
+        # Sorting keys is cheap.  Sorting ``files.items()`` would force a lazy
+        # mapping to materialize every body at once and reintroduce the OOM.
+        for rel_path in sorted(files):
+            if len(str(rel_path).encode("utf-8")) > _MAX_BACKUP_PATH_BYTES:
+                raise RuntimeError(
+                    f"GitHub backup path exceeds {_MAX_BACKUP_PATH_BYTES} bytes: "
+                    f"{str(rel_path)[:200]}"
+                )
+            content = files[rel_path]
             size = len(content)
             total_bytes += size
             entries.append({
@@ -297,7 +568,53 @@ class GitHubSync:
             "files": entries,
         }
 
-    async def _batch_commit(self, files: dict[str, bytes]) -> int:
+    def _iter_file_chunks(
+        self,
+        files: Mapping[str, bytes],
+        manifest: Mapping[str, Any],
+    ) -> Iterator[list[tuple[str, bytes]]]:
+        """Yield verified bodies bounded by both count and decoded byte size."""
+        expected_items = manifest.get("files", [])
+        if not isinstance(expected_items, list) or len(expected_items) != len(files):
+            raise RuntimeError("GitHub backup manifest does not match the file index")
+        chunk: list[tuple[str, bytes]] = []
+        chunk_bytes = 0
+        # The manifest is already sorted.  Iterating its entries directly avoids
+        # materializing a second O(N) path→metadata dictionary.
+        for expected_item in expected_items:
+            if not isinstance(expected_item, Mapping) or not expected_item.get("path"):
+                raise RuntimeError("GitHub backup manifest contains an invalid file entry")
+            relative_path = str(expected_item["path"])
+            try:
+                content = files[relative_path]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"GitHub backup source changed while being indexed: {relative_path}; retry"
+                ) from exc
+            if not isinstance(content, bytes):
+                content = bytes(content)
+            expected_size = int(expected_item.get("bytes", -1))
+            if (
+                expected_size != len(content)
+                or str(expected_item.get("sha256") or "")
+                != hashlib.sha256(content).hexdigest()
+            ):
+                raise RuntimeError(
+                    f"GitHub backup source changed while being read: {relative_path}; retry"
+                )
+            if chunk and (
+                len(chunk) >= _TREE_CHUNK
+                or chunk_bytes + len(content) > _TREE_CHUNK_BYTES
+            ):
+                yield chunk
+                chunk = []
+                chunk_bytes = 0
+            chunk.append((relative_path, content))
+            chunk_bytes += len(content)
+        if chunk:
+            yield chunk
+
+    async def _batch_commit(self, files: Mapping[str, bytes]) -> int:
         """用 Git Trees API 一次性提交所有文件，返回上传文件数。
 
         关键点：tree entry 直接内联 `content`（UTF-8 文本），由 GitHub 在建
@@ -325,37 +642,52 @@ class GitHubSync:
                 r.raise_for_status()
                 base_tree_sha = r.json()["tree"]["sha"]
 
-            # 3. 组装 tree entries（内联 content，文本直接走 UTF-8）
-            entries: list[dict] = []
-            for rel_path, content in files.items():
-                gh_path = f"{self.path_prefix}/{rel_path}" if self.path_prefix else rel_path
-                try:
-                    text = content.decode("utf-8")
-                    entry = {"path": gh_path, "mode": "100644", "type": "blob", "content": text}
-                except UnicodeDecodeError:
-                    # 非 UTF-8（理论上只同步 .md，不会走到这里）：退回 base64 blob
-                    rb = await self._request(
-                        c, "POST", f"{_API}/repos/{self.repo}/git/blobs",
-                        json={"content": base64.b64encode(content).decode(), "encoding": "base64"},
-                    )
-                    rb.raise_for_status()
-                    entry = {"path": gh_path, "mode": "100644", "type": "blob", "sha": rb.json()["sha"]}
-                entries.append(entry)
-
+            # 3. Build a hard-bounded manifest first.  Lazy production mappings
+            # read one body at a time during this pass and retain metadata only.
             manifest_path = f"{self.path_prefix}/{_MANIFEST_FILENAME}" if self.path_prefix else _MANIFEST_FILENAME
             manifest = self._build_backup_manifest(files)
-            entries.append({
+            manifest_content = json.dumps(
+                manifest, ensure_ascii=False, indent=2, sort_keys=True
+            )
+            manifest_entry = {
                 "path": manifest_path,
                 "mode": "100644",
                 "type": "blob",
-                "content": json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
-            })
+                "content": manifest_content,
+            }
+            # Account for the outer Git Trees JSON escaping too.  Count/path
+            # limits bound construction; this payload limit bounds the request.
+            manifest_payload_bytes = len(json.dumps(
+                {"tree": [manifest_entry]},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+            if manifest_payload_bytes > _MAX_MANIFEST_PAYLOAD_BYTES:
+                raise RuntimeError(
+                    "GitHub backup manifest exceeds the bounded request limit "
+                    f"({_MAX_MANIFEST_PAYLOAD_BYTES} bytes); split or archive the vault"
+                )
 
-            # 4. 分块创建 tree，块间用 base_tree 串联
+            # 4. Read/decode/upload one bounded file chunk at a time.
             cur_base = base_tree_sha
-            for i in range(0, len(entries), _TREE_CHUNK):
-                chunk = entries[i:i + _TREE_CHUNK]
-                tree_payload: dict[str, Any] = {"tree": chunk}
+            for file_chunk in self._iter_file_chunks(files, manifest):
+                tree_entries: list[dict[str, Any]] = []
+                for rel_path, content in file_chunk:
+                    gh_path = f"{self.path_prefix}/{rel_path}" if self.path_prefix else rel_path
+                    try:
+                        text = content.decode("utf-8")
+                        entry = {"path": gh_path, "mode": "100644", "type": "blob", "content": text}
+                    except UnicodeDecodeError:
+                        rb = await self._request(
+                            c, "POST", f"{_API}/repos/{self.repo}/git/blobs",
+                            json={"content": base64.b64encode(content).decode(), "encoding": "base64"},
+                        )
+                        rb.raise_for_status()
+                        blob_sha = rb.json()["sha"]
+                        del rb
+                        entry = {"path": gh_path, "mode": "100644", "type": "blob", "sha": blob_sha}
+                    tree_entries.append(entry)
+                tree_payload: dict[str, Any] = {"tree": tree_entries}
                 if cur_base:
                     tree_payload["base_tree"] = cur_base
                 r = await self._request(
@@ -364,6 +696,26 @@ class GitHubSync:
                 )
                 r.raise_for_status()
                 cur_base = r.json()["sha"]
+                # httpx responses retain their originating request (including
+                # its serialized JSON body).  Drop it before reading the next
+                # chunk so two request bodies cannot overlap in memory.
+                del r
+                del tree_payload, tree_entries, file_chunk
+
+            # Keep the manifest in its own bounded request.  Otherwise a large
+            # manifest silently sits on top of the file-chunk byte budget.
+            manifest_payload: dict[str, Any] = {"tree": [manifest_entry]}
+            if cur_base:
+                manifest_payload["base_tree"] = cur_base
+            r = await self._request(
+                c,
+                "POST",
+                f"{_API}/repos/{self.repo}/git/trees",
+                json=manifest_payload,
+            )
+            r.raise_for_status()
+            cur_base = r.json()["sha"]
+            del r, manifest_payload, manifest_entry, manifest_content
             new_tree_sha = cur_base
 
             # 5. 创建 commit
@@ -400,6 +752,9 @@ class GitHubSync:
         manifest_item: dict[str, Any],
     ) -> dict[str, Any]:
         try:
+            declared_size = int(manifest_item.get("size", -1))
+            if declared_size < 0 or declared_size > _MAX_MANIFEST_PAYLOAD_BYTES:
+                raise ValueError("backup manifest exceeds the decoded-byte limit")
             sha = manifest_item.get("sha", "")
             if not sha:
                 return {"present": False}
@@ -407,16 +762,31 @@ class GitHubSync:
             rb.raise_for_status()
             bj = rb.json()
             if bj.get("encoding") == "base64":
-                raw = base64.b64decode(bj.get("content", "")).decode("utf-8", errors="replace")
+                encoded = bj.get("content", "")
+                if not isinstance(encoded, str) or len(encoded) > _MAX_MANIFEST_BASE64_BYTES:
+                    raise ValueError("backup manifest base64 payload is too large")
+                compact = "".join(encoded.split())
+                decoded = base64.b64decode(compact, validate=True)
+                if len(decoded) > _MAX_MANIFEST_PAYLOAD_BYTES:
+                    raise ValueError("backup manifest exceeds the decoded-byte limit")
+                raw = decoded.decode("utf-8")
             else:
                 raw = str(bj.get("content", "") or "")
+                if (
+                    len(raw) > _MAX_MANIFEST_PAYLOAD_BYTES
+                    or len(raw.encode("utf-8")) > _MAX_MANIFEST_PAYLOAD_BYTES
+                ):
+                    raise ValueError("backup manifest exceeds the decoded-byte limit")
             data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("backup manifest root must be an object")
             return {
                 "present": True,
                 "schema_version": data.get("schema_version"),
                 "generated_at": data.get("generated_at", ""),
                 "file_count": int(data.get("file_count") or 0),
                 "total_bytes": int(data.get("total_bytes") or 0),
+                "_entries": data.get("files"),
             }
         except Exception as e:
             return {"present": False, "error": str(e)[:200]}

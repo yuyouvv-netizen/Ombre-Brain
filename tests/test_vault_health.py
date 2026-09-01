@@ -2,7 +2,7 @@ import sqlite3
 
 import frontmatter
 
-from vault_health import inspect_vault
+from ombrebrain.storage.vault_health import inspect_vault
 
 
 def _write(path, bucket_id, content="memory"):

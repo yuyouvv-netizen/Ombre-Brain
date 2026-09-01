@@ -11,27 +11,57 @@ web/buckets.py — 记忆桶管理 + 设置 + 锚点 + 自我认知读取
 ========================================
 """
 
-import os
-import re
-import yaml
+import math
+import threading
+from contextlib import AsyncExitStack
 
 from starlette.requests import Request
 from starlette.responses import Response
 
-from memory_messages import resolved_hint
+from ombrebrain.domain.memory_messages import resolved_hint
 from . import _shared as sh
 
 logger = sh.logger
 
 try:
-    from utils import strip_wikilinks, parse_bool  # type: ignore
+    from utils import (  # type: ignore
+        atomic_update_config_yaml,
+        parse_bool,
+        parse_iso_datetime,
+        strip_wikilinks,
+    )
 except ImportError:  # pragma: no cover
-    from ..utils import strip_wikilinks, parse_bool  # type: ignore
+    from ..utils import (  # type: ignore
+        atomic_update_config_yaml,
+        parse_bool,
+        parse_iso_datetime,
+        strip_wikilinks,
+    )
 
 try:
-    from tools._common import check_pinned_quota as _check_pinned_quota  # type: ignore
+    from tools._common import (  # type: ignore
+        _quota_turn,
+        check_pinned_quota as _check_pinned_quota,
+        enforce_high_importance_quota as _enforce_high_importance_quota,
+        is_terminal_memory_metadata as _is_terminal_memory_metadata,
+        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
+    )
 except ImportError:  # pragma: no cover
-    from ..tools._common import check_pinned_quota as _check_pinned_quota  # type: ignore
+    from ..tools._common import (  # type: ignore
+        _quota_turn,
+        check_pinned_quota as _check_pinned_quota,
+        enforce_high_importance_quota as _enforce_high_importance_quota,
+        is_terminal_memory_metadata as _is_terminal_memory_metadata,
+        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
+    )
+
+
+def _datetime_epoch_ms(value) -> int | None:
+    """Return one server-normalized instant for Dashboard sorting/display."""
+    try:
+        return round(parse_iso_datetime(value).timestamp() * 1000)
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
 
 
 async def rename_human_in_buckets(old: str, new: str) -> dict:
@@ -41,76 +71,43 @@ async def rename_human_in_buckets(old: str, new: str) -> dict:
     用途：她/他改了称呼后，改名前就存在的老桶仍写着旧词（默认「用户」），breath 里
     新桶显示新名、老桶还是旧名，看起来"批量替换没生效"。这里一次性补齐。
 
-    刻意**直接改 frontmatter，不走 bucket_mgr.update**：update 会把 last_active 刷成现在，
-    改个称呼不该让全部记忆显得"刚刚动过"、扰乱衰减与浮现排序。content 改了的桶顺手重算
-    embedding（best-effort，无 key/standby 时静默跳过）。
+    每个桶都走 BucketManager 的正常事务边界，但不刷新 ``last_active``；
+    content 改变时派生索引也会按普通更新流程重建。
 
     返回 {buckets_changed, replacements}。old 为空 / old==new 时直接 no-op。"""
-    import frontmatter as _fm
-
-    if not old or not new or old == new:
-        return {"buckets_changed": 0, "replacements": 0}
-
-    pat = re.compile(re.escape(old))
-    bm = sh.bucket_mgr
-    dirs = list(bm._active_dirs) + [bm.archive_dir]
-    changed, total = 0, 0
-
-    for _root, _fname, fpath in bm._iter_md_files(dirs):
-        try:
-            post = _fm.load(fpath)
-        except Exception:
-            continue
-        n = 0
-        content_changed = False
-        new_content, c = pat.subn(new, post.content or "")
-        if c:
-            post.content = new_content
-            n += c
-            content_changed = True
-        for field in ("name", "why_remembered", "user_name"):
-            v = post.get(field)
-            if isinstance(v, str) and v:
-                nv, c2 = pat.subn(new, v)
-                if c2:
-                    post[field] = nv
-                    n += c2
-        if not n:
-            continue
-        try:
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(_fm.dumps(post))
-        except OSError as e:
-            logger.warning(f"rename_human write failed {fpath}: {e}")
-            continue
-        changed += 1
-        total += n
-        if content_changed:
-            bid = post.get("id")
-            ee = sh.embedding_engine
-            if bid and ee and getattr(ee, "enabled", False):
-                try:
-                    await ee.generate_and_store(bid, post.content or "")
-                except Exception:
-                    pass
-
-    try:
-        bm._invalidate_bm25()
-    except Exception:
-        pass
-    logger.info(f"rename_human_in_buckets: '{old}'->'{new}' changed={changed} replacements={total}")
-    return {"buckets_changed": changed, "replacements": total}
+    result = await sh.bucket_mgr.replace_text_fields(old, new)
+    logger.info(
+        "rename_human_in_buckets: %r->%r changed=%s replacements=%s",
+        old,
+        new,
+        result["buckets_changed"],
+        result["replacements"],
+    )
+    return result
 
 
 def register(mcp) -> None:
+    # 每次路由注册使用一个原生提交锁，不与 asyncio 事件循环绑定；临界区内
+    # 不执行 await，因此既能跨测试事件循环串行化，也不会因持锁等待而死锁。
+    sampling_commit_lock = threading.Lock()
 
     @mcp.custom_route("/api/buckets", methods=["GET"])
     async def api_buckets(request: Request) -> Response:
-        """List all buckets with metadata (no content for efficiency)."""
+        """List buckets, optionally ordered by their first-recorded time."""
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
             return err
+        sort_mode = str(request.query_params.get("sort", "score") or "score").strip()
+        allowed_sort_modes = {"score", "created_desc", "created_asc"}
+        if sort_mode not in allowed_sort_modes:
+            return JSONResponse(
+                {
+                    "error": "invalid sort mode",
+                    "allowed": sorted(allowed_sort_modes),
+                },
+                status_code=400,
+            )
         try:
             all_buckets = await sh.bucket_mgr.list_all(include_archive=True)
             result = []
@@ -118,6 +115,8 @@ def register(mcp) -> None:
                 meta = b.get("metadata", {})
                 if meta.get("deleted_at"):
                     continue
+                created_epoch_ms = _datetime_epoch_ms(meta.get("created"))
+                last_active_epoch_ms = _datetime_epoch_ms(meta.get("last_active"))
                 result.append({
                     "id": b["id"],
                     "name": meta.get("name", b["id"]),
@@ -132,7 +131,9 @@ def register(mcp) -> None:
                     "pinned": meta.get("pinned", False),
                     "digested": meta.get("digested", False),
                     "created": meta.get("created", ""),
+                    "created_epoch_ms": created_epoch_ms,
                     "last_active": meta.get("last_active", ""),
+                    "last_active_epoch_ms": last_active_epoch_ms,
                     "activation_count": meta.get("activation_count", 0),
                     "score": sh.decay_engine.calculate_score(meta),
                     "content_preview": strip_wikilinks(b.get("content", ""))[:200],
@@ -148,7 +149,24 @@ def register(mcp) -> None:
                         and meta["provenance"].get("erasable") is True
                     ),
                 })
-            result.sort(key=lambda x: x["score"], reverse=True)
+            if sort_mode == "score":
+                # Preserve the long-standing Dashboard default while making
+                # equal-score ordering deterministic across os.walk refreshes.
+                result.sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+            else:
+                descending = sort_mode == "created_desc"
+
+                def created_sort_key(item: dict) -> tuple[int, int, str]:
+                    timestamp = item["created_epoch_ms"]
+                    if timestamp is None:
+                        # Legacy/hand-written buckets can lack a valid created
+                        # value. Unknown times always stay at the end, not at
+                        # an arbitrary extreme of either chronological view.
+                        return (1, 0, str(item["id"]))
+                    ordered_timestamp = -timestamp if descending else timestamp
+                    return (0, ordered_timestamp, str(item["id"]))
+
+                result.sort(key=created_sort_key)
             return JSONResponse(result)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
@@ -156,7 +174,7 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET"])
     async def api_bucket_detail(request: Request) -> Response:
-        """Get full bucket content by ID."""
+        """Get full raw bucket content plus display-only derived text by ID."""
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
@@ -172,10 +190,15 @@ def register(mcp) -> None:
             triggered_feels = await sh.bucket_mgr.get_triggered_feels(bucket_id)
         except Exception as e:
             logger.warning(f"triggered_feels lookup failed / 反向链查询失败: {e}")
+        raw_content = bucket.get("content", "")
         return JSONResponse({
             "id": bucket["id"],
             "metadata": meta,
-            "content": strip_wikilinks(bucket.get("content", "")),
+            # Editing must round-trip the exact stored Markdown.  Keep the
+            # bracket-free presentation text separate so a metadata-only edit
+            # can never write a stripped [[wikilink]] body back to disk.
+            "content": raw_content,
+            "display_content": strip_wikilinks(raw_content),
             "score": sh.decay_engine.calculate_score(meta),
             "triggered_feels": triggered_feels,  # iter 1.9 D
         })
@@ -191,25 +214,153 @@ def register(mcp) -> None:
         if err:
             return err
         bucket_id = request.path_params["bucket_id"]
-        bucket = await sh.bucket_mgr.get(bucket_id)
-        if not bucket:
-            return JSONResponse({"error": "not found"}, status_code=404)
-        meta = bucket["metadata"]
-        new_pinned = not bool(meta.get("pinned", False))
-        update_kwargs: dict[str, object] = {"pinned": new_pinned}
-        # Pinning: importance jumps to 10 + type→permanent. Unpin reverts type→dynamic.
-        if new_pinned:
-            quota_err = await _check_pinned_quota()
-            if quota_err:
-                return JSONResponse({"error": quota_err}, status_code=400)
-            update_kwargs["importance"] = 10
-            update_kwargs["type"] = "permanent"
-        else:
-            if meta.get("type") == "permanent":
-                update_kwargs["type"] = "dynamic"
         try:
-            await sh.bucket_mgr.update(bucket_id, **update_kwargs)
-            return JSONResponse({"ok": True, "pinned": new_pinned})
+            # Both pin and unpin share the pinned turn.  Otherwise an unpin can
+            # race a new pin and make the latter reject against a stale count;
+            # more importantly, two new pins could both pass the same precheck.
+            async with AsyncExitStack() as quota_stack:
+                await quota_stack.enter_async_context(_quota_turn("pinned"))
+
+                bucket = await sh.bucket_mgr.get(bucket_id)
+                if not bucket:
+                    return JSONResponse({"error": "not found"}, status_code=404)
+                meta = bucket.get("metadata", {})
+                if _is_terminal_memory_metadata(meta):
+                    return JSONResponse(
+                        {"error": "archived buckets cannot be pinned or unpinned"},
+                        status_code=409,
+                    )
+                current_pinned = parse_bool(meta.get("pinned"), default=False)
+                new_pinned = not current_pinned
+                protected = parse_bool(meta.get("protected"), default=False)
+                update_kwargs: dict[str, object] = {"pinned": new_pinned}
+                try:
+                    current_importance = int(meta.get("importance") or 0)
+                except (TypeError, ValueError):
+                    current_importance = 0
+                current_type = str(
+                    meta.get("type") or "dynamic"
+                ).strip().lower()
+                final_type = (
+                    "permanent"
+                    if new_pinned
+                    else "dynamic"
+                    if current_pinned and not protected
+                    else current_type
+                )
+                before_quota_meta = dict(meta)
+                before_quota_meta.update({
+                    "importance": current_importance,
+                    "pinned": current_pinned,
+                    "protected": protected,
+                    "type": current_type,
+                })
+                after_quota_meta = dict(before_quota_meta)
+                after_quota_meta.update({
+                    "importance": 10 if new_pinned else current_importance,
+                    "pinned": new_pinned,
+                    "type": final_type,
+                })
+                occupied_high_before = _occupies_high_importance_slot(
+                    before_quota_meta
+                )
+                occupies_high_after = _occupies_high_importance_slot(
+                    after_quota_meta
+                )
+                await quota_stack.enter_async_context(
+                    _quota_turn("high_importance")
+                )
+
+                locked_bucket = await sh.bucket_mgr.get(bucket_id)
+                if not locked_bucket:
+                    return JSONResponse({"error": "not found"}, status_code=404)
+                locked_meta = locked_bucket.get("metadata", {})
+                if not isinstance(locked_meta, dict):
+                    locked_meta = {}
+                if _is_terminal_memory_metadata(locked_meta):
+                    return JSONResponse(
+                        {"error": "bucket was archived concurrently"},
+                        status_code=409,
+                    )
+                initial_quota_state = (
+                    current_pinned,
+                    protected,
+                    current_importance,
+                    current_type,
+                    parse_bool(meta.get("dont_surface"), default=False),
+                )
+                try:
+                    locked_importance = int(
+                        locked_meta.get("importance") or 0
+                    )
+                except (TypeError, ValueError):
+                    locked_importance = 0
+                locked_quota_state = (
+                    parse_bool(locked_meta.get("pinned"), default=False),
+                    parse_bool(locked_meta.get("protected"), default=False),
+                    locked_importance,
+                    str(locked_meta.get("type") or "dynamic").strip().lower(),
+                    parse_bool(
+                        locked_meta.get("dont_surface"), default=False
+                    ),
+                )
+                if locked_quota_state != initial_quota_state:
+                    return JSONResponse(
+                        {
+                            "error": "bucket changed concurrently; reload and retry",
+                            "conflict": "concurrent_change",
+                        },
+                        status_code=409,
+                    )
+
+                if new_pinned:
+                    quota_err = await _check_pinned_quota()
+                    if quota_err:
+                        return JSONResponse({"error": quota_err}, status_code=400)
+                else:
+                    # A formerly pinned importance=10 bucket becomes an
+                    # ordinary high-importance bucket after unpinning.  Reserve
+                    # that quota atomically too; when full, demote to 8 in the
+                    # same BucketManager transaction.
+                    if occupies_high_after and not occupied_high_before:
+                        adjusted_importance = (
+                            await _enforce_high_importance_quota(current_importance)
+                        )
+                        if adjusted_importance != current_importance:
+                            update_kwargs["importance"] = adjusted_importance
+
+                ok = await sh.bucket_mgr.update(bucket_id, **update_kwargs)
+                if not ok:
+                    latest = await sh.bucket_mgr.get(bucket_id)
+                    if _is_terminal_memory_metadata(
+                        (latest or {}).get("metadata", {})
+                    ):
+                        return JSONResponse(
+                            {"error": "bucket was archived concurrently"},
+                            status_code=409,
+                        )
+                    return JSONResponse({"error": "update failed"}, status_code=500)
+
+                persisted = await sh.bucket_mgr.get(bucket_id)
+                actual_pinned = parse_bool(
+                    (persisted or {}).get("metadata", {}).get("pinned"),
+                    default=False,
+                )
+                if not persisted or actual_pinned != new_pinned:
+                    return JSONResponse(
+                        {
+                            "error": "pin state was not persisted",
+                            "pinned": actual_pinned,
+                        },
+                        status_code=409,
+                    )
+                persisted_meta = persisted.get("metadata", {})
+                return JSONResponse({
+                    "ok": True,
+                    "pinned": actual_pinned,
+                    "importance": persisted_meta.get("importance"),
+                    "type": persisted_meta.get("type"),
+                })
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -267,13 +418,48 @@ def register(mcp) -> None:
         if err:
             return err
         bucket_id = request.path_params["bucket_id"]
-        bucket = await sh.bucket_mgr.get(bucket_id)
-        if not bucket:
-            return JSONResponse({"error": "not found"}, status_code=404)
-        new_val = not bool(bucket["metadata"].get("dont_surface", False))
         try:
-            await sh.bucket_mgr.update(bucket_id, dont_surface=new_val)
-            return JSONResponse({"ok": True, "dont_surface": new_val})
+            async with _quota_turn("high_importance"):
+                bucket = await sh.bucket_mgr.get(bucket_id)
+                if not bucket:
+                    return JSONResponse({"error": "not found"}, status_code=404)
+                metadata = bucket.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                current = parse_bool(
+                    metadata.get("dont_surface"), default=False
+                )
+                new_val = not current
+                projected = dict(metadata)
+                projected["dont_surface"] = new_val
+                update_kwargs: dict[str, object] = {"dont_surface": new_val}
+                quota_adjustment = None
+                if (
+                    _occupies_high_importance_slot(projected)
+                    and not _occupies_high_importance_slot(metadata)
+                ):
+                    try:
+                        requested_importance = int(
+                            metadata.get("importance") or 0
+                        )
+                    except (TypeError, ValueError):
+                        requested_importance = 0
+                    applied_importance = await _enforce_high_importance_quota(
+                        requested_importance
+                    )
+                    if applied_importance != requested_importance:
+                        update_kwargs["importance"] = applied_importance
+                        quota_adjustment = {
+                            "requested": requested_importance,
+                            "applied": applied_importance,
+                        }
+                ok = await sh.bucket_mgr.update(bucket_id, **update_kwargs)
+                if not ok:
+                    return JSONResponse({"error": "update failed"}, status_code=500)
+                payload = {"ok": True, "dont_surface": new_val}
+                if quota_adjustment:
+                    payload["quota_adjustment"] = quota_adjustment
+                return JSONResponse(payload)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -305,25 +491,63 @@ def register(mcp) -> None:
             target = parse_bool(body["dont_surface"])
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        ok_ids, missing_ids, errors = [], [], []
-        for bid in ids:
-            try:
-                b = await sh.bucket_mgr.get(bid)
-                if not b:
-                    missing_ids.append(bid)
-                    continue
-                await sh.bucket_mgr.update(bid, dont_surface=target)
-                ok_ids.append(bid)
-            except Exception as e:
-                errors.append({"id": bid, "error": str(e)})
-                logger.warning(f"batch forget failed for {bid}: {e}")
-        return JSONResponse({
-            "ok": True,
+        ok_ids, missing_ids, errors, quota_adjustments = [], [], [], []
+        async with _quota_turn("high_importance"):
+            for bid in dict.fromkeys(ids):
+                try:
+                    b = await sh.bucket_mgr.get(bid)
+                    if not b:
+                        missing_ids.append(bid)
+                        continue
+                    metadata = b.get("metadata", {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    projected = dict(metadata)
+                    projected["dont_surface"] = target
+                    update_kwargs: dict[str, object] = {"dont_surface": target}
+                    quota_adjustment = None
+                    if (
+                        _occupies_high_importance_slot(projected)
+                        and not _occupies_high_importance_slot(metadata)
+                    ):
+                        try:
+                            requested_importance = int(
+                                metadata.get("importance") or 0
+                            )
+                        except (TypeError, ValueError):
+                            requested_importance = 0
+                        applied_importance = (
+                            await _enforce_high_importance_quota(
+                                requested_importance
+                            )
+                        )
+                        if applied_importance != requested_importance:
+                            update_kwargs["importance"] = applied_importance
+                            quota_adjustment = {
+                                "id": bid,
+                                "requested": requested_importance,
+                                "applied": applied_importance,
+                            }
+                    ok = await sh.bucket_mgr.update(bid, **update_kwargs)
+                    if ok:
+                        ok_ids.append(bid)
+                        if quota_adjustment:
+                            quota_adjustments.append(quota_adjustment)
+                    else:
+                        errors.append({"id": bid, "error": "update failed"})
+                except Exception as e:
+                    errors.append({"id": bid, "error": str(e)})
+                    logger.warning(f"batch forget failed for {bid}: {e}")
+        payload = {
+            "ok": not errors,
             "dont_surface": target,
             "updated": ok_ids,
             "missing": missing_ids,
             "errors": errors,
-        })
+        }
+        if quota_adjustments:
+            payload["quota_adjustments"] = quota_adjustments
+        return JSONResponse(payload)
 
     @mcp.custom_route("/api/buckets/batch", methods=["POST"])
     async def api_buckets_batch(request: Request) -> Response:
@@ -411,8 +635,12 @@ def register(mcp) -> None:
         err = sh._require_auth(request)
         if err:
             return err
-        surfacing = sh.config.setdefault("surfacing", {})
-        sampling = surfacing.setdefault("sampling", {})
+        surfacing = sh.config.get("surfacing")
+        if not isinstance(surfacing, dict):
+            surfacing = {}
+        sampling = surfacing.get("sampling")
+        if not isinstance(sampling, dict):
+            sampling = {}
         if request.method == "GET":
             return JSONResponse({
                 "enabled": parse_bool(sampling.get("enabled", False), default=False),
@@ -424,56 +652,105 @@ def register(mcp) -> None:
             body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        # Validate ranges; reject silently-corrupt inputs at the boundary
-        try:
-            if "enabled" in body:
-                sampling["enabled"] = parse_bool(body["enabled"])
-            if "top_k" in body:
-                tk = int(body["top_k"])
-                if not (1 <= tk <= 50):
-                    return JSONResponse({"error": "top_k must be in [1,50]"}, status_code=400)
-                sampling["top_k"] = tk
-            if "sample_k" in body:
-                sk = int(body["sample_k"])
-                if not (1 <= sk <= 20):
-                    return JSONResponse({"error": "sample_k must be in [1,20]"}, status_code=400)
-                sampling["sample_k"] = sk
-            if "temperature" in body:
-                t = float(body["temperature"])
-                if not (0.1 <= t <= 5.0):
-                    return JSONResponse({"error": "temperature must be in [0.1,5.0]"}, status_code=400)
-                sampling["temperature"] = t
-        except (ValueError, TypeError) as e:
-            return JSONResponse({"error": f"invalid field type: {e}"}, status_code=400)
+        # JSON 读取已经结束，以下原生锁临界区内没有 await。锁覆盖候选快照、
+        # 落盘和运行态发布，防止并发更新丢字段或出现磁盘/运行态逆序。
+        with sampling_commit_lock:
+            live_surfacing = sh.config.get("surfacing")
+            if not isinstance(live_surfacing, dict):
+                live_surfacing = {}
+            live_sampling = live_surfacing.get("sampling")
+            if not isinstance(live_sampling, dict):
+                live_sampling = {}
 
-        # --- 写回 config.yaml（iter 2.0 §10 U-03 修复：重启后设置不丢失）---
-        try:
-            from utils import config_file_path
-            _cfg_path = config_file_path()
-            _disk: dict[str, object] = {}
-            if os.path.exists(_cfg_path):
-                with open(_cfg_path, "r", encoding="utf-8") as _f:
-                    _disk = yaml.safe_load(_f) or {}
-            _disk_sf = _disk.setdefault("surfacing", {})
-            if not isinstance(_disk_sf, dict):
-                _disk_sf = {}
-                _disk["surfacing"] = _disk_sf
-            _disk_samp = _disk_sf.setdefault("sampling", {})
-            if not isinstance(_disk_samp, dict):
-                _disk_samp = {}
-                _disk_sf["sampling"] = _disk_samp
-            _disk_samp.update({
-                "enabled": sampling.get("enabled", False),
-                "top_k": sampling.get("top_k", 5),
-                "sample_k": sampling.get("sample_k", 2),
-                "temperature": sampling.get("temperature", 0.7),
-            })
-            with open(_cfg_path, "w", encoding="utf-8") as _f:
-                yaml.dump(_disk, _f, default_flow_style=False, allow_unicode=True)
-        except Exception as _e:
-            logger.warning(f"sampling persist failed: {_e}")  # 不阻断热更新响应
+            # 先在独立候选副本上完成全部校验。若逐字段发布，后续字段无效或
+            # config.yaml 写入失败时，运行态会残留一半新、一半旧的配置。
+            candidate = dict(live_sampling)
+            try:
+                if "enabled" in body:
+                    candidate["enabled"] = parse_bool(body["enabled"])
+                if "top_k" in body:
+                    if isinstance(body["top_k"], bool):
+                        raise ValueError("top_k must be an integer")
+                    tk = int(body["top_k"])
+                    if isinstance(body["top_k"], float) and body["top_k"] != tk:
+                        raise ValueError("top_k must be an integer")
+                    if not (1 <= tk <= 50):
+                        return JSONResponse(
+                            {"error": "top_k must be in [1,50]"}, status_code=400
+                        )
+                    candidate["top_k"] = tk
+                if "sample_k" in body:
+                    if isinstance(body["sample_k"], bool):
+                        raise ValueError("sample_k must be an integer")
+                    sk = int(body["sample_k"])
+                    if (
+                        isinstance(body["sample_k"], float)
+                        and body["sample_k"] != sk
+                    ):
+                        raise ValueError("sample_k must be an integer")
+                    if not (1 <= sk <= 20):
+                        return JSONResponse(
+                            {"error": "sample_k must be in [1,20]"},
+                            status_code=400,
+                        )
+                    candidate["sample_k"] = sk
+                if "temperature" in body:
+                    if isinstance(body["temperature"], bool):
+                        raise ValueError("temperature must be a number")
+                    temperature = float(body["temperature"])
+                    if not math.isfinite(temperature) or not (
+                        0.1 <= temperature <= 5.0
+                    ):
+                        return JSONResponse(
+                            {"error": "temperature must be in [0.1,5.0]"},
+                            status_code=400,
+                        )
+                    candidate["temperature"] = temperature
+            except (OverflowError, ValueError, TypeError) as e:
+                return JSONResponse(
+                    {"error": f"invalid field type: {e}"}, status_code=400
+                )
 
-        return JSONResponse({"ok": True, **sampling})
+            # 写回 config.yaml，保证重启后设置不丢失。
+            def _mutate_sampling(save_config: dict) -> None:
+                sf = save_config.setdefault("surfacing", {})
+                if not isinstance(sf, dict):
+                    sf = {}
+                    save_config["surfacing"] = sf
+                samp = sf.setdefault("sampling", {})
+                if not isinstance(samp, dict):
+                    samp = {}
+                    sf["sampling"] = samp
+                samp.update({
+                    "enabled": candidate.get("enabled", False),
+                    "top_k": candidate.get("top_k", 5),
+                    "sample_k": candidate.get("sample_k", 2),
+                    "temperature": candidate.get("temperature", 0.7),
+                })
+
+            try:
+                atomic_update_config_yaml(_mutate_sampling)
+            except Exception as e:
+                # 磁盘未落地就如实报错，不能让用户看到“已保存”。
+                return JSONResponse(
+                    {"error": f"采样设置写入磁盘失败，未保存：{e}"},
+                    status_code=500,
+                )
+
+            # 以磁盘写入成功为提交点；尽量保留原嵌套字典对象，因为浮现逻辑
+            # 可能持有这个对象的引用。
+            published_surfacing = sh.config.get("surfacing")
+            if not isinstance(published_surfacing, dict):
+                published_surfacing = {}
+                sh.config["surfacing"] = published_surfacing
+            published_sampling = published_surfacing.get("sampling")
+            if not isinstance(published_sampling, dict):
+                published_sampling = {}
+                published_surfacing["sampling"] = published_sampling
+            published_sampling.clear()
+            published_sampling.update(candidate)
+
+            return JSONResponse({"ok": True, **published_sampling})
 
 
     # ---- iter 2.0: /api/settings/human — 读写通知称呼（human 宏）----
@@ -499,32 +776,37 @@ def register(mcp) -> None:
             human = "人类"
         if len(human) > 20:
             return JSONResponse({"error": "human name must be ≤ 20 characters"}, status_code=400)
-        # 旧称呼（默认「用户」，与 dehydrator / import 的兜底同源）—— 用于把老桶里的旧词换成新名。
-        old_human = (sh.config.get("human") or "用户").strip() or "用户"
-        sh.config["human"] = human
-        # 同步活的 dehydrator.human：否则改名后、重启前，新记忆仍按旧称呼脱水。
-        if getattr(sh, "dehydrator", None) is not None and hasattr(sh.dehydrator, "human"):
-            sh.dehydrator.human = human
-        # 写回 config.yaml
-        try:
-            from utils import config_file_path
-            _cfg_path = config_file_path()
-            _disk2: dict[str, object] = {}
-            if os.path.exists(_cfg_path):
-                with open(_cfg_path, "r", encoding="utf-8") as _f:
-                    _disk2 = yaml.safe_load(_f) or {}
-            _disk2["human"] = human
-            with open(_cfg_path, "w", encoding="utf-8") as _f:
-                yaml.dump(_disk2, _f, default_flow_style=False, allow_unicode=True)
-        except Exception as _e:
-            logger.warning(f"human name persist failed: {_e}")
-        # 改名时把老桶里残留的旧称呼一起换成新名（name/content/why_remembered/user_name）。
-        renamed = {"buckets_changed": 0, "replacements": 0}
-        if old_human and old_human != human:
+        # Config read/write, live runtime update and the full-vault replacement
+        # are one outer transaction.  Without it, concurrent A->B and B->C
+        # requests can interleave their per-bucket writes and leave mixed names.
+        async with sh.bucket_mgr.human_name_change_turn():
+            # 旧称呼（默认「用户」，与 dehydrator / import 的兜底同源）—— 用于把老桶里的旧词换成新名。
+            old_human = (sh.config.get("human") or "用户").strip() or "用户"
             try:
-                renamed = await rename_human_in_buckets(old_human, human)
-            except Exception as _re:
-                logger.warning(f"human rename batch failed: {_re}")
+                atomic_update_config_yaml(
+                    lambda save_config: save_config.__setitem__("human", human)
+                )
+            except Exception as e:
+                # Do not mutate live state unless persistence succeeded.
+                return JSONResponse(
+                    {"error": f"称呼写入磁盘失败，未保存：{e}"},
+                    status_code=500,
+                )
+
+            sh.config["human"] = human
+            # 同步活的 dehydrator.human：否则改名后、重启前，新记忆仍按旧称呼脱水。
+            if getattr(sh, "dehydrator", None) is not None and hasattr(
+                sh.dehydrator, "human"
+            ):
+                sh.dehydrator.human = human
+
+            # 改名时把老桶里残留的旧称呼一起换成新名（name/content/why_remembered/user_name）。
+            renamed = {"buckets_changed": 0, "replacements": 0}
+            if old_human and old_human != human:
+                try:
+                    renamed = await rename_human_in_buckets(old_human, human)
+                except Exception as _re:
+                    logger.warning(f"human rename batch failed: {_re}")
         return JSONResponse({"ok": True, "human": human, "renamed": renamed})
 
     # ---- 手动「同步旧记忆」：把指定旧称呼（默认「用户」）批量换成当前称呼 ----
@@ -545,19 +827,21 @@ def register(mcp) -> None:
         from_term = from_raw.strip()
         if len(from_term) > 100:
             return JSONResponse({"error": "from must be at most 100 characters"}, status_code=400)
-        cur = (sh.config.get("human") or "人类").strip() or "人类"
         if not from_term:
             return JSONResponse({"error": "缺少要替换的旧称呼"}, status_code=400)
-        if from_term == cur:
-            return JSONResponse({
-                "ok": True, "from": from_term, "to": cur,
-                "renamed": {"buckets_changed": 0, "replacements": 0},
-                "note": "要替换的词与当前称呼相同，无需处理",
-            })
-        try:
-            stats = await rename_human_in_buckets(from_term, cur)
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+        async with sh.bucket_mgr.human_name_change_turn():
+            # Re-read inside the same reservation used by name-change requests.
+            cur = (sh.config.get("human") or "人类").strip() or "人类"
+            if from_term == cur:
+                return JSONResponse({
+                    "ok": True, "from": from_term, "to": cur,
+                    "renamed": {"buckets_changed": 0, "replacements": 0},
+                    "note": "要替换的词与当前称呼相同，无需处理",
+                })
+            try:
+                stats = await rename_human_in_buckets(from_term, cur)
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
         return JSONResponse({"ok": True, "from": from_term, "to": cur, "renamed": stats})
 
 

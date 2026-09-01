@@ -34,6 +34,11 @@ import hmac
 import ipaddress
 import secrets
 import logging
+import threading
+from collections import OrderedDict, deque
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Iterator
 
 from starlette.requests import Request
 from starlette.responses import Response
@@ -68,6 +73,29 @@ def in_docker() -> bool:
     return found
 
 
+def _path_is_on_non_root_mount(path: str) -> bool:
+    """Return true when path is a mount point or lives below one.
+
+    Render users commonly mount a disk at ``/var/data`` and place buckets in
+    ``/var/data/buckets``.  ``os.path.ismount`` only recognizes the former.
+    Never count the filesystem root: on Render that is precisely the ephemeral
+    layer we are trying to distinguish from a persistent disk.
+    """
+    if not path:
+        return False
+    try:
+        current = os.path.realpath(os.path.abspath(path))
+        while True:
+            parent = os.path.dirname(current)
+            if parent == current:
+                return False
+            if os.path.ismount(current):
+                return True
+            current = parent
+    except Exception:
+        return False
+
+
 def data_dir_persistence(buckets_dir: str) -> dict:
     """判断记忆数据目录是不是真的在持久盘上（记忆最怕的就是「以为存住了其实没有」）。
 
@@ -77,6 +105,30 @@ def data_dir_persistence(buckets_dir: str) -> dict:
 
     只做检测与提示，绝不阻断启动（阻断会伤部署体验）。返回 {persistent, mode, note}。
     """
+    # Render's native Python runtime is not a Docker container from inside the
+    # process, but its root filesystem is ephemeral.  Only an attached disk
+    # mount survives a restart/redeploy, so treating every non-Docker host as
+    # local/persistent gives the most dangerous possible false positive.
+    is_render = os.environ.get("RENDER", "").strip().lower() == "true"
+    if is_render:
+        try:
+            is_mount = _path_is_on_non_root_mount(buckets_dir)
+        except Exception:
+            is_mount = False
+        if is_mount:
+            return {
+                "persistent": True,
+                "mode": "render_disk",
+                "note": "Render：记忆目录已挂载 Persistent Disk，实例重启或重新部署后仍会保留。",
+            }
+        return {
+            "persistent": False,
+            "mode": "render_ephemeral",
+            "note": (
+                "Render：记忆目录不在 Persistent Disk 挂载点上；根文件系统会在实例重启或"
+                "重新部署时还原，请挂载磁盘并把 OMBRE_BUCKETS_DIR 指向该挂载点。"
+            ),
+        }
     if not in_docker():
         return {"persistent": True, "mode": "local",
                 "note": "本地部署：记忆就存在你磁盘上的这个目录里。"}
@@ -348,6 +400,65 @@ def _session_ttl_seconds() -> int:
     return max(1, min(days, _MAX_SESSION_TTL_DAYS)) * 86400
 
 _sessions: dict[str, float] = {}  # {token: expiry_timestamp}
+_session_state_lock = threading.RLock()
+_auth_mutation_lock = threading.RLock()
+_credential_generation = 0
+_credential_proof_key = secrets.token_bytes(32)
+
+
+class AuthPersistenceError(RuntimeError):
+    """A security-state mutation could not be committed durably."""
+
+
+@dataclass(frozen=True)
+class CredentialProof:
+    """Opaque proof that one exact credential was verified at one generation.
+
+    Password/security-answer KDF work happens without holding the credential
+    lock.  Routes must carry this proof into the later session, OAuth-code, or
+    password-rotation commit so a verification that raced a credential change
+    cannot authorize a mutation with stale input.
+    """
+
+    source: str
+    value: str
+    generation: int
+
+
+class CredentialChangedError(RuntimeError):
+    """The credential used to authorize a mutation is no longer current."""
+
+
+@contextmanager
+def _credential_state_guard() -> Iterator[None]:
+    """Serialize credential changes and credential-derived grant commits.
+
+    Cross-module lock order is always this guard first, followed by the
+    session or OAuth registry lock.  Keeping that order prevents both stale
+    grants and auth/OAuth deadlocks during a password rotation.
+    """
+    with _auth_mutation_lock:
+        yield
+
+
+def _credential_generation_snapshot() -> int:
+    with _auth_mutation_lock:
+        return _credential_generation
+
+
+def _advance_credential_generation_locked() -> int:
+    """Invalidate every in-flight credential proof while the guard is held."""
+    global _credential_generation
+    _credential_generation += 1
+    return _credential_generation
+
+
+def _environment_password_proof(password: str) -> str:
+    return hmac.new(
+        _credential_proof_key,
+        password.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 # --- 登录失败限流 / 指数退避锁定（防在线密码爆破）---
@@ -359,8 +470,39 @@ _LOGIN_MAX_FAILURES = 5              # 窗口内允许的失败次数，超过�
 _LOGIN_BASE_LOCK_SECONDS = 60        # 首次锁定时长，按超出次数指数增长
 _LOGIN_MAX_LOCK_SECONDS = 3600       # 锁定时长上限（1 小时）
 
+# Bound the amount of attacker-controlled state retained by this single-user
+# service. The global window also caps how many expensive password KDF jobs can
+# be admitted when an attacker rotates source addresses.
+_LOGIN_MAX_TRACKED_SOURCES = 2048
+_LOGIN_SOURCE_TTL_SECONDS = max(_LOGIN_WINDOW_SECONDS, _LOGIN_MAX_LOCK_SECONDS)
+_LOGIN_FAILURE_HISTORY_LIMIT = 16
+_LOGIN_GLOBAL_WINDOW_SECONDS = 60
+_LOGIN_GLOBAL_MAX_ATTEMPTS = 60
+
 _login_failures: dict[str, list[float]] = {}      # {client_key: [失败时间戳...]}
 _login_locked_until: dict[str, float] = {}        # {client_key: 解锁时间戳}
+_login_source_lru: OrderedDict[str, float] = OrderedDict()
+_login_global_attempts: deque[float] = deque()
+_login_state_lock = threading.RLock()
+
+
+def _normalize_login_source(value: str) -> str:
+    """Normalize one network source for fair, bounded login throttling.
+
+    IPv4 remains per-address. IPv6 is grouped by /64 so rotating interface
+    identifiers cannot manufacture an effectively unlimited set of buckets.
+    IPv4-mapped IPv6 addresses retain their underlying IPv4 identity.
+    """
+    raw = str(value or "").strip()
+    # A socket peer can carry an IPv6 zone id (for example ``%eth0``); it is
+    # local routing metadata, not part of the remote security identity.
+    address = ipaddress.ip_address(raw.split("%", 1)[0])
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        network = ipaddress.ip_network((address, 64), strict=False)
+        return f"{network.network_address}/64"
+    return str(address)
 
 
 def _client_key(request: Request) -> str:
@@ -381,13 +523,57 @@ def _client_key(request: Request) -> str:
                 request.headers.get("x-forwarded-for") or ""
             ).split(",", 1)[0].strip()
             if forwarded:
-                return str(ipaddress.ip_address(forwarded))
+                return _normalize_login_source(forwarded)
         except (AttributeError, ValueError):
             pass
     try:
-        return str(ipaddress.ip_address(peer))
+        return _normalize_login_source(peer)
     except ValueError:
-        return peer or "unknown"
+        return peer.lower()[:128] or "unknown"
+
+
+def _prune_login_source_state(now: float) -> None:
+    """Expire inactive source buckets and their associated failure state."""
+    cutoff = now - max(1, int(_LOGIN_SOURCE_TTL_SECONDS))
+    for key, last_seen in list(_login_source_lru.items()):
+        if last_seen > cutoff:
+            continue
+        if _login_locked_until.get(key, 0.0) > now:
+            continue
+        _login_source_lru.pop(key, None)
+        _login_failures.pop(key, None)
+        _login_locked_until.pop(key, None)
+
+
+def _touch_login_source(key: str, now: float) -> None:
+    """Refresh one LRU entry and evict complete source records at the cap."""
+    _login_source_lru[key] = now
+    _login_source_lru.move_to_end(key)
+    limit = max(1, int(_LOGIN_MAX_TRACKED_SOURCES))
+    while len(_login_source_lru) > limit:
+        evicted, _last_seen = _login_source_lru.popitem(last=False)
+        _login_failures.pop(evicted, None)
+        _login_locked_until.pop(evicted, None)
+
+
+def _reserve_global_login_attempt() -> int:
+    """Reserve one process-wide expensive auth attempt.
+
+    The operation contains no await point, so callers on the server event loop
+    cannot overbook the window. A positive result tells the route to shed the
+    request before scheduling PBKDF2 work.
+    """
+    with _login_state_lock:
+        now = time.time()
+        window = max(1, int(_LOGIN_GLOBAL_WINDOW_SECONDS))
+        cutoff = now - window
+        while _login_global_attempts and _login_global_attempts[0] <= cutoff:
+            _login_global_attempts.popleft()
+        limit = max(1, int(_LOGIN_GLOBAL_MAX_ATTEMPTS))
+        if len(_login_global_attempts) >= limit:
+            return max(1, int(_login_global_attempts[0] + window - now) + 1)
+        _login_global_attempts.append(now)
+        return 0
 
 
 def _trusted_proxy_networks() -> tuple[ipaddress._BaseNetwork, ...]:
@@ -429,34 +615,56 @@ def _trusted_forwarded_value(request: Request, header: str) -> str:
 def _login_retry_after(request: Request) -> int:
     """>0 = 当前被锁，返回建议等待秒数；0 = 允许尝试。"""
     key = _client_key(request)
-    now = time.time()
-    until = _login_locked_until.get(key, 0.0)
-    if until > now:
-        return int(until - now) + 1
-    if until:
-        _login_locked_until.pop(key, None)
-    return 0
+    with _login_state_lock:
+        now = time.time()
+        _prune_login_source_state(now)
+        if key in _login_failures or key in _login_locked_until:
+            _touch_login_source(key, now)
+        until = _login_locked_until.get(key, 0.0)
+        if until > now:
+            return int(until - now) + 1
+        if until:
+            _login_locked_until.pop(key, None)
+        return 0
 
 
 def _record_login_failure(request: Request) -> None:
     """记一次失败；窗口内累计超阈值则按指数退避锁定该客户端。"""
     key = _client_key(request)
-    now = time.time()
-    fails = [t for t in _login_failures.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
-    fails.append(now)
-    _login_failures[key] = fails
-    if len(fails) >= _LOGIN_MAX_FAILURES:
-        over = len(fails) - _LOGIN_MAX_FAILURES
-        lock = min(_LOGIN_BASE_LOCK_SECONDS * (2 ** over), _LOGIN_MAX_LOCK_SECONDS)
-        _login_locked_until[key] = now + lock
-        logger.warning(f"[auth] login rate-limit: client {key} locked for {int(lock)}s after {len(fails)} failures")
+    with _login_state_lock:
+        now = time.time()
+        _prune_login_source_state(now)
+        _touch_login_source(key, now)
+        fails = [
+            timestamp
+            for timestamp in _login_failures.get(key, [])
+            if now - timestamp < _LOGIN_WINDOW_SECONDS
+        ]
+        fails.append(now)
+        fails = fails[-_LOGIN_FAILURE_HISTORY_LIMIT:]
+        _login_failures[key] = fails
+        if len(fails) >= _LOGIN_MAX_FAILURES:
+            over = len(fails) - _LOGIN_MAX_FAILURES
+            lock = min(
+                _LOGIN_BASE_LOCK_SECONDS * (2 ** over),
+                _LOGIN_MAX_LOCK_SECONDS,
+            )
+            _login_locked_until[key] = now + lock
+            logger.warning(
+                "[auth] login rate-limit: client %s locked for %ss after %s failures",
+                key,
+                int(lock),
+                len(fails),
+            )
 
 
 def _record_login_success(request: Request) -> None:
     """成功登录：清空该客户端的失败计数与锁定。"""
     key = _client_key(request)
-    _login_failures.pop(key, None)
-    _login_locked_until.pop(key, None)
+    with _login_state_lock:
+        _login_failures.pop(key, None)
+        _login_locked_until.pop(key, None)
+        _login_source_lru.pop(key, None)
 
 
 def _get_auth_file() -> str:
@@ -523,38 +731,82 @@ def _load_sessions() -> None:
                     :_MAX_ACTIVE_SESSIONS
                 ]
             )
-        _sessions.clear()
-        _sessions.update(valid)
+        with _session_state_lock:
+            _sessions.clear()
+            _sessions.update(valid)
     except Exception as e:
         logger.warning(f"[auth] failed to load sessions: {e}")
 
 
 def _save_sessions() -> None:
-    """Atomically persist active sessions to disk."""
+    """Atomically persist active sessions or raise on a durability failure."""
     try:
-        path = _get_sessions_file()
-        now = time.time()
-        active = {
-            tok: exp
-            for tok, exp in sorted(
-                _sessions.items(), key=lambda item: item[1], reverse=True
-            )[:_MAX_ACTIVE_SESSIONS]
-            if exp > now
-        }
+        with _session_state_lock:
+            _persist_sessions_locked(_sessions)
+    except Exception as e:
+        if isinstance(e, AuthPersistenceError):
+            raise
+        raise AuthPersistenceError("failed to persist dashboard sessions") from e
+
+
+def _persist_sessions_locked(sessions: dict[str, float]) -> None:
+    """Persist one candidate registry while ``_session_state_lock`` is held."""
+    path = _get_sessions_file()
+    now = time.time()
+    active = {
+        tok: exp
+        for tok, exp in sorted(
+            sessions.items(), key=lambda item: item[1], reverse=True
+        )[:_MAX_ACTIVE_SESSIONS]
+        if exp > now
+    }
+    try:
         _atomic_write_private_json(path, active)
     except Exception as e:
-        logger.warning(f"[auth] failed to save sessions: {e}")
+        raise AuthPersistenceError("failed to persist dashboard sessions") from e
 
 
-def _load_auth_data() -> dict:
+def _revoke_session(token: str) -> bool:
+    """Durably revoke one session before changing the in-memory registry."""
+    with _session_state_lock:
+        if token not in _sessions:
+            return False
+        candidate = dict(_sessions)
+        candidate.pop(token, None)
+        _persist_sessions_locked(candidate)
+        _sessions.clear()
+        _sessions.update(candidate)
+        return True
+
+
+def _revoke_all_sessions() -> None:
+    """Durably revoke every dashboard session as one fail-closed mutation."""
+    with _session_state_lock:
+        _persist_sessions_locked({})
+        _sessions.clear()
+
+
+def _read_auth_data_locked(*, strict: bool = False) -> dict:
     try:
         auth_file = _get_auth_file()
         if os.path.exists(auth_file):
             with open(auth_file, "r", encoding="utf-8") as f:
-                return _json_lib.load(f)
-    except Exception:
-        pass
+                loaded = _json_lib.load(f)
+            if isinstance(loaded, dict):
+                return loaded
+            if strict:
+                raise AuthPersistenceError("dashboard auth state is not an object")
+    except AuthPersistenceError:
+        raise
+    except Exception as e:
+        if strict:
+            raise AuthPersistenceError("failed to read dashboard auth state") from e
     return {}
+
+
+def _load_auth_data() -> dict:
+    with _auth_mutation_lock:
+        return _read_auth_data_locked()
 
 
 def _load_password_hash() -> str | None:
@@ -605,31 +857,171 @@ def _needs_rehash(stored: str) -> bool:
         return True
 
 
-def _save_password_hash(password: str, *, keep_qa: bool = True) -> None:
-    auth_file = _get_auth_file()
-    os.makedirs(os.path.dirname(auth_file), exist_ok=True)
-    data: dict = {"password_hash": _hash_secret(password)}
-    if keep_qa:
-        existing = _load_auth_data()
-        if existing.get("security_question"):
-            data["security_question"] = existing["security_question"]
-        if existing.get("security_answer_hash"):
-            data["security_answer_hash"] = existing["security_answer_hash"]
-    _atomic_write_private_json(auth_file, data)
+def _credential_proof_matches_locked(
+    proof: CredentialProof,
+    *,
+    strict: bool = True,
+) -> bool:
+    """Compare one proof while ``_credential_state_guard`` is held."""
+    if not isinstance(proof, CredentialProof):
+        return False
+    if proof.generation != _credential_generation:
+        return False
+    if proof.source == "environment_password":
+        current = os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")
+        return bool(current) and hmac.compare_digest(
+            _environment_password_proof(current), proof.value
+        )
+    if proof.source not in {"password_hash", "security_answer_hash"}:
+        return False
+    current = _read_auth_data_locked(strict=strict).get(proof.source, "")
+    return bool(current) and hmac.compare_digest(str(current), proof.value)
 
 
-def _save_security_qa(question: str, answer: str) -> None:
+def _credential_proof_matches(
+    proof: CredentialProof,
+    *,
+    strict: bool = True,
+) -> bool:
+    with _auth_mutation_lock:
+        return _credential_proof_matches_locked(proof, strict=strict)
+
+
+def _verify_password_for_rotation(password: str) -> CredentialProof | None:
+    """Verify a password and return the exact credential/generation checked."""
+    with _auth_mutation_lock:
+        generation = _credential_generation
+        env_password = os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")
+        if env_password:
+            stored = ""
+            proof = CredentialProof(
+                "environment_password",
+                _environment_password_proof(env_password),
+                generation,
+            )
+        else:
+            stored = str(_read_auth_data_locked().get("password_hash", ""))
+            proof = CredentialProof("password_hash", stored, generation)
+
+    if env_password:
+        verified = hmac.compare_digest(password, env_password)
+    else:
+        verified = bool(stored) and _verify_secret(password, stored)
+    if not verified:
+        return None
+    with _auth_mutation_lock:
+        return proof if _credential_proof_matches_locked(proof) else None
+
+
+def _verify_security_answer_for_rotation(
+    answer: str,
+) -> CredentialProof | None:
+    """Verify the recovery answer and bind it to the current auth generation."""
+    with _auth_mutation_lock:
+        generation = _credential_generation
+        stored = str(
+            _read_auth_data_locked().get("security_answer_hash", "")
+        )
+        proof = CredentialProof("security_answer_hash", stored, generation)
+    if not stored or not _verify_secret(answer.strip().lower(), stored):
+        return None
+    with _auth_mutation_lock:
+        return proof if _credential_proof_matches_locked(proof) else None
+
+
+def _save_prehashed_password(
+    password_hash: str,
+    *,
+    keep_qa: bool = True,
+    expected_hash: str | None = None,
+    expected_generation: int | None = None,
+    advance_generation: bool = True,
+) -> bool:
+    """Persist an already-derived password hash with optional CAS checks."""
     auth_file = _get_auth_file()
     os.makedirs(os.path.dirname(auth_file), exist_ok=True)
-    data = _load_auth_data()
-    data["security_question"] = question.strip()
-    data["security_answer_hash"] = _hash_secret(answer.strip().lower())
-    _atomic_write_private_json(auth_file, data)
+    with _auth_mutation_lock:
+        existing = _read_auth_data_locked(strict=True)
+        if (
+            expected_hash is not None
+            and existing.get("password_hash") != expected_hash
+        ):
+            return False
+        if (
+            expected_generation is not None
+            and _credential_generation != expected_generation
+        ):
+            return False
+        data: dict = {"password_hash": password_hash}
+        if keep_qa:
+            if existing.get("security_question"):
+                data["security_question"] = existing["security_question"]
+            if existing.get("security_answer_hash"):
+                data["security_answer_hash"] = existing["security_answer_hash"]
+        try:
+            _atomic_write_private_json(auth_file, data)
+        except Exception as e:
+            raise AuthPersistenceError(
+                "failed to persist dashboard password"
+            ) from e
+        if advance_generation:
+            _advance_credential_generation_locked()
+        return True
+
+
+def _save_password_hash(
+    password: str,
+    *,
+    keep_qa: bool = True,
+    expected_hash: str | None = None,
+    expected_generation: int | None = None,
+    advance_generation: bool = True,
+) -> bool:
+    """Replace the password without losing a concurrent security-QA update.
+
+    ``expected_hash`` turns legacy rehash into compare-and-swap: a login that
+    verified an old hash must never overwrite a password changed meanwhile.
+    """
+    return _save_prehashed_password(
+        _hash_secret(password),
+        keep_qa=keep_qa,
+        expected_hash=expected_hash,
+        expected_generation=expected_generation,
+        advance_generation=advance_generation,
+    )
+
+
+def _save_security_qa(
+    question: str,
+    answer: str,
+    *,
+    expected_generation: int | None = None,
+) -> bool:
+    answer_hash = _hash_secret(answer.strip().lower())
+    auth_file = _get_auth_file()
+    os.makedirs(os.path.dirname(auth_file), exist_ok=True)
+    with _auth_mutation_lock:
+        data = _read_auth_data_locked(strict=True)
+        if (
+            expected_generation is not None
+            and _credential_generation != expected_generation
+        ):
+            return False
+        data["security_question"] = question.strip()
+        data["security_answer_hash"] = answer_hash
+        try:
+            _atomic_write_private_json(auth_file, data)
+        except Exception as e:
+            raise AuthPersistenceError(
+                "failed to persist dashboard security question"
+            ) from e
+        _advance_credential_generation_locked()
+        return True
 
 
 def _verify_security_answer(answer: str) -> bool:
-    stored = _load_auth_data().get("security_answer_hash", "")
-    return _verify_secret(answer.strip().lower(), stored)
+    proof = _verify_security_answer_for_rotation(answer)
+    return proof is not None and _credential_proof_matches(proof)
 
 
 def _is_setup_needed() -> bool:
@@ -641,48 +1033,74 @@ def _is_setup_needed() -> bool:
 
 def _verify_any_password(password: str) -> bool:
     """Check password against env var (first) or stored hash."""
-    env_pwd = os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")
-    if env_pwd:
-        return hmac.compare_digest(password, env_pwd)
-    stored = _load_password_hash()
-    if not stored:
+    proof = _verify_password_for_rotation(password)
+    if proof is None:
         return False
-    if not _verify_secret(password, stored):
-        return False
+    if proof.source == "environment_password":
+        return _credential_proof_matches(proof)
     # 校验通过：若存的是旧格式或低迭代数，趁手里有明文静默升级到当前 PBKDF2 标准。
-    if _needs_rehash(stored):
+    if _needs_rehash(proof.value):
         try:
-            _save_password_hash(password)
+            upgraded = _save_password_hash(
+                password,
+                expected_hash=proof.value,
+                expected_generation=proof.generation,
+                advance_generation=False,
+            )
+            if upgraded:
+                return True
         except Exception as e:
             logger.warning(f"[auth] password hash upgrade failed: {e}")
-    return True
+    return _credential_proof_matches(proof)
 
 
 def _create_session() -> str:
-    now = time.time()
-    expired = [tok for tok, exp in _sessions.items() if exp <= now]
-    for tok in expired:
-        _sessions.pop(tok, None)
-    while len(_sessions) >= _MAX_ACTIVE_SESSIONS:
-        oldest = min(_sessions, key=_sessions.get)
-        _sessions.pop(oldest, None)
-    token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
-    _sessions[token] = now + _session_ttl_seconds()
-    _save_sessions()
-    return token
+    with _session_state_lock:
+        now = time.time()
+        candidate = {
+            tok: exp for tok, exp in _sessions.items() if exp > now
+        }
+        while len(candidate) >= _MAX_ACTIVE_SESSIONS:
+            oldest = min(candidate, key=candidate.get)
+            candidate.pop(oldest, None)
+        token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
+        candidate[token] = now + _session_ttl_seconds()
+        _persist_sessions_locked(candidate)
+        _sessions.clear()
+        _sessions.update(candidate)
+        return token
+
+
+def _create_session_for_credential(proof: CredentialProof) -> str | None:
+    """Issue a session only while the credential that was verified is current."""
+    with _auth_mutation_lock:
+        if not _credential_proof_matches_locked(proof):
+            return None
+        return _create_session()
 
 
 def _is_authenticated(request: Request) -> bool:
     token = request.cookies.get("ombre_session")
     if not token:
         return False
-    expiry = _sessions.get(token)
-    if expiry is None or time.time() > expiry:
-        if expiry is not None:
-            _sessions.pop(token, None)
-            _save_sessions()
-        return False
-    return True
+    with _session_state_lock:
+        expiry = _sessions.get(token)
+        if expiry is None or time.time() > expiry:
+            # An expired entry cannot revive after restart because its stored
+            # timestamp is already in the past, so no durability write is
+            # required merely to prune it from memory.
+            if expiry is not None:
+                _sessions.pop(token, None)
+            return False
+        return True
+
+
+def _authenticated_credential_generation(request: Request) -> int | None:
+    """Atomically bind an authenticated mutation to the credential generation."""
+    with _auth_mutation_lock:
+        if not _is_authenticated(request):
+            return None
+        return _credential_generation
 
 
 def _is_https_request(request: Request) -> bool:

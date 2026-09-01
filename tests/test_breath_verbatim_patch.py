@@ -9,6 +9,7 @@ from tools.breath import dispatch
 from tools.breath._verbatim import render_stored_bucket
 from tools.breath.importance import surface_by_importance
 from tools.breath.search import surface_search
+from tools.breath.surface import surface_default
 
 
 class ExplodingDehydrator:
@@ -88,8 +89,8 @@ async def _search(query, **overrides):
 def _returned_body(output: str, bucket_id: str, expected_length: int) -> str:
     marker = f"[bucket_id:{bucket_id}]"
     marker_at = output.index(marker)
-    body_start = output.index("\n", marker_at) + 1
-    return output[body_start:body_start + expected_length]
+    footer_start = output.rfind("\n", 0, marker_at)
+    return output[footer_start - expected_length:footer_start]
 
 
 def _sha256(text: str) -> str:
@@ -123,6 +124,8 @@ async def test_query_single_bucket_returns_stored_content_exactly(bucket_mgr, mo
     assert dehydrator.calls == 0
     assert "待办" not in output
     assert "\n- " not in output
+    assert "Footprint" not in output
+    assert output.index(original) < output.index(f"[bucket_id:{bucket_id}]")
 
 
 @pytest.mark.asyncio
@@ -214,6 +217,146 @@ async def test_token_budget_omits_whole_bucket_instead_of_truncating(monkeypatch
     # literal hit, so this is an incidental result and must not reinforce itself.
     assert manager.touched == []
     assert dehydrator.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_default_surface_skips_oversized_core_and_keeps_later_core(monkeypatch):
+    oversized = {
+        "id": "oversized-core",
+        "content": "oversized " * 400,
+        "metadata": {
+            "type": "permanent",
+            "importance": 10,
+            "pinned": True,
+            "domain": [],
+        },
+    }
+    later = {
+        "id": "later-core",
+        "content": "Later core rule must still surface in full.",
+        "metadata": {
+            "type": "permanent",
+            "importance": 10,
+            "pinned": True,
+            "domain": [],
+        },
+    }
+    manager = OrderedBucketManager([oversized, later])
+    _install_runtime(manager)
+    monkeypatch.setattr("tools.breath.surface.random.random", lambda: 1.0)
+    _, later_cost = render_stored_bucket(
+        later,
+        "📌 [核心准则] [bucket_id:later-core]",
+    )
+
+    output = await surface_default(
+        max_results=10,
+        max_tokens=later_cost,
+        tag_filter=[],
+    )
+
+    assert "[bucket_id:later-core]" in output
+    assert later["content"] in output
+    assert "[bucket_id:oversized-core]" not in output
+    assert "token 预算不足" in output
+
+
+@pytest.mark.asyncio
+async def test_default_surface_skips_random_oversized_candidate_and_keeps_later_fit(
+    monkeypatch,
+):
+    top = {
+        "id": "top",
+        "content": "Top weighted memory.",
+        "metadata": {
+            "type": "dynamic",
+            "importance": 10,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    high = {
+        "id": "high",
+        "content": "Later high-importance memory must not be blocked.",
+        "metadata": {
+            "type": "dynamic",
+            "importance": 9,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    blocker = {
+        "id": "blocker",
+        "content": "blocking " * 400,
+        "metadata": {
+            "type": "dynamic",
+            "importance": 8,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    manager = OrderedBucketManager([top, high, blocker])
+    _install_runtime(manager)
+
+    def blocker_first(items):
+        items.sort(key=lambda bucket: bucket["id"] != "blocker")
+
+    monkeypatch.setattr("tools.breath.surface.random.shuffle", blocker_first)
+    monkeypatch.setattr("tools.breath.surface.random.random", lambda: 1.0)
+    _, top_cost = render_stored_bucket(top, "[bucket_id:top]")
+    _, high_cost = render_stored_bucket(high, "[bucket_id:high]")
+    rt.config["surfacing"]["breath_max_tokens"] = top_cost + high_cost
+
+    output = await dispatch()
+
+    assert "[bucket_id:top]" in output
+    assert "[bucket_id:high]" in output
+    assert high["content"] in output
+    assert "[bucket_id:blocker]" not in output
+    assert "token 预算不足" in output
+    assert "有 1 条主要浮现记忆" in output
+
+
+@pytest.mark.asyncio
+async def test_oversized_passive_association_does_not_report_primary_truncation(
+    monkeypatch,
+):
+    top = {
+        "id": "top",
+        "content": "Primary surfaced memory.",
+        "metadata": {
+            "type": "dynamic",
+            "importance": 10,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    passive = {
+        "id": "passive",
+        "content": "optional passive " * 400,
+        "metadata": {
+            "type": "dynamic",
+            "importance": 9,
+            "activation_count": 1,
+            "last_active": "2020-01-01T00:00:00",
+            "domain": [],
+        },
+    }
+    manager = OrderedBucketManager([top, passive])
+    _install_runtime(manager)
+    monkeypatch.setattr("tools.breath.surface.random.shuffle", lambda items: None)
+    monkeypatch.setattr("tools.breath.surface.random.random", lambda: 1.0)
+    _, top_cost = render_stored_bucket(top, "[bucket_id:top]")
+
+    output = await surface_default(
+        max_results=1,
+        max_tokens=top_cost,
+        tag_filter=[],
+    )
+
+    assert "[bucket_id:top]" in output
+    assert "[bucket_id:passive]" not in output
+    assert "token 预算不足" not in output
 
 
 @pytest.mark.asyncio

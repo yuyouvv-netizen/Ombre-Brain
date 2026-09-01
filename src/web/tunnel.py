@@ -55,25 +55,11 @@ def _load_tunnel_config() -> dict:
 
 def _save_tunnel_config(data: dict) -> None:
     path = _get_tunnel_config_file()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}.{_threading.get_ident()}"
-    payload = _json_lib.dumps(data, ensure_ascii=False)
     with _tunnel_config_lock:
-        try:
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            persisted = _load_tunnel_config()
-            if persisted != data:
-                raise OSError("tunnel config verification failed after write")
-        finally:
-            try:
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-            except OSError:
-                pass
+        sh._atomic_write_private_json(path, data)
+        persisted = _load_tunnel_config()
+        if persisted != data:
+            raise OSError("tunnel config verification failed after write")
 
 
 def _tunnel_running() -> bool:
@@ -96,10 +82,13 @@ def _start_tunnel(token: str) -> tuple[bool, str]:
                        "重新构建时去掉该参数，或手动安装 cloudflared 后再用隧道管理。")
     try:
         _tunnel_last_error = ""
+        child_env = os.environ.copy()
+        child_env["TUNNEL_TOKEN"] = token
         _tunnel_proc = _subprocess.Popen(
-            [cf, "tunnel", "--no-autoupdate", "run", "--token", token],
+            [cf, "tunnel", "--no-autoupdate", "run"],
             stdout=_subprocess.DEVNULL,
             stderr=_subprocess.PIPE,
+            env=child_env,
         )
         # Capture stderr in background thread so we can surface errors
         def _read_stderr(proc):

@@ -233,7 +233,7 @@ async def test_literal_original_term_wins_single_result_over_higher_association(
     )
     association = _bucket(
         "association",
-        "A high-scoring semantic association that does not contain the original term.",
+        "A high-scoring semantic association without the original term.",
         score=100,
         direct=True,
     )
@@ -245,7 +245,26 @@ async def test_literal_original_term_wins_single_result_over_higher_association(
 
     assert f"[bucket_id:{literal['id']}]" in output
     assert association["content"] not in output
-    assert "[content_role:stored_memory_data]" in output
+    assert output.index(literal["content"]) < output.index(
+        f"[bucket_id:{literal['id']}]"
+    )
+    assert "[content_role:stored_memory_data]" not in output
+
+
+@pytest.mark.asyncio
+async def test_search_output_hides_footprint_and_numeric_ranking_metadata():
+    body = "格式契约校验：正文必须先出现。"
+    ordinary = _bucket("format-contract", body, score=98, direct=True)
+    manager = SearchManager(active=[ordinary])
+    _install(manager)
+
+    output = await _search("格式契约校验", max_results=1)
+
+    assert output.index(body) < output.index("[bucket_id:format-contract]")
+    assert "Footprint" not in output
+    assert "[权重:" not in output
+    assert "importance" not in output.lower()
+    assert "相似度" not in output
 
 
 @pytest.mark.asyncio

@@ -48,11 +48,13 @@ def test_restore_from_prev_recovers_src_frontend_version_and_requirements(tmp_pa
     (prev / "frontend" / "app.js").write_text("// old\n", encoding="utf-8")
     (prev / "VERSION").write_text("1.0.0\n", encoding="utf-8")
     (prev / "requirements.txt").write_text("old-dependency==1\n", encoding="utf-8")
+    (prev / "requirements.lock.txt").write_text("old-lock==1\n", encoding="utf-8")
 
     # 当前是坏版本
     (src / "server.py").write_text("BROKEN(:\n", encoding="utf-8")
     (front / "app.js").write_text("// broken\n", encoding="utf-8")
     (repo / "requirements.txt").write_text("broken-dependency==9\n", encoding="utf-8")
+    (repo / "requirements.lock.txt").write_text("broken-lock==9\n", encoding="utf-8")
 
     ok = meta._restore_from_prev(str(repo), str(prev), str(src), str(front))
     assert ok is True
@@ -61,6 +63,29 @@ def test_restore_from_prev_recovers_src_frontend_version_and_requirements(tmp_pa
     assert (repo / "VERSION").read_text(encoding="utf-8") == "1.0.0\n"
     assert (src / "VERSION").read_text(encoding="utf-8") == "1.0.0\n"
     assert (repo / "requirements.txt").read_text(encoding="utf-8") == "old-dependency==1\n"
+    assert (repo / "requirements.lock.txt").read_text(encoding="utf-8") == "old-lock==1\n"
+
+
+def test_restore_removes_dependency_files_absent_before_backup(tmp_path):
+    repo = tmp_path
+    src = repo / "src"
+    src.mkdir()
+    front = repo / "frontend"
+    front.mkdir()
+    (src / "server.py").write_text("OLD = 1\n", encoding="utf-8")
+    (front / "app.js").write_text("// old\n", encoding="utf-8")
+    (repo / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    prev = repo / "_prev"
+
+    meta._backup_update_tree(str(repo), str(src), str(front), str(prev))
+    (repo / "requirements.txt").write_text("new==1\n", encoding="utf-8")
+    (repo / "requirements.lock.txt").write_text("new==1\n", encoding="utf-8")
+
+    assert meta._restore_from_prev(
+        str(repo), str(prev), str(src), str(front)
+    ) is True
+    assert not (repo / "requirements.txt").exists()
+    assert not (repo / "requirements.lock.txt").exists()
 
 
 def test_restore_returns_false_without_prev(tmp_path):

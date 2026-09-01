@@ -1,4 +1,6 @@
+import asyncio
 import json
+import threading
 
 import pytest
 
@@ -85,3 +87,37 @@ async def test_import_preflight_route_returns_preview_with_runtime_readiness(mon
     assert payload["turns_count"] == 2
     assert payload["chunks_count"] == 1
 
+
+@pytest.mark.asyncio
+async def test_preflight_is_off_loop_and_rejects_parallel_body_before_read(monkeypatch):
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(import_api.sh, "import_engine", FakeImportEngine())
+    monkeypatch.setattr(import_api.sh, "config", {"human": "阿立"})
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_preview(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return {"ok": True, "turns_count": 1, "chunks_count": 1}
+
+    monkeypatch.setattr(import_api, "preview_import", blocking_preview)
+    mcp = FakeMCP()
+    import_api.register(mcp)
+    preflight = mcp.routes[("POST", "/api/import/preflight")]
+
+    class MustNotReadRequest(BodyRequest):
+        async def body(self):
+            raise AssertionError("parallel preflight must be rejected before body read")
+
+    first = asyncio.create_task(preflight(BodyRequest("Human: one")))
+    while not entered.is_set():
+        await asyncio.sleep(0)
+
+    second = await preflight(MustNotReadRequest("Human: two"))
+    assert second.status_code == 409
+    assert "active" in json.loads(second.body)["error"].lower()
+
+    release.set()
+    response = await asyncio.wait_for(first, timeout=2)
+    assert response.status_code == 200

@@ -1,4 +1,4 @@
-from ledger_mirror import LedgerMirror
+from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
 
 
 def test_projection_rebuild_cannot_create_or_lose_canonical_truth():

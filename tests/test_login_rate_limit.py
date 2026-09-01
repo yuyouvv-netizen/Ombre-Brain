@@ -20,9 +20,13 @@ class DummyRequest:
 def _clear_state():
     sh._login_failures.clear()
     sh._login_locked_until.clear()
+    sh._login_source_lru.clear()
+    sh._login_global_attempts.clear()
     yield
     sh._login_failures.clear()
     sh._login_locked_until.clear()
+    sh._login_source_lru.clear()
+    sh._login_global_attempts.clear()
 
 
 def test_not_limited_before_threshold():

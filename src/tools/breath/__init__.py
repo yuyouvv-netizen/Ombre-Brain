@@ -48,6 +48,8 @@ async def dispatch(
     importance_min: Optional[int] = -1,
     tags: Optional[str] = "",
     catalog: Optional[bool] = False,
+    date_from: Optional[str] = "",
+    date_to: Optional[str] = "",
 ) -> str:
     # --- Null-safe coercion ---
     query = "" if query is None else str(query)
@@ -65,6 +67,8 @@ async def dispatch(
     tags = "" if tags is None else str(tags)
     if catalog is None:
         catalog = False
+    date_from = "" if date_from is None else str(date_from)
+    date_to = "" if date_to is None else str(date_to)
 
     query_err = check_query_size(query)
     if query_err:
@@ -85,21 +89,16 @@ async def dispatch(
         "importance_min": importance_min,
         "tags": tags,
         "catalog": catalog,
+        "date_from": date_from,
+        "date_to": date_to,
     })
     await rt.decay_engine.ensure_started()
-
-    # --- catalog 目录模式：最先短路，0 LLM、只读元数据、每桶一行 ---
-    # 开新窗省 token 的推荐姿势：先 breath(catalog=True) 看目录，
-    # 再 breath(query=...) 精准拉取正文。
-    if catalog:
-        domain_filter = [d.strip() for d in domain.split(",") if d.strip()]
-        return await surface_catalog(domain_filter=domain_filter or None)
 
     surfacing_cfg = rt.config.get("surfacing", {}) or {}
     is_search = bool(query and query.strip())
     if is_search:
-        # 检索与无参 breath 是两种任务：前者默认少而准，后者保留用户既有的
-        # 浮现桶数量。显式传 max_* 时仍完全尊重调用方。
+        # Search is intentionally compact; no-query breath keeps the user's
+        # existing bucket count and composition.
         matching_cfg = rt.config.get("matching", {}) or {}
         default_results = int(
             surfacing_cfg.get("search_max_results")
@@ -116,9 +115,20 @@ async def dispatch(
         max_tokens = default_tokens
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
+    tag_filter = [t.strip() for t in tags.split(",") if t.strip()]
+
+    # --- catalog 目录模式：最先短路，0 LLM、只读元数据、每桶一行 ---
+    # 开新窗省 token 的推荐姿势：先 breath(catalog=True) 看目录，
+    # 再 breath(query=...) 精准拉取正文。
+    if catalog:
+        domain_filter = [d.strip() for d in domain.split(",") if d.strip()]
+        return await surface_catalog(
+            domain_filter=domain_filter or None,
+            tag_filter=tag_filter,
+            max_results=max_results,
+        )
 
     # --- 解析 tags 过滤；feel/__feel__ 映射到 feel 通道 ---
-    tag_filter = [t.strip() for t in tags.split(",") if t.strip()]
     if any(t in ("feel", "__feel__") for t in tag_filter):
         domain = "feel"
         tag_filter = [t for t in tag_filter if t not in ("feel", "__feel__")]
@@ -152,4 +162,6 @@ async def dispatch(
         valence=valence,
         arousal=arousal,
         tag_filter=tag_filter,
+        date_from=date_from,
+        date_to=date_to,
     )

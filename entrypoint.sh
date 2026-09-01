@@ -15,9 +15,9 @@
 # 处理逻辑：
 #   1. 配置路径取 $OMBRE_CONFIG_PATH，未设则退回 /app/config.yaml（老行为，兼容现有部署）。
 #   2. 确保父目录存在。
-#   3. 若该路径是目录（Docker 副作用）：rmdir / rm -rf 常规删除；删不掉就用
-#      `find -mindepth 1 -delete` 清空内容兜底（即便目录本身是挂载点删不掉），再试 rmdir。
-#   4. 删成功（路径已不存在）→ 从内置默认模板初始化一份。
+#   3. 若该路径已是目录，立即 fail closed。配置路径来自环境变量，绝不能对它
+#      `rm -rf`/`find -delete`；误指到记忆卷时那会删掉用户数据。
+#   4. 路径不存在则从内置默认模板初始化。
 #   5. 最终校验：路径必须是普通文件，否则打印清晰指引并 FATAL 退出（不带病启动）。
 
 IMAGE_ROOT="${OMBRE_IMAGE_ROOT:-/app}"
@@ -26,21 +26,16 @@ DEFAULT="$IMAGE_ROOT/config.default.yaml"
 
 mkdir -p "$(dirname "$CONFIG")" 2>/dev/null || true
 
-# --- 3. 若是目录，尽全力把它清掉 ---
+# --- 3. 目录绝不自动删除：它可能就是整个记忆卷 ---
 if [ -d "$CONFIG" ]; then
     echo "[entrypoint] '$CONFIG' is a directory (Docker created it because the host file was missing)."
-    echo "[entrypoint] Trying to remove it and re-initialize from defaults..."
-    rmdir "$CONFIG" 2>/dev/null || rm -rf "$CONFIG" 2>/dev/null || true
-    if [ -d "$CONFIG" ]; then
-        # 直接删除失败（多半是活动 bind mount，挂载点自身删不掉）。
-        # 兜底：清空目录内容（mindepth 1 = 不碰目录自身），再试着删掉空目录。
-        echo "[entrypoint] Direct removal failed; clearing its contents as a fallback..."
-        find "$CONFIG" -mindepth 1 -delete 2>/dev/null || true
-        rmdir "$CONFIG" 2>/dev/null || true
-    fi
+    echo "[entrypoint] FATAL: refusing to delete a directory supplied as OMBRE_CONFIG_PATH."
+    echo "[entrypoint] Point OMBRE_CONFIG_PATH at a file, for example:"
+    echo "[entrypoint]     /app/buckets/config.yaml"
+    exit 1
 fi
 
-# --- 4. 不存在则从默认模板初始化（上面删成功后会走到这；纯缺文件也走这）---
+# --- 4. 不存在则从默认模板初始化 ---
 if [ ! -e "$CONFIG" ]; then
     echo "[entrypoint] Initializing config from defaults at '$CONFIG'..."
     cp "$DEFAULT" "$CONFIG"
@@ -99,7 +94,10 @@ _restore_seed_swap() {
     rm -rf "$CODE_DIR/src" "$CODE_DIR/frontend" 2>/dev/null || true
     [ ! -d "$old_dir/src" ] || mv "$old_dir/src" "$CODE_DIR/src" 2>/dev/null || true
     [ ! -d "$old_dir/frontend" ] || mv "$old_dir/frontend" "$CODE_DIR/frontend" 2>/dev/null || true
-    [ ! -f "$old_dir/VERSION" ] || cp -a "$old_dir/VERSION" "$CODE_DIR/VERSION" 2>/dev/null || true
+    for root_file in VERSION requirements.txt requirements.lock.txt; do
+        rm -f "$CODE_DIR/$root_file" 2>/dev/null || true
+        [ ! -f "$old_dir/$root_file" ] || cp -a "$old_dir/$root_file" "$CODE_DIR/$root_file" 2>/dev/null || true
+    done
 }
 
 _seed_image_code() {
@@ -110,7 +108,12 @@ _seed_image_code() {
     mkdir -p "$stage" "$old_dir" 2>/dev/null || return 1
     cp -a "$IMAGE_ROOT/src" "$stage/src" 2>/dev/null || { rm -rf "$stage" "$old_dir"; return 1; }
     cp -a "$IMAGE_ROOT/frontend" "$stage/frontend" 2>/dev/null || { rm -rf "$stage" "$old_dir"; return 1; }
-    cp -a "$IMAGE_ROOT/VERSION" "$stage/VERSION" 2>/dev/null || true
+    for root_file in VERSION requirements.txt requirements.lock.txt; do
+        [ ! -f "$IMAGE_ROOT/$root_file" ] || cp -a "$IMAGE_ROOT/$root_file" "$stage/$root_file" 2>/dev/null || {
+            rm -rf "$stage" "$old_dir"
+            return 1
+        }
+    done
     [ -f "$stage/src/server.py" ] && [ -d "$stage/frontend" ] || {
         rm -rf "$stage" "$old_dir" 2>/dev/null
         return 1
@@ -128,7 +131,9 @@ _seed_image_code() {
             return 1
         }
     fi
-    [ ! -f "$CODE_DIR/VERSION" ] || cp -a "$CODE_DIR/VERSION" "$old_dir/VERSION" 2>/dev/null || true
+    for root_file in VERSION requirements.txt requirements.lock.txt; do
+        [ ! -f "$CODE_DIR/$root_file" ] || cp -a "$CODE_DIR/$root_file" "$old_dir/$root_file" 2>/dev/null || true
+    done
 
     mv "$stage/src" "$CODE_DIR/src" 2>/dev/null || {
         _restore_seed_swap "$old_dir"
@@ -140,7 +145,14 @@ _seed_image_code() {
         rm -rf "$stage" "$old_dir" 2>/dev/null
         return 1
     }
-    [ ! -f "$stage/VERSION" ] || cp -a "$stage/VERSION" "$CODE_DIR/VERSION" 2>/dev/null || true
+    for root_file in VERSION requirements.txt requirements.lock.txt; do
+        rm -f "$CODE_DIR/$root_file" 2>/dev/null || true
+        [ ! -f "$stage/$root_file" ] || cp -a "$stage/$root_file" "$CODE_DIR/$root_file" 2>/dev/null || {
+            _restore_seed_swap "$old_dir"
+            rm -rf "$stage" "$old_dir" 2>/dev/null || true
+            return 1
+        }
+    done
     rm -rf "$stage" 2>/dev/null || true
 
     # A previously healthy runtime becomes the crash rollback point for this image seed.
@@ -187,7 +199,10 @@ _bootstrap_code() {
         rm -rf "$CODE_DIR/src" "$CODE_DIR/frontend" 2>/dev/null
         cp -a "$CODE_DIR/_prev/src" "$CODE_DIR/src" 2>/dev/null || return 1
         cp -a "$CODE_DIR/_prev/frontend" "$CODE_DIR/frontend" 2>/dev/null || true
-        [ -f "$CODE_DIR/_prev/VERSION" ] && cp -a "$CODE_DIR/_prev/VERSION" "$CODE_DIR/VERSION" 2>/dev/null
+        for root_file in VERSION requirements.txt requirements.lock.txt; do
+            rm -f "$CODE_DIR/$root_file" 2>/dev/null || true
+            [ ! -f "$CODE_DIR/_prev/$root_file" ] || cp -a "$CODE_DIR/_prev/$root_file" "$CODE_DIR/$root_file" 2>/dev/null || return 1
+        done
         rm -rf "$CODE_DIR/_prev" 2>/dev/null
         FAILS=0
         echo 0 > "$CODE_DIR/.boot_fails" 2>/dev/null || true

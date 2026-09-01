@@ -15,15 +15,19 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping
-
 import httpx
 from starlette.middleware.cors import CORSMiddleware
 
+from ombrebrain.security.public_origin import (
+    configured_public_origin,
+    normalize_public_origin,
+)
 from utils import parse_bool
 from web.request_limits import (
     MCPRequestBodyLimitMiddleware,
     ManagementRequestBodyLimitMiddleware,
     is_mcp_endpoint_path,
+    is_sse_endpoint_path,
 )
 
 
@@ -47,6 +51,10 @@ class HTTPRuntimeSettings:
     # "oauth" (default) or "token" — only consulted when auth_required is True.
     # Mutually exclusive: see MCPAuthMiddleware and web/oauth.py's route 404s.
     auth_mode: str = "oauth"
+    # Canonical external origin captured from the same startup config snapshot
+    # used by OAuth route registration.  An empty value means request-derived
+    # trusted-proxy/Host fallback.
+    public_origin: str = ""
 
     @classmethod
     def from_config(
@@ -82,43 +90,90 @@ class HTTPRuntimeSettings:
             max_request_bytes=max_request_bytes,
             max_management_request_bytes=max_management_request_bytes,
             auth_mode=auth_mode,
+            public_origin=configured_public_origin(config),
         )
-
-
-def merge_mcp_tool_registries(primary: Any, extra: Any) -> int:
-    """Merge FastMCP's compatibility registry into the public registry.
-
-    FastMCP does not currently expose a public registry merge API. Keeping this
-    compatibility access in one function makes the private dependency easy to
-    test and replace when the SDK adds one.
-    """
-
-    primary_tools = primary._tool_manager._tools
-    extra_tools = extra._tool_manager._tools
-    primary_tools.update(extra_tools)
-    return len(extra_tools)
 
 
 def _first_forwarded_value(value: str) -> str:
     return value.split(",", 1)[0].strip()
 
 
-def _request_resource(scope: Mapping[str, Any], headers: Mapping[bytes, bytes]) -> tuple[str, str]:
-    proto = _first_forwarded_value(
-        headers.get(b"x-forwarded-proto", b"").decode("latin-1")
-    ) or str(scope.get("scheme", "http"))
-    host = _first_forwarded_value(
-        (headers.get(b"x-forwarded-host") or headers.get(b"host", b"")).decode(
-            "latin-1"
+def _header_text(headers: Mapping[bytes, bytes], name: bytes) -> str:
+    try:
+        return headers.get(name, b"").decode("latin-1").strip()
+    except (AttributeError, UnicodeError):
+        return ""
+
+
+def _scope_peer_host(scope: Mapping[str, Any]) -> str:
+    client = scope.get("client")
+    if isinstance(client, (tuple, list)) and client:
+        return str(client[0] or "").strip()
+    return ""
+
+
+def _scope_peer_is_trusted_proxy(scope: Mapping[str, Any]) -> bool:
+    """Use the Dashboard's existing trusted-proxy CIDR policy.
+
+    Keeping one policy avoids accepting forwarding headers here while rejecting
+    them in login rate limiting and secure-cookie detection (or vice versa).
+    The import is lazy so importing this testable assembly module remains free
+    of Dashboard runtime initialization.
+    """
+
+    from web._shared import _is_trusted_proxy
+
+    return _is_trusted_proxy(_scope_peer_host(scope))
+
+
+def _normalize_http_origin(value: str) -> str | None:
+    """Return a canonical HTTP(S) origin, or ``None`` when malformed."""
+
+    return normalize_public_origin(value, allow_mcp_endpoint=False) or None
+
+
+def _request_base(scope: Mapping[str, Any], headers: Mapping[bytes, bytes]) -> str:
+    proto = str(scope.get("scheme", "http")).strip().lower()
+    if proto not in ("http", "https"):
+        proto = "http"
+    host = _first_forwarded_value(_header_text(headers, b"host"))
+
+    if _scope_peer_is_trusted_proxy(scope):
+        forwarded_proto = _first_forwarded_value(
+            _header_text(headers, b"x-forwarded-proto")
+        ).lower()
+        if forwarded_proto in ("http", "https"):
+            proto = forwarded_proto
+        forwarded_host = _first_forwarded_value(
+            _header_text(headers, b"x-forwarded-host")
         )
-    )
-    path = str(scope.get("path", ""))
-    base = f"{proto}://{host}"
-    return f"{base}{path.rstrip('/')}", base
+        if forwarded_host:
+            host = forwarded_host
+
+    return _normalize_http_origin(f"{proto}://{host}") or ""
+
+
+def _canonical_mcp_base(
+    scope: Mapping[str, Any],
+    headers: Mapping[bytes, bytes],
+    public_origin: str,
+) -> str:
+    """Use the configured public origin, then the trusted request fallback."""
+
+    return normalize_public_origin(public_origin) or _request_base(scope, headers)
+
+
+def _extract_bearer_token(value: str) -> str:
+    """Parse an RFC 7235 auth scheme (scheme names are case-insensitive)."""
+
+    parts = str(value or "").strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return ""
+    return parts[1].strip()
 
 
 class MCPAuthMiddleware:
-    """Require an OAuth bearer token for the streamable MCP endpoint."""
+    """Require a bearer token for every endpoint of the selected MCP transport."""
 
     def __init__(
         self,
@@ -127,24 +182,36 @@ class MCPAuthMiddleware:
         auth_required: bool,
         token_validator: TokenValidator,
         auth_mode: str = "oauth",
+        path_matcher: Callable[[object], bool] = is_mcp_endpoint_path,
+        resource_path: str = "/mcp",
+        public_origin: str = "",
     ) -> None:
         self.app = app
         self.auth_required = bool(auth_required)
         self.token_validator = token_validator
         self.auth_mode = auth_mode if auth_mode in ("oauth", "token") else "oauth"
+        self.path_matcher = path_matcher
+        self.resource_path = "/" + str(resource_path or "mcp").strip("/")
+        self.public_origin = normalize_public_origin(public_origin)
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         path = str(scope.get("path", ""))
         if (
             scope.get("type") == "http"
+            and str(scope.get("method", "")).upper() != "OPTIONS"
             and self.auth_required
-            and is_mcp_endpoint_path(path)
+            and self.path_matcher(path)
         ):
             headers = {key.lower(): value for key, value in scope.get("headers", [])}
             auth = headers.get(b"authorization", b"").decode("latin-1")
-            resource, base = _request_resource(scope, headers)
-            valid = auth.startswith("Bearer ") and self.token_validator(
-                auth[7:], resource=resource
+            base = _canonical_mcp_base(scope, headers, self.public_origin)
+            # OAuth discovery currently exposes one canonical MCP resource.
+            # Legacy SSE's /sse and /messages routes are two transport legs of
+            # that same resource, not independently token-bound resources.
+            resource = f"{base}{self.resource_path}"
+            bearer_token = _extract_bearer_token(auth)
+            valid = bool(bearer_token) and self.token_validator(
+                bearer_token, resource=resource
             )
             if not valid and self.auth_mode == "token":
                 # Fallback header for MCP clients that can't customize Authorization.
@@ -154,7 +221,7 @@ class MCPAuthMiddleware:
                 if alt_token:
                     valid = self.token_validator(alt_token, resource=resource)
             if not valid:
-                endpoint = path.strip("/")
+                endpoint = self.resource_path.strip("/")
                 if self.auth_mode == "token":
                     # No OAuth server exists in token mode — a resource_metadata
                     # challenge pointing at a 404'd discovery endpoint would mislead.
@@ -196,42 +263,183 @@ class MCPAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-class MCPAcceptShim:
-    """Ensure MCP clients advertise both supported response media types."""
+class MCPJSONAcceptShim:
+    """为省略或通配 ``Accept`` 的 Streamable HTTP 客户端选择 JSON。
 
-    _REQUIRED = (b"application/json", b"text/event-stream")
+    FastMCP 会按 MCP 规范拒绝没有明确声明响应媒体类型的 POST。部分简化
+    客户端只发送浏览器/HTTP 库默认的 ``*/*``，虽然它在 HTTP 语义上本就
+    接受 JSON，却会因此在 ``tools/list`` 前收到 406。这里只把“缺失”补成
+    JSON、把通配范围补充为 JSON；显式只接受 SSE 等媒体类型时保持原样，
+    避免向客户端返回它没有声明能够解析的响应。
+    """
 
-    def __init__(self, app: Any) -> None:
+    def __init__(
+        self,
+        app: Any,
+        *,
+        path_matcher: Callable[[object], bool] = is_mcp_endpoint_path,
+    ) -> None:
         self.app = app
+        self.path_matcher = path_matcher
+
+    @staticmethod
+    def _wildcard_allows_json(media_range: bytes) -> bool:
+        parts = [part.strip().lower() for part in media_range.split(b";")]
+        if not parts or parts[0] not in (b"*/*", b"application/*"):
+            return False
+        for parameter in parts[1:]:
+            key, separator, value = parameter.partition(b"=")
+            if separator and key.strip() == b"q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    return False
+                return 0 < quality <= 1
+        return True
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
-        if scope.get("type") == "http" and is_mcp_endpoint_path(
+        if scope.get("type") == "http" and self.path_matcher(
             scope.get("path")
         ):
             headers = list(scope.get("headers", []))
-            accept_index = next(
-                (
-                    index
-                    for index, (key, _value) in enumerate(headers)
-                    if key.lower() == b"accept"
-                ),
-                -1,
+            accept_values = [
+                value
+                for key, value in headers
+                if key.lower() == b"accept"
+            ]
+            combined = b", ".join(accept_values).strip()
+            raw_media_ranges = [
+                item.strip()
+                for item in combined.lower().split(b",")
+                if item.strip()
+            ]
+            media_ranges = [
+                item.split(b";", 1)[0].strip()
+                for item in raw_media_ranges
+            ]
+            has_json = b"application/json" in media_ranges
+            accepts_wildcard = any(
+                self._wildcard_allows_json(item)
+                for item in raw_media_ranges
             )
-            current = headers[accept_index][1].lower() if accept_index >= 0 else b""
-            missing = [value for value in self._REQUIRED if value not in current]
-            if missing:
-                required = b", ".join(missing)
-                if accept_index >= 0 and headers[accept_index][1].strip():
-                    headers[accept_index] = (
-                        headers[accept_index][0],
-                        headers[accept_index][1] + b", " + required,
-                    )
-                elif accept_index >= 0:
-                    headers[accept_index] = (headers[accept_index][0], required)
-                else:
-                    headers.append((b"accept", required))
+
+            if not combined or (accepts_wildcard and not has_json):
+                normalized = (
+                    b"application/json"
+                    if not combined
+                    else combined + b", application/json"
+                )
+                headers = [
+                    (key, value)
+                    for key, value in headers
+                    if key.lower() != b"accept"
+                ]
+                headers.append((b"accept", normalized))
                 scope = dict(scope)
                 scope["headers"] = headers
+
+        await self.app(scope, receive, send)
+
+
+class OriginCSRFGuardMiddleware:
+    """Reject cross-origin state-changing requests to the cookie-session surface.
+
+    CORS below is wide open (``allow_origins=["*"]``) only so browser-based MCP
+    clients (e.g. claude.ai) can call ``/mcp`` cross-origin with a Bearer token.
+    That has no business relaxing the Origin for the cookie-session dashboard
+    (``/auth/*``, ``/api/*``, ...): a POST/PUT/DELETE whose ``Origin`` doesn't
+    match its own ``Host`` has no legitimate reason to mutate password/session
+    state there, no matter what the CORS preflight allowed. ``/mcp``,
+    ``/oauth/*`` and ``/.well-known/*`` are exempt — they authenticate via
+    bearer tokens / proof-of-possession (PKCE), not ambient cookies, so a
+    mismatched Origin there isn't a CSRF risk.
+    """
+
+    _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+    _EXEMPT_PREFIXES = ("/oauth/", "/.well-known/")
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        mcp_path_matcher: Callable[[object], bool] = is_mcp_endpoint_path,
+        public_origin: str = "",
+    ) -> None:
+        self.app = app
+        self.mcp_path_matcher = mcp_path_matcher
+        # Optional second proof for browsers/proxies that strip Fetch Metadata:
+        # the persisted external origin is operator-controlled and shared with
+        # OAuth/MCP resource binding. It never overrides an explicit cross-site
+        # Fetch Metadata signal below.
+        self.public_origin = normalize_public_origin(public_origin)
+
+    def _is_exempt(self, path: str) -> bool:
+        if self.mcp_path_matcher(path):
+            return True
+        return any(path.startswith(prefix) for prefix in self._EXEMPT_PREFIXES)
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        method = str(scope.get("method", "GET")).upper()
+        path = str(scope.get("path", ""))
+        if method in self._SAFE_METHODS or self._is_exempt(path):
+            await self.app(scope, receive, send)
+            return
+        raw_headers = [
+            (key.lower(), value) for key, value in scope.get("headers", [])
+        ]
+        headers = dict(raw_headers)
+        origin = _header_text(headers, b"origin")
+        fetch_site = _header_text(headers, b"sec-fetch-site").lower()
+        singular_security_headers = {
+            b"origin",
+            b"host",
+            b"sec-fetch-site",
+            b"forwarded",
+            b"x-forwarded-for",
+            b"x-forwarded-host",
+            b"x-forwarded-proto",
+        }
+        duplicate_security_header = any(
+            sum(1 for key, _value in raw_headers if key == name) > 1
+            for name in singular_security_headers
+        )
+        normalized_origin = _normalize_http_origin(origin) if origin else None
+        # Browsers do not let page JavaScript forge Sec-Fetch-Site.  Its
+        # same-origin value therefore remains useful when a reverse proxy
+        # rewrites Host/scheme but omits X-Forwarded-Host/Proto.  Missing,
+        # navigation-only ("none"), and unknown values retain the Origin
+        # fallback for older clients; non-same-origin browser contexts fail
+        # closed even if they omit Origin.
+        reject = (
+            duplicate_security_header
+            or (bool(origin) and normalized_origin is None)
+            or fetch_site in ("same-site", "cross-site")
+        )
+        if fetch_site != "same-origin" and not reject and origin:
+            own_base = _request_base(scope, headers)
+            allowed_origins = {own_base}
+            if self.public_origin:
+                allowed_origins.add(self.public_origin)
+            reject = (
+                normalized_origin is None or normalized_origin not in allowed_origins
+            )
+        if reject:
+            body = json.dumps({"error": "Cross-origin request rejected"}).encode()
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 403,
+                    "headers": [
+                        [b"content-type", b"application/json"],
+                        [b"content-length", str(len(body)).encode()],
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+            return
         await self.app(scope, receive, send)
 
 
@@ -266,6 +474,43 @@ class NgrokHeaderMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_header)
+
+
+class SecurityHeadersMiddleware:
+    """Apply browser hardening headers to success and error responses."""
+
+    _HEADERS = (
+        (b"content-security-policy", b"frame-ancestors 'none'"),
+        (b"x-frame-options", b"DENY"),
+        (b"x-content-type-options", b"nosniff"),
+        (b"referrer-policy", b"no-referrer"),
+        (
+            b"permissions-policy",
+            b"camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+        ),
+    )
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: dict) -> None:
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers", []))
+                existing = {key.lower() for key, _value in headers}
+                headers.extend(
+                    (key, value)
+                    for key, value in self._HEADERS
+                    if key not in existing
+                )
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 @dataclass
@@ -430,32 +675,60 @@ def build_http_app(
     else:
         raise ValueError(f"HTTP app cannot be built for transport: {transport}")
 
+    mcp_path_matcher = (
+        is_sse_endpoint_path if transport == "sse" else is_mcp_endpoint_path
+    )
+
     install_runtime_lifespan(app, lifecycle)
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
+        OriginCSRFGuardMiddleware,
+        mcp_path_matcher=mcp_path_matcher,
+        public_origin=settings.public_origin,
     )
     app.add_middleware(
         MCPRequestBodyLimitMiddleware,
         max_bytes=settings.max_request_bytes,
+        path_matcher=mcp_path_matcher,
     )
     app.add_middleware(
         ManagementRequestBodyLimitMiddleware,
         max_bytes=settings.max_management_request_bytes,
+        mcp_path_matcher=mcp_path_matcher,
     )
-    app.add_middleware(MCPAcceptShim)
+    if transport == "streamable-http":
+        app.add_middleware(
+            MCPJSONAcceptShim,
+            path_matcher=mcp_path_matcher,
+        )
     app.add_middleware(
         MCPAuthMiddleware,
         auth_required=settings.auth_required,
         token_validator=token_validator,
         auth_mode=settings.auth_mode,
+        path_matcher=mcp_path_matcher,
+        resource_path="/mcp",
+        public_origin=settings.public_origin,
+    )
+    # Starlette wraps middleware in reverse registration order.  CORS must be
+    # outside MCP auth so browser preflights never receive a bare 401 and auth
+    # challenges/errors still carry the appropriate CORS response headers.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        # 携带凭据时，部分浏览器不把通配符视为可读响应头。
+        # 显式暴露 MCP/OAuth 排障需要的字段。
+        expose_headers=[
+            "Mcp-Session-Id",
+            "WWW-Authenticate",
+            "Ngrok-Skip-Browser-Warning",
+        ],
     )
     # Outermost: must still fire on auth-rejected/error responses, not just
     # successful tool calls, so add it last (see NgrokHeaderMiddleware).
     app.add_middleware(NgrokHeaderMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
     app.state.ombre_http_settings = settings
     app.state.ombre_runtime_lifecycle = lifecycle
     return app

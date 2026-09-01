@@ -6,7 +6,7 @@ It is intentionally shadow-only:
 
 - It does not replace the Python runtime.
 - It has no external Rust dependencies.
-- It models the same baseline replay invariants as `src/ledger_replay.py`.
+- It models the same baseline replay invariants as `src/ombrebrain/eventsourcing/ledger_replay.py`.
 - It is meant to become the future FFI/kernel boundary after the replay contract is stable.
 
 Run when Rust is available:
