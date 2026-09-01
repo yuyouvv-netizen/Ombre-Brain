@@ -205,6 +205,18 @@ def _normal_candidate(bucket: dict, *, archived: bool = False) -> dict:
     }
 
 
+def _candidate_rank(candidate: dict) -> tuple[int, float]:
+    """Literal evidence always outranks associative evidence.
+
+    Relevance scores from different retrievers are not perfectly comparable.
+    In particular, a normalized BM25 or semantic candidate can tie a literal
+    hit at the top of its own scale.  A deliberate original-term lookup must
+    therefore win before importance/recency are allowed to settle ties.
+    """
+    match = candidate.get("match") or {}
+    return (1 if match.get("literal") else 0, float(candidate.get("score") or 0.0))
+
+
 async def surface_search(
     query: str,
     max_results: int,
@@ -269,13 +281,44 @@ async def surface_search(
         and bucket.get("metadata", {}).get("type") not in ("feel", "plan", "letter", "archived")
         and _bucket_has_tags(bucket.get("metadata", {}), tag_filter)
     ]
-    ordinary = [_normal_candidate(bucket) for bucket in ordinary_matches]
-    for candidate in ordinary:
+    ordinary_by_id = {
+        str(bucket.get("id") or ""): _normal_candidate(bucket)
+        for bucket in ordinary_matches
+    }
+    for candidate in ordinary_by_id.values():
         # Older adapters do not expose match diagnostics. Infer literal direct
         # hits so deliberate keyword reads still receive one bounded touch.
         if not candidate["match"] and _literal_hit(query, candidate["bucket"]):
             candidate["direct"] = True
             candidate["match"] = {"literal": True, "semantic": 0.0}
+
+    # Do an uncapped literal pass over active Markdown truth.  The manager's
+    # mixed-retriever limit must never drop an exact original-term hit merely
+    # because many associative candidates tied near the top.
+    for bucket in all_active:
+        meta = bucket.get("metadata", {}) or {}
+        bucket_id = str(bucket.get("id") or "")
+        bucket_domains = {str(item).lower() for item in (meta.get("domain") or [])}
+        if (
+            not bucket_id
+            or not _can_surface_search(bucket)
+            or meta.get("type") in ("feel", "plan", "letter", "archived")
+            or (domain_filter and not bucket_domains.intersection(
+                str(item).lower() for item in domain_filter
+            ))
+            or not _bucket_has_tags(meta, tag_filter)
+            or not _literal_hit(query, bucket)
+        ):
+            continue
+        candidate = ordinary_by_id.get(bucket_id) or _normal_candidate(bucket)
+        candidate["direct"] = True
+        candidate["match"] = {
+            **candidate["match"],
+            "literal": True,
+            "direct": True,
+        }
+        ordinary_by_id[bucket_id] = candidate
+    ordinary = list(ordinary_by_id.values())
 
     letters = [
         bucket for bucket in all_active
@@ -304,7 +347,7 @@ async def surface_search(
     # strong semantic hits keep their true rank and are never hidden.
     fresh: list[dict] = []
     inhibited: list[dict] = []
-    for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
+    for candidate in sorted(candidates, key=_candidate_rank, reverse=True):
         bucket_id = str(candidate["bucket"].get("id") or "")
         if (
             candidate["kind"] == "bucket"
