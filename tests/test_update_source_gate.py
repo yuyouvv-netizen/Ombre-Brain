@@ -95,14 +95,25 @@ def test_ci_lock_verification_freezes_package_index_snapshot():
     assert cutoff.tzinfo == timezone.utc
     assert cutoff <= datetime.now(timezone.utc)
 
-    package_cutoffs = re.findall(
-        r"--exclude-newer-package\s+([^\s]+)", step
+    compile_lines = [
+        line.strip()
+        for line in step.splitlines()
+        if line.strip().startswith("uv pip compile ")
+    ]
+    assert len(compile_lines) == 2
+    package_cutoffs = [
+        re.findall(r"--exclude-newer-package\s+([^\s]+)", line)
+        for line in compile_lines
+    ]
+    assert package_cutoffs[0] == package_cutoffs[1], (
+        "两份锁必须使用相同的单包安全快照"
     )
-    assert len(package_cutoffs) == 2, "两份锁必须使用相同的单包安全快照"
-    assert len(set(package_cutoffs)) == 1
-    package_name, _, package_date = package_cutoffs[0].partition("=")
-    assert package_name == "cryptography"
-    assert datetime.fromisoformat(package_date[:-1] + "+00:00") > cutoff
+    parsed_cutoffs = dict(item.partition("=")[::2] for item in package_cutoffs[0])
+    assert set(parsed_cutoffs) == {"cryptography", "anyio"}
+    assert all(
+        datetime.fromisoformat(package_date[:-1] + "+00:00") > cutoff
+        for package_date in parsed_cutoffs.values()
+    )
 
     assert step.count("uv pip compile ") == 2
     assert "--upgrade" not in step
