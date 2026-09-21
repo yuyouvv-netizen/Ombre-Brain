@@ -24,6 +24,7 @@ from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 
 from ombrebrain.policy.surfacing import SurfacePolicyVM
+from tools.i.core import i_surface_blocks
 
 from . import _shared as sh
 
@@ -391,68 +392,15 @@ def register(mcp) -> None:
                             )
                         )
 
-                self_buckets = [
-                    bucket for bucket in all_buckets
-                    if bucket["metadata"].get("type") == "i"
-                    or "__i__" in (bucket["metadata"].get("tags") or [])
-                ]
-                self_buckets.sort(
-                    key=lambda bucket: bucket["metadata"].get("created", ""),
-                    reverse=True,
-                )
-
-                def self_aspect(bucket: dict) -> str:
-                    tags = bucket["metadata"].get("tags") or []
-                    return next(
-                        (
-                            _bounded_text(tag, 100).removeprefix("aspect:")
-                            for tag in tags
-                            if isinstance(tag, str) and tag.startswith("aspect:")
-                        ),
-                        "",
-                    )
-
-                # I is a self-model, not a recency-only diary.  Surface the
-                # newest entry from every populated aspect first, then fill
-                # the remaining dedicated budget by recency.  This prevents
-                # several recent stance entries from crowding out older
-                # nature/patterns entries while keeping SessionStart bounded.
-                latest_by_aspect: dict[str, dict] = {}
-                for bucket in self_buckets:
-                    aspect = self_aspect(bucket)
-                    if aspect and aspect not in latest_by_aspect:
-                        latest_by_aspect[aspect] = bucket
-                coverage_ids = {
-                    bucket["id"] for bucket in latest_by_aspect.values()
-                }
-                self_surface_order = [
-                    *latest_by_aspect.values(),
-                    *(
-                        bucket for bucket in self_buckets
-                        if bucket["id"] not in coverage_ids
-                    ),
-                ]
-                self_token_remaining = min(
+                self_token_budget = min(
                     _SELF_SURFACE_TOKEN_BUDGET, remaining
                 )
-                for bucket in self_surface_order:
-                    meta = bucket["metadata"]
-                    aspect = self_aspect(bucket)
-                    raw = strip_wikilinks(str(bucket.get("content") or ""))
-                    excerpt = raw[:300]
-                    block = _hook_data_block(
-                        bucket,
-                        f"🪞{str(meta.get('created') or '')[:10]}"
-                        f"{f' [{aspect}]' if aspect else ''}\n{excerpt}",
-                        role="self_knowledge_excerpt",
-                        content_truncated=len(excerpt) < len(raw),
-                    )
-                    cost = count_tokens_approx(block) + 2
-                    if cost > self_token_remaining:
-                        continue
+                for block in i_surface_blocks(
+                    all_buckets,
+                    token_budget=self_token_budget,
+                ):
                     if not append_block(block):
                         break
-                    self_token_remaining -= cost
 
                 if not parts:
                     try:
