@@ -75,4 +75,4 @@ async def test_surface_mode_has_dedicated_budget_and_clean_body(monkeypatch):
     assert "self-29" not in surfaced.replace("self-29-content", "")
     assert "=== 我的自我认知（1 条）===" in ordinary
     assert "self-29\n" in ordinary
-    assert ordinary.count("认知") == 400
+    assert ("认知" * 400) in ordinary
