@@ -178,6 +178,86 @@ async def test_hook_caps_provider_calls_and_final_render_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hook_surfaces_all_short_self_entries_within_budget(monkeypatch):
+    aspects = [
+        "stance", "stance", "stance", "patterns", "patterns", "patterns",
+        "patterns", "nature", "nature", "stance", "patterns",
+    ]
+    buckets = [
+        _bucket(
+            f"self-{index}",
+            f"self-{index}-content",
+            type="i",
+            created=f"2026-09-{index + 1:02d}T00:00:00",
+            tags=["__i__", f"aspect:{aspect}"],
+        )
+        for index, aspect in enumerate(aspects)
+    ]
+
+    response = await _handler(monkeypatch, buckets, _EchoDehydrator())(_Request())
+    text = response.body.decode("utf-8")
+
+    assert response.status_code == 200
+    for index in range(len(buckets)):
+        assert f"self-{index}-content" in text
+
+
+@pytest.mark.asyncio
+async def test_hook_covers_self_aspects_before_filling_by_recency(monkeypatch):
+    buckets = [
+        _bucket(
+            "stance-new",
+            "最新立场" + ("立" * 220),
+            type="i",
+            created="2026-09-17T00:00:00",
+            tags=["__i__", "aspect:stance"],
+        ),
+        _bucket(
+            "stance-middle",
+            "次新立场" + ("场" * 220),
+            type="i",
+            created="2026-09-16T00:00:00",
+            tags=["__i__", "aspect:stance"],
+        ),
+        _bucket(
+            "stance-old",
+            "更早立场" + ("观" * 220),
+            type="i",
+            created="2026-09-15T00:00:00",
+            tags=["__i__", "aspect:stance"],
+        ),
+        _bucket(
+            "patterns",
+            "模式维度仍被带入",
+            type="i",
+            created="2026-09-10T00:00:00",
+            tags=["__i__", "aspect:patterns"],
+        ),
+        _bucket(
+            "nature",
+            "本质维度仍被带入",
+            type="i",
+            created="2026-08-01T00:00:00",
+            tags=["__i__", "aspect:nature"],
+        ),
+    ]
+
+    response = await _handler(
+        monkeypatch,
+        buckets,
+        _EchoDehydrator(),
+        {"max_tokens": 500},
+    )(_Request())
+    text = response.body.decode("utf-8")
+
+    assert response.status_code == 200
+    assert "最新立场" in text
+    assert "模式维度仍被带入" in text
+    assert "本质维度仍被带入" in text
+    assert count_tokens_approx(text) <= 500
+
+
+@pytest.mark.asyncio
 async def test_hook_rejects_third_concurrent_provider_job(monkeypatch):
     class BlockingDehydrator:
         def __init__(self):

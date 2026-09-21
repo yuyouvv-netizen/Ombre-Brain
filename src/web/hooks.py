@@ -36,6 +36,7 @@ _HOOK_RATE_SOURCE_LIMIT = 10
 _HOOK_RATE_GLOBAL_LIMIT = 60
 _HOOK_RATE_SOURCE_CAP = 2048
 _HOOK_MIN_BLOCK_TOKENS = 120
+_SELF_SURFACE_TOKEN_BUDGET = 2500
 _hook_slots = threading.BoundedSemaphore(_HOOK_CONCURRENCY)
 _hook_rate_lock = threading.Lock()
 _hook_source_events: OrderedDict[str, deque[float]] = OrderedDict()
@@ -399,10 +400,10 @@ def register(mcp) -> None:
                     key=lambda bucket: bucket["metadata"].get("created", ""),
                     reverse=True,
                 )
-                for bucket in self_buckets[:3]:
-                    meta = bucket["metadata"]
-                    tags = meta.get("tags") or []
-                    aspect = next(
+
+                def self_aspect(bucket: dict) -> str:
+                    tags = bucket["metadata"].get("tags") or []
+                    return next(
                         (
                             _bounded_text(tag, 100).removeprefix("aspect:")
                             for tag in tags
@@ -410,17 +411,48 @@ def register(mcp) -> None:
                         ),
                         "",
                     )
+
+                # I is a self-model, not a recency-only diary.  Surface the
+                # newest entry from every populated aspect first, then fill
+                # the remaining dedicated budget by recency.  This prevents
+                # several recent stance entries from crowding out older
+                # nature/patterns entries while keeping SessionStart bounded.
+                latest_by_aspect: dict[str, dict] = {}
+                for bucket in self_buckets:
+                    aspect = self_aspect(bucket)
+                    if aspect and aspect not in latest_by_aspect:
+                        latest_by_aspect[aspect] = bucket
+                coverage_ids = {
+                    bucket["id"] for bucket in latest_by_aspect.values()
+                }
+                self_surface_order = [
+                    *latest_by_aspect.values(),
+                    *(
+                        bucket for bucket in self_buckets
+                        if bucket["id"] not in coverage_ids
+                    ),
+                ]
+                self_token_remaining = min(
+                    _SELF_SURFACE_TOKEN_BUDGET, remaining
+                )
+                for bucket in self_surface_order:
+                    meta = bucket["metadata"]
+                    aspect = self_aspect(bucket)
                     raw = strip_wikilinks(str(bucket.get("content") or ""))
                     excerpt = raw[:300]
-                    append_block(
-                        _hook_data_block(
-                            bucket,
-                            f"🪞{str(meta.get('created') or '')[:10]}"
-                            f"{f' [{aspect}]' if aspect else ''}\n{excerpt}",
-                            role="self_knowledge_excerpt",
-                            content_truncated=len(excerpt) < len(raw),
-                        )
+                    block = _hook_data_block(
+                        bucket,
+                        f"🪞{str(meta.get('created') or '')[:10]}"
+                        f"{f' [{aspect}]' if aspect else ''}\n{excerpt}",
+                        role="self_knowledge_excerpt",
+                        content_truncated=len(excerpt) < len(raw),
                     )
+                    cost = count_tokens_approx(block) + 2
+                    if cost > self_token_remaining:
+                        continue
+                    if not append_block(block):
+                        break
+                    self_token_remaining -= cost
 
                 if not parts:
                     try:
