@@ -120,7 +120,7 @@ EXPECTED_TOOL_PROPERTIES = {
     "plan": {"content", "status", "related_bucket", "weight", "why_remembered"},
     "letter_write": {"author", "content", "user_name", "title", "date", "ai_name"},
     "letter_read": {"query", "limit", "author", "date_from", "date_to"},
-    "I": {"content", "aspect", "read", "limit"},
+    "I": {"content", "aspect", "read", "limit", "surface"},
     "dream": {"window_hours"},
 }
 
