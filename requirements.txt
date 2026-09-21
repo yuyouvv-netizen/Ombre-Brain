@@ -23,6 +23,9 @@ python-frontmatter>=1.1.0
 # 异步 HTTP 客户端（应用层保活 ping）
 httpx>=0.27.0
 
+# 异步运行时安全下限。4.14.2 修复 4.14.1 的已知安全问题。
+anyio>=4.14.2,<5
+
 # JWT 传递依赖的安全下限。保持为直接约束，使 2.8.4 等只读取 requirements.txt
 # 的旧热更新器也能发现并安装安全迁移；正式安装仍以带 hash 的 lock 为准。
 cryptography>=50.0.1,<51
