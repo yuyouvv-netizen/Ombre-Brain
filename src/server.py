@@ -936,12 +936,19 @@ async def I(
     aspect: Optional[str] = "",
     read: Optional[bool] = False,
     limit: Optional[int] = 20,
+    surface: Optional[bool] = False,
 ) -> str:
-    """记录或读取自我认知条目。content=要记录的自我认知内容(空=进入读取模式)。aspect=维度:nature(本质)/values(看重的)/patterns(规律)/limits(局限)/becoming(变化方向)/uncertainty(不确定的)/stance(立场)(可选)。read=True=读取所有已积累条目。limit=返回条数上限(默认 20)。条目不参与普通 breath/dream；SessionStart 时先附每个已有维度的最新一条，再按时间补入，I 独享最多 2500 tokens。"""
+    """记录或读取自我认知条目。content=要记录的自我认知内容(空=进入读取模式)。aspect=维度:nature(本质)/values(看重的)/patterns(规律)/limits(局限)/becoming(变化方向)/uncertainty(不确定的)/stance(立场)(可选)。read=True=按时间读取，limit=返回条数上限(默认 20)。surface=True=压缩恢复专用：每个已有维度最新一条优先，再按时间补入，独享最多 2500 tokens。条目不参与普通 breath/dream。"""
     return await _with_notice(
-        _t_i.dispatch(content=content, aspect=aspect, read=read, limit=limit),
+        _t_i.dispatch(
+            content=content, aspect=aspect, read=read, limit=limit,
+            surface=surface,
+        ),
         op="I",
-        args={"content_len": len(content or ""), "aspect": aspect, "read": read, "limit": limit},
+        args={
+            "content_len": len(content or ""), "aspect": aspect, "read": read,
+            "limit": limit, "surface": surface,
+        },
     )
 
 

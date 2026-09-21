@@ -25,7 +25,14 @@ from typing import Optional
 from .. import _runtime as rt
 from .._common import check_content_size, check_metadata_size, stored_data_marker
 
+try:
+    from utils import count_tokens_approx, strip_wikilinks  # type: ignore
+except ImportError:  # pragma: no cover
+    from ...utils import count_tokens_approx, strip_wikilinks  # type: ignore
+
 _VALID_ASPECTS = {"nature", "values", "patterns", "limits", "becoming", "uncertainty", "stance"}
+_I_SURFACE_TOKEN_BUDGET = 2500
+_I_SURFACE_EXCERPT_CHARS = 300
 
 
 async def i_core(
@@ -33,11 +40,14 @@ async def i_core(
     aspect: Optional[str] = "",
     read: Optional[bool] = False,
     limit: Optional[int] = 20,
+    surface: Optional[bool] = False,
 ) -> str:
     content = "" if content is None else str(content)
     aspect = "" if aspect is None else str(aspect)
     if read is None:
         read = False
+    if surface is None:
+        surface = False
     try:
         limit = max(1, min(100, int(limit if limit is not None else 20)))
     except (TypeError, ValueError, OverflowError):
@@ -53,8 +63,8 @@ async def i_core(
 
     await rt.decay_engine.ensure_started()
 
-    if read or not content.strip():
-        return await _read_i(limit)
+    if surface or read or not content.strip():
+        return await _read_i(limit, surface=bool(surface))
     if aspect and aspect not in _VALID_ASPECTS:
         choices = ", ".join(sorted(_VALID_ASPECTS))
         return f"aspect 无效：{aspect}。可选值: {choices}"
@@ -95,7 +105,78 @@ async def _write_i(content: str, aspect: str) -> str:
     return f"🪞I {aspect_label}→{bucket_id}"
 
 
-async def _read_i(limit: int) -> str:
+def _i_aspect(bucket: dict) -> str:
+    tags = bucket.get("metadata", {}).get("tags") or []
+    return next(
+        (
+            str(tag)[:100].removeprefix("aspect:")
+            for tag in tags
+            if isinstance(tag, str) and tag.startswith("aspect:")
+        ),
+        "",
+    )
+
+
+def _i_surface_order(i_buckets: list[dict]) -> list[dict]:
+    ordered = sorted(
+        i_buckets,
+        key=lambda bucket: (
+            bucket.get("metadata", {}).get("created")
+            or bucket.get("metadata", {}).get("last_active", "")
+        ),
+        reverse=True,
+    )
+    latest_by_aspect: dict[str, dict] = {}
+    for bucket in ordered:
+        aspect = _i_aspect(bucket)
+        if aspect and aspect not in latest_by_aspect:
+            latest_by_aspect[aspect] = bucket
+    coverage_ids = {
+        str(bucket.get("id") or "") for bucket in latest_by_aspect.values()
+    }
+    return [
+        *latest_by_aspect.values(),
+        *(
+            bucket for bucket in ordered
+            if str(bucket.get("id") or "") not in coverage_ids
+        ),
+    ]
+
+
+def i_surface_blocks(
+    all_buckets: list[dict],
+    *,
+    token_budget: int = _I_SURFACE_TOKEN_BUDGET,
+) -> list[str]:
+    """Render compact-recovery I blocks: aspect coverage first, then recency."""
+
+    remaining = max(0, int(token_budget))
+    i_buckets = [
+        bucket for bucket in all_buckets
+        if bucket.get("metadata", {}).get("type") == "i"
+        or "__i__" in (bucket.get("metadata", {}).get("tags") or [])
+    ]
+    blocks: list[str] = []
+    for bucket in _i_surface_order(i_buckets):
+        meta = bucket.get("metadata", {})
+        aspect = _i_aspect(bucket)
+        raw = strip_wikilinks(str(bucket.get("content") or "")).strip()
+        if not raw:
+            continue
+        excerpt = raw[:_I_SURFACE_EXCERPT_CHARS]
+        block = (
+            f"🪞{str(meta.get('created') or meta.get('last_active') or '')[:10]}"
+            f"{f' [{aspect}]' if aspect else ''}\n{excerpt}"
+        )
+        cost = count_tokens_approx(block) + 2
+        if cost > remaining:
+            continue
+        blocks.append(block)
+        remaining -= cost
+    return blocks
+
+
+async def _read_i(limit: int, *, surface: bool = False) -> str:
     try:
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
@@ -108,6 +189,14 @@ async def _read_i(limit: int) -> str:
 
     if not i_buckets:
         return "还没有任何自我认知记录。"
+
+    if surface:
+        header = "=== 我的自我认知（压缩恢复）==="
+        budget = max(0, _I_SURFACE_TOKEN_BUDGET - count_tokens_approx(header) - 2)
+        blocks = i_surface_blocks(i_buckets, token_budget=budget)
+        if not blocks:
+            return "还没有可在预算内带回的自我认知记录。"
+        return header + "\n\n" + "\n\n".join(blocks)
 
     i_buckets.sort(
         key=lambda b: b.get("metadata", {}).get("last_active", ""),
