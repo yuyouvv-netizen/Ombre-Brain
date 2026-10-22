@@ -41,6 +41,8 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult
+from tools.breath.media import with_saved_images
 
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
@@ -619,19 +621,21 @@ except (AttributeError, RuntimeError, TypeError, ValueError) as _breath_compat_e
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def breath_search(
     query: str,
     domain: Optional[str] = "",
     max_results: Optional[int] = 0,
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
-) -> str:
-    """忘事后的统一检索入口：同时查普通记忆与续接信逐字段落，活跃记忆无答案时再查沉底旧记忆。相关性先过门槛，重要度/近期性只打破同分；逐字返回、跨来源去重，不展示评分。完整 bucket/letter id 可直读原文。domain 逗号分隔；date_from/date_to 按创建时间过滤，支持 YYYY-MM-DD 或 ISO 8601。max_results 默认 search_max_results（fallback matching.max_results/4）。"""
-    return await _with_notice(
+) -> str | CallToolResult:
+    """忘事后的统一检索入口：同时查普通记忆与续接信逐字段落，活跃记忆无答案时再查沉底旧记忆。相关性先过门槛，重要度/近期性只打破同分；逐字返回、跨来源去重，不展示评分。完整 bucket/letter id 可直读原文及已存图片（最多 6 张）；关键词检索和默认浮现不加载图片。domain 逗号分隔；date_from/date_to 按创建时间过滤，支持 YYYY-MM-DD 或 ISO 8601。max_results 默认 search_max_results（fallback matching.max_results/4）。"""
+    media = []
+    text = await _with_notice(
         _t_breath.dispatch(
             query=query, domain=domain, max_results=max_results,
             date_from=date_from, date_to=date_to,
+            media_collector=media,
         ),
         op="breath_search",
         args={
@@ -639,6 +643,7 @@ async def breath_search(
             "date_from": date_from, "date_to": date_to,
         },
     )
+    return await with_saved_images(text, media, bucket_mgr.media_store)
 
 
 @mcp.tool()

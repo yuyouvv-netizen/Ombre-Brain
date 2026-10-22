@@ -304,6 +304,8 @@ feel 桶自身：
 - **Feel 模式** (`feel=True`)：跳过 LLM 分析，自动注入 `__feel__` 标签，写入 `feel/沉淀物/`。`source_bucket` 提供时把源桶标记为 `digested=True` 并写 `model_valence`。返回 `🫧feel→{id}`。
 - **普通模式**：`analyze()` → 用户传入的 `valence`/`arousal` 优先于 LLM 结果（B-09 修复）→ `_merge_or_create(raw_merge=True)`；完全相同正文的重试幂等复用，其它每次 hold 都建独立桶，不做语义自动合并 → 原文落盘后投递 embedding outbox → 异步触发 `_check_plan_resolution()` 扫 active plans。`analyze()` 或 embedding 不可用时只降级元数据/向量索引，正文仍原样落盘；**hold 永远不调 `dehydrate()`/`merge()` 压缩正文**。
 - `meaning` 追加一条“为什么值得被想起”的第一人称含义；`media` 接受持久化前可读取路径或 `data_base64+filename` 项，失败时不写失效引用。
+- 客户端与 OB 不在同一机器时，应由客户端桥读取明确选中的图片并传 `data_base64`，不能只传客户端路径。OB 原有 HTTP body 上限仍生效（默认编码后 4 MiB）。
+- `breath_search(query=完整记忆编号)` 在命中且通过既有范围/预算检查后返回原文与已存图片的 MCP image blocks（最多 6 张，总共 24 MiB，单张 12 MiB）。关键词检索和默认浮现仍只有文字及媒体引用，不自动读图。图片只从持久媒体目录读取，拒绝越界、符号链接、非图片及校验不符的内容；读图失败不影响原文返回。
 - `test_data=True` 只在创建时写入不可后补的可擦除 provenance，并禁止与 pinned/feel 组合；这是 `trace(hard_delete=True)` 唯一允许物理删除的来源边界。
 
 (改动注意：`pinned=True` 走单独分支直接创建到 `permanent/`，importance 强制锁 10，不走合并；用户显式传 valence/arousal=0.0 也算「有效」，必须走 `0 <= v <= 1` 判定，不能用 `if valence` 否则 0.0 会被忽略——这就是 B-09。)

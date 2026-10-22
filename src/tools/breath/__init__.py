@@ -50,6 +50,7 @@ async def dispatch(
     catalog: Optional[bool] = False,
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
+    media_collector: Optional[list] = None,
 ) -> str:
     # --- Null-safe coercion ---
     query = "" if query is None else str(query)
@@ -164,4 +165,5 @@ async def dispatch(
         tag_filter=tag_filter,
         date_from=date_from,
         date_to=date_to,
+        **({"media_collector": media_collector} if media_collector is not None else {}),
     )
