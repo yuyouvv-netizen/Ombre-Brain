@@ -109,7 +109,13 @@ def test_ci_lock_verification_freezes_package_index_snapshot():
         "两份锁必须使用相同的单包安全快照"
     )
     parsed_cutoffs = dict(item.partition("=")[::2] for item in package_cutoffs[0])
-    assert set(parsed_cutoffs) == {"cryptography", "anyio"}
+    assert parsed_cutoffs == {
+        "cryptography": "2026-08-26T00:00:00Z",
+        "anyio": "2026-09-21T23:59:59Z",
+        "mcp": "2026-10-22T16:00:00Z",
+        "pyjwt": "2026-10-22T16:00:00Z",
+        "certifi": "2026-10-22T16:00:00Z",
+    }
     assert all(
         datetime.fromisoformat(package_date[:-1] + "+00:00") > cutoff
         for package_date in parsed_cutoffs.values()
