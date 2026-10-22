@@ -162,6 +162,55 @@ class MediaStore:
             )
         return data
 
+    def _read_stored(self, entry: dict) -> bytes:
+        """Read only inside media_dir; openat rejects symlinks at every level."""
+        raw = Path(str(entry.get("path") or ""))
+        target = raw if raw.is_absolute() else self.vault_dir / raw
+        try:
+            parts = target.relative_to(self.media_dir).parts
+        except ValueError as exc:
+            raise MediaPersistenceError("媒体引用不在持久媒体目录中。") from exc
+        if not parts or any(part in (".", "..", "") for part in parts):
+            raise MediaPersistenceError("媒体引用路径无效。")
+        directory = os.open(self.media_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = None
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            info = os.fstat(fd)
+            limit = min(self.max_bytes, 12 * 1024 * 1024)
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
+                raise MediaPersistenceError("已存图片为空、过大或不是普通文件。")
+            with os.fdopen(fd, "rb") as handle:
+                fd = None
+                data = handle.read(limit + 1)
+            if len(data) != info.st_size or len(data) > limit:
+                raise MediaPersistenceError("已存图片读取不完整。")
+            if entry.get("sha256") and hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                raise MediaPersistenceError("已存图片校验失败。")
+            return data
+        finally:
+            os.close(directory)
+            if fd is not None:
+                os.close(fd)
+
+    async def read_image(self, entry: dict) -> tuple[bytes, str]:
+        data = await asyncio.to_thread(self._read_stored, entry)
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif data.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        elif data.startswith((b"GIF87a", b"GIF89a")):
+            mime = "image/gif"
+        elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            mime = "image/webp"
+        else:
+            raise MediaPersistenceError("这项媒体不是支持的图片。")
+        return data, mime
+
     def _persist_one(self, bucket_id: str, item: Any) -> dict[str, Any]:
         entry = {"path": item} if isinstance(item, str) else dict(item or {})
         mime_type = str(entry.get("type") or entry.get("mime_type") or "")[:128]
@@ -172,7 +221,12 @@ class MediaStore:
             raw_path = str(entry.get("path") or "").strip()
             if not raw_path:
                 raise MediaPersistenceError("media 每项必须提供 path 或 data_base64。")
-            data, source_name = self._read_path(raw_path)
+            # Stable vault-relative references can be retained when replacing media.
+            if raw_path.startswith("_media/"):
+                data = self._read_stored({"path": raw_path})
+                source_name = Path(raw_path).name
+            else:
+                data, source_name = self._read_path(raw_path)
         digest = hashlib.sha256(data).hexdigest()
         suffix = self._suffix(source_name, mime_type)
         target = self._stable_path(bucket_id, digest, suffix)

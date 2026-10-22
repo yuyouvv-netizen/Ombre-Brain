@@ -366,6 +366,7 @@ async def surface_search(
     tag_filter: list,
     date_from: str = "",
     date_to: str = "",
+    media_collector: list | None = None,
 ) -> str:
     domain_filter = [part.strip() for part in domain.split(",") if part.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
@@ -434,12 +435,16 @@ async def surface_search(
                     exact_bucket,
                     _archive_footer(exact_id, exact=True),
                 )
+                if entry_tokens <= max_tokens and media_collector is not None:
+                    media_collector.extend(meta.get("media") or [])
                 return rendered if entry_tokens <= max_tokens else _BUDGET_NOTICE
         elif bucket_type == "letter" and in_scope:
             rendered, entry_tokens = render_stored_bucket(
                 exact_bucket,
                 _letter_footer(exact_bucket, 0, exact=True),
             )
+            if entry_tokens <= max_tokens and media_collector is not None:
+                media_collector.extend(meta.get("media") or [])
             return rendered if entry_tokens <= max_tokens else _BUDGET_NOTICE
         elif (
             bucket_type not in ("feel", "plan")
@@ -461,6 +466,8 @@ async def surface_search(
                     "breath",
                     {"mode": "exact_id", "matches": 1, "chars": len(rendered)},
                 )
+            if media_collector is not None:
+                media_collector.extend(meta.get("media") or [])
             return rendered
 
     vector_scores, semantic_notice = await _semantic_scores(
