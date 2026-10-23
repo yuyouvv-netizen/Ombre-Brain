@@ -63,6 +63,40 @@ def _dashboard_function(name, next_name):
     return html[start:end]
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_photo_cards_escape_labels_and_only_build_local_index_urls():
+    source = _dashboard_function("renderMemoryPhotos", "openMemoryPhoto")
+    script = """
+const BASE = '';
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>\"']/g, function(char) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char];
+  });
+}
+const escAttr = esc;
+""" + source + """
+const cards = renderMemoryPhotos('id/with space', [
+  {index: 2, title: '<img src=x onerror=alert(1)>', note: '\" onclick=alert(1)'},
+  {index: 4},
+  {index: -1}, {index: 'https://outside.test/photo'}, null,
+]);
+process.stdout.write(JSON.stringify({cards, empty:renderMemoryPhotos('id', [])}));
+"""
+    completed = subprocess.run(
+        [shutil.which("node"), "-e", script], check=True,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    result = json.loads(completed.stdout)
+    assert result["empty"] == ""
+    assert result["cards"].count('class="memory-photo"') == 2
+    assert "/api/bucket/id%2Fwith%20space/photo/2" in result["cards"]
+    assert "&lt;img src=x onerror=alert(1)&gt;" in result["cards"]
+    assert "<img src=x" not in result["cards"]
+    assert '&quot; onclick=alert(1)' in result["cards"]
+    assert "未命名照片" in result["cards"]
+    assert "outside.test" not in result["cards"]
+
+
 @pytest.mark.asyncio
 async def test_bucket_detail_preserves_raw_content_and_separates_display_text(
     monkeypatch,

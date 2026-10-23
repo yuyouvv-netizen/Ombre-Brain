@@ -5,6 +5,7 @@ without touching retrieval, ranking, or bucket storage.
 """
 
 from utils import count_tokens_approx
+from ombrebrain.storage.media_store import MediaStore
 
 from .._common import stored_data_marker
 
@@ -21,19 +22,24 @@ def _miss_block(bucket: dict) -> str:
     """Miss: meaning/media 元数据，和 tags/importance 一样是桶的基本信息之一。
 
     meaning 是 list[str]（可能被反复触动过多次），逐条展示，不合并/不改写。
-    media 只给 path/title 元数据，不读取或内联文件内容。
+    media 只提示照片数量、名字与打开方法，不读取或内联文件内容。
     """
     meta = bucket.get("metadata", {}) or {}
     lines = []
     for item in meta.get("meaning") or []:
         if item:
             lines.append(f"💭 meaning: {item}")
-    for m in meta.get("media") or []:
+    media = meta.get("media") or []
+    photos = [item for item in media if MediaStore.is_image_entry(item)]
+    if photos:
+        names = "、".join(MediaStore.image_title(item) for item in photos)
+        lines.append(f"🖼️ 这条有 {len(photos)} 张照片：{names}，用编号打开可以看。")
+    for m in media:
         if not isinstance(m, dict) or not m.get("path"):
             continue
-        title = m.get("title")
-        label = f" ({title})" if title and title != m.get("path") else ""
-        lines.append(f"🖼️ media: {m['path']}{label}")
+        if not MediaStore.is_image_entry(m):
+            title = MediaStore.image_title(m)
+            lines.append(f"📎 附件：{title if title != '未命名照片' else '未命名附件'}")
     return ("\n" + "\n".join(lines)) if lines else ""
 
 

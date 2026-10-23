@@ -145,12 +145,12 @@
 
 `release` 只是从 anchor 状态退出，pinned/importance 不变，桶恢复正常浮现资格。
 
-#### `letter_write(author, content, ...)` / `letter_read(...)` — 我写信、读信
+#### `letter_write(author, content, media=None, ...)` / `letter_read(...)` — 我写信、读信
 
-- `letter_write(author="claude", content="...", title="...")` — 我写给她他。
+- `letter_write(author="claude", content="...", title="...", media=[...])` — 我写给她他；有想随信留下的照片时传 `media`。
 - `letter_write(author="user", content="...", user_name="...")` — 把她他写给我的留下。
 - `author="user"` 表示用户侧，`author="ai"`（或与 `ai_name` 相同）表示 AI 侧；也可以直接传任意自定义署名字符串，读取时可用同一署名过滤。
-- `letter_read()` — 按时间倒序读最近 10 封。
+- `letter_read()` — 按时间倒序读最近 10 封；信里的已存照片会随正文直接返回。
 - `letter_read(query="完整 letter_id")` — 直读一封完整原信。忘记某件事时统一用 `breath_search`，不要在 `breath_search` / `letter_read` 之间猜路径。
 
 **信件原文永久保留，不压缩、不合并、不衰减**。普通 breath 不会浮信件，但 `/breath-hook`（SessionStart）会自动把双方各最新一封带给我。

@@ -31,6 +31,22 @@ class MediaPersistenceError(ValueError):
 class MediaStore:
     """把媒体复制到持久目录，并生成稳定引用。"""
 
+    @staticmethod
+    def is_image_entry(entry: Any) -> bool:
+        """只判断附件元数据，用于展示；实际读取仍须检查文件内容。"""
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            return False
+        return bool(entry["path"]) and (
+            entry.get("type") in ("image/png", "image/jpeg", "image/gif", "image/webp")
+            or Path(entry["path"]).suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp")
+        )
+
+    @staticmethod
+    def image_title(entry: dict) -> str:
+        """没有自取名字时用自然语言占位，不把文件路径当作照片名字。"""
+        title = " ".join(str(entry.get("title") or "").split())[:200]
+        return title if title and title != entry.get("path") else "未命名照片"
+
     def __init__(
         self,
         vault_dir: str,

@@ -27,6 +27,7 @@ breath 中。
 import math
 from typing import Optional
 
+from ombrebrain.storage.media_store import MediaStore
 from .. import _runtime as rt
 from .._common import (
     check_content_size,
@@ -127,6 +128,7 @@ async def letter_write(
     title: Optional[str] = "",
     date: Optional[str] = "",
     ai_name: Optional[str] = "",
+    media: Optional[list | str] = None,
 ) -> str:
     if user_name is None:
         user_name = ""
@@ -184,6 +186,7 @@ async def letter_write(
         name=(title.strip()[:60] or f"{a}_{date.strip() or 'letter'}"),
         bucket_type="letter",
         source_tool="letter",
+        media=media,
     )
     try:
         await rt.bucket_mgr.update(bucket_id, **extra_meta)
@@ -207,6 +210,7 @@ async def letter_read(
     author: Optional[str] = "",
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
+    media_collector: Optional[list] = None,
 ) -> str:
     if query is None:
         query = ""
@@ -309,7 +313,7 @@ async def letter_read(
     if not letters:
         return "没有找到匹配的信件。"
     parts = []
-    for b in letters:
+    for letter_number, b in enumerate(letters, start=1):
         m = b["metadata"]
         a = m.get("author", "?")
         d = (m.get("letter_date") or m.get("created", ""))[:10]
@@ -323,4 +327,18 @@ async def letter_read(
             + "\n"
             + payload
         )
+        if media_collector is not None:
+            photo_number = 0
+            for entry in m.get("media") or []:
+                if not MediaStore.is_image_entry(entry):
+                    continue
+                photo_number += 1
+                display_title = MediaStore.image_title(entry)
+                letter_title = str(title or f"第 {letter_number} 封信").strip()
+                media_collector.append({
+                    **entry,
+                    "_display_label": (
+                        f"《{letter_title}》照片 {photo_number}：{display_title}"
+                    ),
+                })
     return "=== 信件 ===\n" + "\n\n---\n\n".join(parts)

@@ -897,35 +897,39 @@ async def letter_write(
     title: Optional[str] = "",
     date: Optional[str] = "",
     ai_name: Optional[str] = "",
+    media: Optional[list | str] = None,
 ) -> str:
-    """写入一封信。author 必填:\"user\"=用户一方写的,\"ai\"(或等于 ai_name)=AI 一方写的,也可直接传任意署名字符串;user_name 可选;ai_name 可选(默认取环境变量 AI_NAME,回退 \"AI\");title/date 可选。信件原文永久保存,不压缩/不合并/不衰减,仅建向量索引;普通 breath 不返回,SessionStart 钩子会带上双方各最新一封。"""
+    """写入一封信。author 必填:\"user\"=用户一方写的,\"ai\"(或等于 ai_name)=AI 一方写的,也可直接传任意署名字符串;user_name 可选;ai_name 可选(默认取环境变量 AI_NAME,回退 \"AI\");title/date 可选。media 可选，照片原图会复制到持久媒体目录。信件原文与照片永久保存,不压缩/不合并/不衰减,仅建向量索引;普通 breath 不返回,SessionStart 钩子会带上双方各最新一封。"""
     return await _with_notice(
         _t_plan.letter_write(
             author=author, content=content, user_name=user_name,
-            title=title, date=date, ai_name=ai_name,
+            title=title, date=date, ai_name=ai_name, media=media,
         ),
         op="letter_write",
         args={
             "author": author, "content_len": len(content or ""),
             "user_name": user_name, "title": title, "date": date,
             "ai_name": ai_name,
+            "media_count": len(media) if isinstance(media, list) else int(bool(media)),
         },
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def letter_read(
     query: Optional[str] = "",
     limit: Optional[int] = 10,
     author: Optional[str] = "",
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
-) -> str:
-    """按时间/署名读历史信件全文。日常忘事只用 breath_search；letter_read 保留给近期信列表、日期/署名筛选，以及 query=完整 letter id 的全文直读。语义候选有最低阈值；返回原文，不压缩。"""
-    return await _with_notice(
+) -> str | CallToolResult:
+    """按时间/署名读历史信件全文。日常忘事只用 breath_search；letter_read 保留给近期信列表、日期/署名筛选，以及 query=完整 letter id 的全文直读。语义候选有最低阈值；返回原文和命中信件里的已存照片，不压缩。"""
+    media = []
+    text = await _with_notice(
         _t_plan.letter_read(
             query=query, limit=limit, author=author,
             date_from=date_from, date_to=date_to,
+            media_collector=media,
         ),
         op="letter_read",
         args={
@@ -933,6 +937,7 @@ async def letter_read(
             "date_from": date_from, "date_to": date_to,
         },
     )
+    return await with_saved_images(text, media, bucket_mgr.media_store)
 
 
 @mcp.tool()
