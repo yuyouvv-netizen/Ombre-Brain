@@ -23,7 +23,7 @@ from .hints import build_connection_hint, build_crystal_hint
 from .output import format_dream_output
 
 
-async def dispatch(window_hours: Optional[int] = 48) -> str:
+async def dispatch(window_hours: Optional[int] = 48, media_collector: Optional[list] = None) -> str:
     await rt.decay_engine.ensure_started()
 
     try:
@@ -48,6 +48,7 @@ async def dispatch(window_hours: Optional[int] = 48) -> str:
         connection_hint=connection_hint,
         crystal_hint=crystal_hint,
         core_context=core_context,
+        media_collector=media_collector,
     )
 
     if rt.fire_webhook:

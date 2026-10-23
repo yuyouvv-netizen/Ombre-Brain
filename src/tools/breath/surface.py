@@ -33,6 +33,7 @@ from .. import _runtime as rt
 from utils import parse_bool, parse_iso_datetime
 from ._verbatim import render_stored_bucket
 from .recent import record_surfaced
+from .media import collect_saved_images
 
 # U-07 fix: throttle the sampling-fallback INFO log to once per 5 minutes.
 # 库小且 sampling=ON 时此分支每次 breath 都触发，原本会刷屏；改为 ≥300s
@@ -62,7 +63,7 @@ def _budget_notice(*, omitted: int, used: int, limit: int) -> str:
     return _BUDGET_NOTICE.format(omitted=omitted, used=used, limit=limit)
 
 
-async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -> str:
+async def surface_default(max_results: int, max_tokens: int, tag_filter: list, media_collector: list | None = None) -> str:
     try:
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
@@ -104,6 +105,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                 primary_omitted += 1
                 continue
             pinned_results.append(rendered)
+            collect_saved_images(b, media_collector)
             token_budget -= entry_tokens
         except Exception as e:
             rt.logger.warning(f"Failed to render pinned bucket / 钉选桶渲染失败: {e}")
@@ -229,6 +231,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                 primary_omitted += 1
                 continue
             dynamic_results.append(rendered)
+            collect_saved_images(b, media_collector)
             shown_ordinary_ids.append(b["id"])
             token_budget -= entry_tokens
         except Exception as e:
@@ -293,6 +296,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                     if entry_tokens > token_budget:
                         continue
                     passive_results.append(rendered)
+                    collect_saved_images(b, media_collector)
                     shown_ordinary_ids.append(b["id"])
                     token_budget -= entry_tokens
                 except Exception as e:
@@ -326,6 +330,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                         if entry_tokens > token_budget:
                             continue
                         dream_results.append(rendered)
+                        collect_saved_images(b, media_collector)
                         shown_ordinary_ids.append(b["id"])
                         token_budget -= entry_tokens
                         rt.logger.info(f"Dream surface triggered / 偶遇机制触发: {b['id']}")

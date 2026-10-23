@@ -567,7 +567,7 @@ _tools_runtime.init(
 # MCP 工具 —— 仅注册，实现见 tools/<tool>/
 # 每个入口都不超过 10 行，便于一眼看清参数与归属
 # =============================================================
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def breath(
     query: Optional[str] = "",
     max_tokens: Optional[int] = 0,
@@ -578,10 +578,12 @@ async def breath(
     importance_min: Optional[int] = -1,
     tags: Optional[str] = "",
     catalog: Optional[bool] = False,
-) -> str:
-    """无参数,睁眼看看自己记得什么:返回权重最高、未解决且未标记 digested 的记忆 + 置顶核心准则。digested 从默认/被动浮现及 dream 隐藏，仍可由 breath_search(query=...) 显式找回。0 参数是刻意设计——claude.ai 按需加载工具时会跳过参数复杂的工具,拆成 0 参数才能保证每次对话自动浮现,不用手动触发。要按关键词找记忆用 breath_search(query=...);要用 catalog/tags/importance_min/valence/arousal/max_tokens 等高级模式用 breath_advanced(...)。"""
-    return await _with_notice(
+) -> str | CallToolResult:
+    """无参数,睁眼看看自己记得什么；已存照片随正文直接返回（最多 6 张 / 24 MiB）:返回权重最高、未解决且未标记 digested 的记忆 + 置顶核心准则。digested 从默认/被动浮现及 dream 隐藏，仍可由 breath_search(query=...) 显式找回。0 参数是刻意设计——claude.ai 按需加载工具时会跳过参数复杂的工具,拆成 0 参数才能保证每次对话自动浮现,不用手动触发。要按关键词找记忆用 breath_search(query=...);要用 catalog/tags/importance_min/valence/arousal/max_tokens 等高级模式用 breath_advanced(...)。"""
+    media = []
+    text = await _with_notice(
         _t_breath.dispatch(
+            media_collector=media,
             query=query, max_tokens=max_tokens, domain=domain,
             valence=valence, arousal=arousal, max_results=max_results,
             importance_min=importance_min, tags=tags, catalog=catalog,
@@ -593,6 +595,7 @@ async def breath(
             "importance_min": importance_min, "tags": tags, "catalog": catalog,
         },
     )
+    return await with_saved_images(text, media, bucket_mgr.media_store)
 
 
 # Keep the advertised schema parameter-free so claude.ai still auto-loads the
@@ -629,7 +632,7 @@ async def breath_search(
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
 ) -> str | CallToolResult:
-    """忘事后的统一检索入口：同时查普通记忆与续接信逐字段落，活跃记忆无答案时再查沉底旧记忆。相关性先过门槛，重要度/近期性只打破同分；逐字返回、跨来源去重，不展示评分。完整 bucket/letter id 可直读原文及已存图片（最多 6 张）；关键词检索和默认浮现不加载图片。domain 逗号分隔；date_from/date_to 按创建时间过滤，支持 YYYY-MM-DD 或 ISO 8601。max_results 默认 search_max_results（fallback matching.max_results/4）。"""
+    """忘事后的统一检索入口：同时查普通记忆与续接信逐字段落，活跃记忆无答案时再查沉底旧记忆。相关性先过门槛，重要度/近期性只打破同分；逐字返回、跨来源去重，不展示评分。完整 bucket/letter id 可直读原文及已存图片（最多 6 张）；关键词检索和默认浮现也随正文返回已存照片，不必再按编号打开；每次最多 6 张 / 24 MiB。domain 逗号分隔；date_from/date_to 按创建时间过滤，支持 YYYY-MM-DD 或 ISO 8601。max_results 默认 search_max_results（fallback matching.max_results/4）。"""
     media = []
     text = await _with_notice(
         _t_breath.dispatch(
@@ -646,7 +649,7 @@ async def breath_search(
     return await with_saved_images(text, media, bucket_mgr.media_store)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def breath_advanced(
     query: Optional[str] = "",
     max_tokens: Optional[int] = 0,
@@ -659,10 +662,12 @@ async def breath_advanced(
     catalog: Optional[bool] = False,
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
-) -> str:
-    """breath 完整参数版。无 query 时保留既有浮现策略与 breath 配额；有 query 时统一检索普通桶、续接信逐字段落，并仅在活跃记忆无答案时回退沉底旧记忆，使用独立 search 配额。命中正文逐字返回，正文在前、操作 ID 在末尾，不展示 Footprint、权重、importance 数值或相似度；max_tokens 不足时整桶省略。catalog=True 只返回元数据。date_from/date_to 按创建时间过滤。domain 逗号分隔；valence/arousal 只作相关候选同分项；importance_min 按稳定重要度读取；tags 为 AND 过滤。"""
-    return await _with_notice(
+) -> str | CallToolResult:
+    """breath 完整参数版。无 query 时保留既有浮现策略与 breath 配额；有 query 时统一检索普通桶、续接信逐字段落，并仅在活跃记忆无答案时回退沉底旧记忆，使用独立 search 配额。命中正文逐字返回，正文在前、操作 ID 在末尾，不展示 Footprint、权重、importance 数值或相似度；max_tokens 不足时整桶省略。照片随命中正文直接返回（最多 6 张 / 24 MiB）；catalog=True 只返回元数据，不加载图片。date_from/date_to 按创建时间过滤。domain 逗号分隔；valence/arousal 只作相关候选同分项；importance_min 按稳定重要度读取；tags 为 AND 过滤。"""
+    media = []
+    text = await _with_notice(
         _t_breath.dispatch(
+            media_collector=media,
             query=query, max_tokens=max_tokens, domain=domain,
             valence=valence, arousal=arousal, max_results=max_results,
             importance_min=importance_min, tags=tags, catalog=catalog,
@@ -676,6 +681,7 @@ async def breath_advanced(
             "date_from": date_from, "date_to": date_to,
         },
     )
+    return await with_saved_images(text, media, bucket_mgr.media_store)
 
 
 @mcp.tool()
@@ -823,17 +829,19 @@ except (AttributeError, RuntimeError, TypeError, ValueError) as _trace_schema_ex
     )
 
 
-@mcp.tool()
-async def dream(window_hours: Optional[int] = 48) -> str:
+@mcp.tool(structured_output=False)
+async def dream(window_hours: Optional[int] = 48) -> str | CallToolResult:
     """读取最近 window_hours（默认 48h）内有变动的所有记忆桶,用于回顾与消化。
-    每个桶返回其在窗口内的最新内容（按 last_active 取）,完整正文不截断。
+    每个桶返回其在窗口内的最新内容（按 last_active 取）,完整正文不截断，已存照片随正文直接返回（最多 6 张 / 24 MiB）。
     可据此操作：放下的 → trace(resolved=1) 沉底；有沉淀的 → hold(feel=True, source_bucket=...) 记录；无沉淀则不操作。
     候选桶超过 40 时按 decay_engine.calculate_score() 排序取前 40，避免一次返回过多。"""
-    return await _with_notice(
-        _t_dream.dispatch(window_hours=window_hours),
+    media = []
+    text = await _with_notice(
+        _t_dream.dispatch(window_hours=window_hours, media_collector=media),
         op="dream",
         args={"window_hours": window_hours},
     )
+    return await with_saved_images(text, media, bucket_mgr.media_store)
 
 
 @mcp.tool()

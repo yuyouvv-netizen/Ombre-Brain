@@ -7,7 +7,7 @@ import pytest
 from mcp.types import CallToolResult
 
 from ombrebrain.storage.media_store import MediaStore
-from tools.breath.media import with_saved_images
+from tools.breath.media import collect_saved_images, with_saved_images
 from tools.breath._verbatim import render_stored_bucket
 
 
@@ -20,7 +20,8 @@ def test_photo_hint_keeps_body_and_id_without_file_paths():
     ]}}
     rendered, _ = render_stored_bucket(bucket, "[bucket_id:photo-memory]")
     assert rendered.startswith(bucket["content"] + "\n")
-    assert "这条有 1 张照片：老婆的脸，用编号打开可以看。" in rendered
+    assert "这条有 1 张照片：老婆的脸。" in rendered
+    assert "用编号打开" not in rendered
     assert "[bucket_id:photo-memory]" in rendered
     assert "_media/" not in rendered
     bucket["metadata"]["media"].extend([
@@ -166,7 +167,7 @@ async def test_hash_mismatch_missing_and_limits_preserve_text(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_only_in_scope_exact_id_collects_images(monkeypatch, bucket_mgr):
+async def test_only_returned_in_scope_memories_collect_images(monkeypatch, bucket_mgr):
     import tools._runtime as rt
     from tools.breath import dispatch
     monkeypatch.setattr(rt, "config", {"surfacing": {}})
@@ -182,14 +183,23 @@ async def test_only_in_scope_exact_id_collects_images(monkeypatch, bucket_mgr):
     text = await dispatch(query=bucket_id, media_collector=entries)
     assert "selected photo fixture" in text
     assert len(entries) == 1
-    for args in [{"query": "selected photo"}, {"query": bucket_id, "domain": "other"}, {"query": bucket_id, "date_from": "2099-01-01"}, {"query": bucket_id, "max_tokens": 1}, {"query": bucket_id, "catalog": True}]:
+    entries = []
+    text = await dispatch(query="selected photo", media_collector=entries)
+    assert "selected photo fixture" in text
+    assert len(entries) == 1
+    assert bucket_id in entries[0]["_display_label"]
+    for args in [{"query": bucket_id, "domain": "other"}, {"query": bucket_id, "date_from": "2099-01-01"}, {"query": bucket_id, "max_tokens": 1}, {"query": bucket_id, "catalog": True}, {"query": "selected photo", "max_tokens": 1}]:
         entries = []
         await dispatch(**args, media_collector=entries)
         assert entries == []
 
 
 @pytest.mark.asyncio
-async def test_mcp_boundary_keeps_native_image_blocks(monkeypatch, bucket_mgr):
+@pytest.mark.parametrize("tool,args", [
+    ("breath", {}), ("breath_search", {"query": "fixture"}),
+    ("breath_advanced", {"query": "fixture"}), ("dream", {}),
+])
+async def test_mcp_boundary_keeps_native_image_blocks(monkeypatch, bucket_mgr, tool, args):
     import server
     entries = await bucket_mgr.media_store.persist("fixture", [{"data_base64": base64.b64encode(PNG).decode(), "filename": "photo.png"}])
 
@@ -198,8 +208,9 @@ async def test_mcp_boundary_keeps_native_image_blocks(monkeypatch, bucket_mgr):
         return "verbatim result"
 
     monkeypatch.setattr(server._t_breath, "dispatch", dispatch)
+    monkeypatch.setattr(server._t_dream, "dispatch", dispatch)
     monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
-    result = await server.mcp.call_tool("breath_search", {"query": "fixture"})
+    result = await server.mcp.call_tool(tool, args)
     # FastMCP versions may return CallToolResult directly or a content tuple.
     if isinstance(result, CallToolResult):
         content = result.content
@@ -211,3 +222,78 @@ async def test_mcp_boundary_keeps_native_image_blocks(monkeypatch, bucket_mgr):
     images = [item for item in content if item.type == "image"]
     assert len(images) == 1
     assert base64.b64decode(images[0].data) == PNG
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args,kind", [
+    ({}, "dynamic"),
+    ({}, "permanent"),
+    ({"importance_min": 5}, "dynamic"),
+    ({"domain": "feel"}, "feel"),
+])
+async def test_surface_modes_attach_only_visible_budgeted_photos(monkeypatch, bucket_mgr, args, kind):
+    import tools._runtime as rt
+    from tools.breath import dispatch
+
+    monkeypatch.setattr(rt, "config", {"surfacing": {}})
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "decay_engine", SimpleNamespace(
+        ensure_started=AsyncMock(), calculate_score=lambda _: 10,
+    ))
+    monkeypatch.setattr(rt, "logger", MagicMock())
+    monkeypatch.setattr(rt, "fire_webhook", None)
+    monkeypatch.setattr(rt, "mark_op", None)
+    monkeypatch.setattr(rt, "record_v3_tool_event", lambda *_args, **_kwargs: None)
+    bucket_id = await bucket_mgr.create(
+        content="今天留下的照片和原文", bucket_type=kind,
+        media=[{"data_base64": base64.b64encode(PNG).decode(), "filename": "photo.png"}],
+    )
+    media = []
+    text = await dispatch(**args, media_collector=media)
+    assert "今天留下的照片和原文" in text
+    assert len(media) == 1
+    assert media[0]["_bucket_id"] == bucket_id
+    result = await with_saved_images(text, media, bucket_mgr.media_store)
+    assert any(block.type == "image" for block in result.content)
+    for extra in [{"max_tokens": 1}, {"catalog": True}]:
+        media = []
+        await dispatch(**args, **extra, media_collector=media)
+        assert media == []
+
+
+def test_collector_deduplicates_and_does_not_mutate_metadata():
+    entry = {"path": "_media/example/one.png", "title": "同一张照片"}
+    bucket = {"id": "example", "metadata": {"media": [
+        entry, entry.copy(), {"path": "_media/example/audio.ogg"},
+    ]}}
+    media = []
+    collect_saved_images(bucket, media)
+    collect_saved_images(bucket, media)
+    assert len(media) == 1
+    assert "_bucket_id" not in entry
+    assert "example" in media[0]["_display_label"]
+
+
+def test_dream_photos_follow_rendered_bodies_and_budget(monkeypatch):
+    import tools._runtime as rt
+    from tools.dream.output import format_dream_output
+
+    monkeypatch.setattr(rt, "config", {"surfacing": {"dream_max_tokens": 1000}})
+    monkeypatch.setattr(rt, "logger", MagicMock())
+    def bucket(bid, content):
+        return {"id": bid, "content": content, "metadata": {
+            "type": "dynamic", "media": [{"path": f"_media/{bid}/one.png"}],
+        }}
+    shown = bucket("shown", "应该一起看到的原文和照片")
+    omitted = bucket("omitted", "太长的记忆" * 5000)
+    core = bucket("core", "核心记忆")
+    media = []
+    text = format_dream_output(
+        recent=[shown, omitted], all_buckets=[], window_hours=48,
+        connection_hint="", crystal_hint="", core_context=[core],
+        media_collector=media,
+    )
+    assert shown["content"] in text
+    assert omitted["content"] not in text
+    assert {entry["_bucket_id"] for entry in media} == {"shown", "core"}
+    assert "_media/" not in text

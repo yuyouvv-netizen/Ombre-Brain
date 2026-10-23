@@ -24,6 +24,7 @@ tools/breath/importance.py — importance_min 模式
 from .. import _runtime as rt
 from .._common import is_importance_audit_candidate
 from ._verbatim import render_stored_bucket
+from .media import collect_saved_images
 
 _BUDGET_NOTICE = "token 预算不足：下一条重要记忆未被截断或摘要，请提高 max_tokens 后重试。"
 
@@ -110,7 +111,7 @@ def _select_importance_buckets(buckets: list[dict], importance_min: int, limit: 
     return sorted(selected, key=_importance_sort_key, reverse=True)
 
 
-async def surface_by_importance(importance_min: int, max_tokens: int, tag_filter: list) -> str:
+async def surface_by_importance(importance_min: int, max_tokens: int, tag_filter: list, media_collector: list | None = None) -> str:
     try:
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
@@ -139,6 +140,7 @@ async def surface_by_importance(importance_min: int, max_tokens: int, tag_filter
                 budget_blocked = True
                 break
             results.append(rendered)
+            collect_saved_images(b, media_collector)
             token_used += entry_tokens
         except Exception as e:
             rt.logger.warning(f"importance_min bucket processing failed: {e}")

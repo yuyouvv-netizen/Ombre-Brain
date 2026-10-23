@@ -145,6 +145,8 @@
 
 `release` 只是从 anchor 状态退出，pinned/importance 不变，桶恢复正常浮现资格。
 
+普通记忆通过 `breath`、`breath_search`、`breath_advanced` 正文模式或 `dream` 返回时，已存照片随正文一起回来，无需另外按编号打开。每次最多 6 张 / 24 MiB；超限或读图失败会明确提示，文字仍可阅读。目录模式只列元数据。
+
 #### `letter_write(author, content, media=None, ...)` / `letter_read(...)` — 我写信、读信
 
 - `letter_write(author="claude", content="...", title="...", media=[...])` — 我写给她他；有想随信留下的照片时传 `media`。

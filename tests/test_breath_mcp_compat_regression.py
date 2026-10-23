@@ -53,6 +53,7 @@ async def test_public_breath_schema_stays_empty_but_cached_query_args_are_forwar
 
     assert output == "query-dispatched"
     assert seen == {
+        "media_collector": [],
         "query": QUERY,
         "max_tokens": 6000,
         "domain": "",
@@ -109,6 +110,7 @@ async def test_parameter_free_breath_still_dispatches_with_all_defaults(monkeypa
 
     assert await tool.run({}) == "default-dispatched"
     assert seen == {
+        "media_collector": [],
         "query": "",
         "max_tokens": 0,
         "domain": "",

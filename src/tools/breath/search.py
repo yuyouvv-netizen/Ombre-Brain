@@ -20,6 +20,7 @@ from ombrebrain.policy.surfacing import SurfacePolicyVM
 from utils import parse_iso_datetime
 
 from .. import _runtime as rt
+from .media import collect_saved_images
 from ._verbatim import render_stored_bucket
 from .recent import should_touch, was_recently_surfaced
 
@@ -436,7 +437,7 @@ async def surface_search(
                     _archive_footer(exact_id, exact=True),
                 )
                 if entry_tokens <= max_tokens and media_collector is not None:
-                    media_collector.extend(meta.get("media") or [])
+                    collect_saved_images(exact_bucket, media_collector)
                 return rendered if entry_tokens <= max_tokens else _BUDGET_NOTICE
         elif bucket_type == "letter" and in_scope:
             rendered, entry_tokens = render_stored_bucket(
@@ -444,7 +445,7 @@ async def surface_search(
                 _letter_footer(exact_bucket, 0, exact=True),
             )
             if entry_tokens <= max_tokens and media_collector is not None:
-                media_collector.extend(meta.get("media") or [])
+                collect_saved_images(exact_bucket, media_collector)
             return rendered if entry_tokens <= max_tokens else _BUDGET_NOTICE
         elif (
             bucket_type not in ("feel", "plan")
@@ -467,7 +468,7 @@ async def surface_search(
                     {"mode": "exact_id", "matches": 1, "chars": len(rendered)},
                 )
             if media_collector is not None:
-                media_collector.extend(meta.get("media") or [])
+                collect_saved_images(exact_bucket, media_collector)
             return rendered
 
     vector_scores, semantic_notice = await _semantic_scores(
@@ -617,7 +618,7 @@ async def surface_search(
         if candidate["kind"] == "letter":
             pseudo = {
                 "id": bucket_id,
-                "metadata": {},
+                "metadata": {"media": (bucket.get("metadata") or {}).get("media", [])},
                 "content": candidate["content"],
             }
             rendered, entry_tokens = render_stored_bucket(
@@ -643,6 +644,7 @@ async def surface_search(
             budget_blocked = True
             break
         results.append(rendered)
+        collect_saved_images(bucket, media_collector)
         token_used += entry_tokens
         if (
             candidate["kind"] == "bucket"

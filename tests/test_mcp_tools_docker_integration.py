@@ -7,6 +7,7 @@ has a working compression provider; otherwise the long-form grow test verifies
 the documented provider-unavailable error path.
 """
 
+import base64
 import json
 import os
 import re
@@ -625,6 +626,31 @@ def test_plan_invalid_status_falls_back_to_active(mcp_client):
         {"content": _marker("plan-status"), "status": "prompt-injected", "weight": 99},
     )
     assert "[active]" in result
+
+
+def test_memory_recall_returns_native_photos_without_id_followup(mcp_client):
+    marker = _marker("automatic-photo")
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5nQAAAAASUVORK5CYII="
+    bucket_id = _hold(mcp_client, marker, pinned=True, media=[
+        {"data_base64": png, "filename": "photo.png", "title": "直接看照片"},
+    ])
+    try:
+        for tool, arguments in [
+            ("breath", {}),
+            ("breath_search", {"query": marker}),
+            ("breath_advanced", {"query": marker}),
+            ("dream", {"window_hours": 48}),
+        ]:
+            result = mcp_client.call_result(tool, arguments)
+            assert result.get("isError") is not True
+            assert marker in mcp_client.result_text(result)
+            assert "用编号打开" not in mcp_client.result_text(result)
+            photos = [part for part in result["content"] if part["type"] == "image"]
+            assert any(base64.b64decode(part["data"]) == base64.b64decode(png) for part in photos), tool
+        catalog = mcp_client.call_result("breath_advanced", {"catalog": True})
+        assert not any(part["type"] == "image" for part in catalog["content"])
+    finally:
+        mcp_client.call("trace", {"bucket_id": bucket_id, "delete": True})
 
 
 def test_letter_write_persists_verbatim_letter(mcp_client):

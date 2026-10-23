@@ -136,7 +136,10 @@ async def dispatch(
 
     # --- Feel 通道优先：即使无 query 也直接拉 feel ---
     if domain.strip().lower() == "feel":
-        return await surface_feels(max_tokens=max_tokens)
+        return await surface_feels(
+            max_tokens=max_tokens,
+            **({"media_collector": media_collector} if media_collector is not None else {}),
+        )
 
     # --- importance_min 模式：跳过语义，按 importance 降序 ---
     if importance_min >= 1:
@@ -144,6 +147,7 @@ async def dispatch(
             importance_min=importance_min,
             max_tokens=max_tokens,
             tag_filter=tag_filter,
+            **({"media_collector": media_collector} if media_collector is not None else {}),
         )
 
     # --- 无 query：浮现模式 ---
@@ -152,6 +156,7 @@ async def dispatch(
             max_results=max_results,
             max_tokens=max_tokens,
             tag_filter=tag_filter,
+            **({"media_collector": media_collector} if media_collector is not None else {}),
         )
 
     # --- 有 query：检索模式 ---
