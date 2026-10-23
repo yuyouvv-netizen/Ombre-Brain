@@ -1,8 +1,30 @@
-"""Attach saved photos only to explicitly opened, in-scope memory IDs."""
+"""只把本次实际返回正文的记忆照片附为原生图片块。"""
 
 import base64
 
 from mcp.types import CallToolResult, ImageContent, TextContent
+from ombrebrain.storage.media_store import MediaStore
+
+
+def collect_saved_images(bucket: dict, collector: list | None) -> None:
+    """正文通过过滤与预算后收集照片；保留来源，不修改存储元数据。"""
+    if collector is None:
+        return
+    meta = bucket.get("metadata") or {}
+    bucket_id = str(bucket.get("id") or "")
+    seen = {(item.get("_bucket_id"), item.get("path")) for item in collector if isinstance(item, dict)}
+    for entry in meta.get("media") or []:
+        if not MediaStore.is_image_entry(entry):
+            continue
+        key = (bucket_id, entry["path"])
+        if key in seen:
+            continue
+        seen.add(key)
+        collector.append({
+            **entry,
+            "_bucket_id": bucket_id,
+            "_display_label": f"[bucket_id:{bucket_id}] 照片：{MediaStore.image_title(entry)}",
+        })
 
 
 async def with_saved_images(text: str, entries: list, store):

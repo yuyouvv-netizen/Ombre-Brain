@@ -32,6 +32,8 @@ import re
 
 from .. import _runtime as rt
 from utils import count_tokens_approx
+from ..breath.media import collect_saved_images
+from ..breath._verbatim import _miss_block
 
 
 _IMPERATIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -188,6 +190,7 @@ def format_dream_output(
     connection_hint: str,
     crystal_hint: str,
     core_context: list | None = None,
+    media_collector: list | None = None,
 ) -> str:
     runtime_config = rt.config if isinstance(rt.config, dict) else {}
     surfacing_cfg = runtime_config.get("surfacing", {}) or {}
@@ -198,18 +201,7 @@ def format_dream_output(
     dream_budget = max(1_000, min(50_000, dream_budget))
 
     def _miss_lines(meta: dict) -> str:
-        # Miss: meaning 逐条原样展示，不压缩/不改写；media 只给 path/title 元数据。
-        lines = []
-        for item in meta.get("meaning") or []:
-            if item:
-                lines.append(f"💭 meaning: {item}")
-        for m in meta.get("media") or []:
-            if not isinstance(m, dict) or not m.get("path"):
-                continue
-            title = m.get("title")
-            label = f"（{title}）" if title and title != m.get("path") else ""
-            lines.append(f"🖼️ media: {m['path']}{label}")
-        return ("\n" + "\n".join(lines)) if lines else ""
+        return _miss_block({"metadata": meta})
 
     parts = []
     for b in recent:
@@ -259,10 +251,11 @@ def format_dream_output(
 
     recent_added = 0
     recent_omitted = 0
-    for block in parts:
+    for bucket, block in zip(recent, parts):
         separator = "" if recent_added == 0 else "\n---\n"
         if append_fragment(separator + block):
             recent_added += 1
+            collect_saved_images(bucket, media_collector)
         else:
             recent_omitted += 1
     if recent_omitted:
@@ -294,6 +287,7 @@ def format_dream_output(
             candidate = core_prefix + "\n---\n".join(candidate_lines)
             if count_tokens_approx(final_text + candidate) <= dream_budget:
                 core_lines.append(block)
+                collect_saved_images(b, media_collector)
             else:
                 core_omitted += 1
         if core_lines:
@@ -381,6 +375,7 @@ def format_dream_output(
                 "或 trace 访问。\n\n"
             )
             feel_lines: list[str] = []
+            feel_media: list = []
             omitted = 0
 
             def render_feel_block(lines: list[str], footer: str = "") -> str:
@@ -400,6 +395,7 @@ def format_dream_output(
                     render_feel_block([*feel_lines, full_block])
                 ) <= feel_budget:
                     feel_lines.append(full_block)
+                    collect_saved_images(f, feel_media)
                     continue
 
                 snippet = fcontent_full.replace("\n", " ")[:40]
@@ -415,6 +411,7 @@ def format_dream_output(
                     render_feel_block([*feel_lines, collapsed_block])
                 ) <= feel_budget:
                     feel_lines.append(collapsed_block)
+                    collect_saved_images(f, feel_media)
                 else:
                     omitted += 1
 
@@ -426,7 +423,8 @@ def format_dream_output(
                         render_feel_block(feel_lines, candidate_footer)
                     ) <= feel_budget:
                         footer = candidate_footer
-                append_fragment(render_feel_block(feel_lines, footer))
+                if append_fragment(render_feel_block(feel_lines, footer)) and media_collector is not None:
+                    media_collector.extend(feel_media)
     except Exception as e:
         rt.logger.warning(f"Dream feel history failed: {e}")
 

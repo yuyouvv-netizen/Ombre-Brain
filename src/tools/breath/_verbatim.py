@@ -22,7 +22,7 @@ def _miss_block(bucket: dict) -> str:
     """Miss: meaning/media 元数据，和 tags/importance 一样是桶的基本信息之一。
 
     meaning 是 list[str]（可能被反复触动过多次），逐条展示，不合并/不改写。
-    media 只提示照片数量、名字与打开方法，不读取或内联文件内容。
+    此处只渲染照片数量和名字，图片由工具边界随正文返回。
     """
     meta = bucket.get("metadata", {}) or {}
     lines = []
@@ -33,7 +33,7 @@ def _miss_block(bucket: dict) -> str:
     photos = [item for item in media if MediaStore.is_image_entry(item)]
     if photos:
         names = "、".join(MediaStore.image_title(item) for item in photos)
-        lines.append(f"🖼️ 这条有 {len(photos)} 张照片：{names}，用编号打开可以看。")
+        lines.append(f"🖼️ 这条有 {len(photos)} 张照片：{names}。")
     for m in media:
         if not isinstance(m, dict) or not m.get("path"):
             continue

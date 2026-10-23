@@ -21,9 +21,10 @@ tools/breath/feel.py — feel 通道
 
 from .. import _runtime as rt
 from ._verbatim import render_stored_bucket
+from .media import collect_saved_images
 
 
-async def surface_feels(max_tokens: int) -> str:
+async def surface_feels(max_tokens: int, media_collector: list | None = None) -> str:
     try:
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
         feels = [b for b in all_buckets if b.get("metadata", {}).get("type") == "feel"]
@@ -41,6 +42,7 @@ async def surface_feels(max_tokens: int) -> str:
             )
             if used + cost <= max_tokens:
                 full_lines.append(full_entry)
+                collect_saved_images(f, media_collector)
                 used += cost
             else:
                 omitted = len(feels) - index
