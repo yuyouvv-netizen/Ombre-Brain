@@ -35,6 +35,7 @@ Ombre Brain gives it persistent memory — not cold key-value storage, but a sys
 - **可验证备份与恢复**：本地导出使用 SQLite 一致性快照，并为每个文件写入 SHA-256 清单；导入前先检查路径、体积、重复项和完整性，损坏包不会部分恢复
 - **历史对话导入**：批量导入 Claude / ChatGPT / DeepSeek 历史对话，分块处理带断点续传
 - **Dashboard**：内置 Web 管理面板，密码保护，桶列表 / 检索调试 / 记忆网络 / 配置管理
+- **记忆与信件照片**：详情页正文下方显示已存照片的缩略图，点击可放大查看名字和说明；`letter_write` 可把照片随信永久保存，`letter_read` 会把命中信件的照片直接作为图片返回。图片沿用登录权限，浏览不调用模型接口；普通记忆的浮现与关键词检索只提示照片数量、名字和按编号打开的方法。
 - **Cloudflare Tunnel 一键管理**：Dashboard 内置 Tunnel 连接器，无需命令行即可开启公网访问
 - **OAuth 2.1 远程鉴权**：通过 HTTPS 连接时自动触发 OAuth 流程，Claude.ai 网页版和 Claude Code 均支持
 
@@ -79,7 +80,7 @@ Ombre Brain 的使用者是**模型自己**，不是它背后的人。所以这�
 | `pulse` | 自检：桶数量、占用、衰减引擎状态、全部桶摘要。「为什么搜不到 X」时第一个调它。 |
 | `plan` | 登记一个承诺 / 待办。不衰减、不浮现，只在 `dream` 末尾出现；后续写新事件会自动判断它是否已闭环。 |
 | `anchor` / `release` | 把**已存在的**桶设 / 解为「坐标系」。anchor 不主动浮现但可被检索命中，硬上限 24。必须先 `hold` 再 `anchor`。 |
-| `letter_write` / `letter_read` | 写信 / 读信。原文永久保留，不压缩、不合并、不衰减。`author` 常用 `user`（用户）或 `claude`（你自己），也接受任意署名字符串。 |
+| `letter_write` / `letter_read` | 写信 / 读信。原文与可选照片永久保留，不压缩、不合并、不衰减；读信时照片随正文直接返回。`author` 常用 `user`（用户）或 `claude`（你自己），也接受任意署名字符串。 |
 | `I` | 自我认知：写下 / 读取「我是什么」（本质 / 规律 / 立场 / 局限…）。不随普通 `breath` 浮现，每次对话开头自动附最近 3 条。 |
 
 归档记忆若经 `breath_search` 命中，会显示 `trace(bucket_id="...", restore=True)`。只有在判断它对当下有帮助、值得再次回忆后才调用；`restore=True` 必须单独使用，查询本身不会改变记忆状态。

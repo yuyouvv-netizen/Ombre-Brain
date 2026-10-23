@@ -19,6 +19,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from ombrebrain.domain.memory_messages import resolved_hint
+from ombrebrain.storage.media_store import MediaStore
 from . import _shared as sh
 
 logger = sh.logger
@@ -194,6 +195,15 @@ def register(mcp) -> None:
         return JSONResponse({
             "id": bucket["id"],
             "metadata": meta,
+            "photos": [
+                {
+                    "index": index,
+                    "title": MediaStore.image_title(entry),
+                    "note": str(entry.get("note") or "")[:500],
+                }
+                for index, entry in enumerate(meta.get("media") or [])
+                if MediaStore.is_image_entry(entry)
+            ],
             # Editing must round-trip the exact stored Markdown.  Keep the
             # bracket-free presentation text separate so a metadata-only edit
             # can never write a stripped [[wikilink]] body back to disk.
@@ -202,6 +212,29 @@ def register(mcp) -> None:
             "score": sh.decay_engine.calculate_score(meta),
             "triggered_feels": triggered_feels,  # iter 1.9 D
         })
+
+
+    @mcp.custom_route("/api/bucket/{bucket_id}/photo/{index:int}", methods=["GET"])
+    async def api_bucket_photo(request: Request) -> Response:
+        """登录后按记忆编号和附件序号读图，不接受客户端文件路径。"""
+        from starlette.responses import JSONResponse
+        err = sh._require_auth(request)
+        if err:
+            return err
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+        bucket = await sh.bucket_mgr.get(request.path_params["bucket_id"])
+        entries = (bucket.get("metadata", {}).get("media") or []) if bucket else []
+        index = request.path_params["index"]
+        if not isinstance(index, int) or index < 0 or index >= len(entries):
+            return JSONResponse({"error": "照片不存在"}, status_code=404, headers=headers)
+        entry = entries[index]
+        if not MediaStore.is_image_entry(entry):
+            return JSONResponse({"error": "照片不存在"}, status_code=404, headers=headers)
+        try:
+            data, mime = await sh.bucket_mgr.media_store.read_image(entry)
+        except (OSError, ValueError, TypeError):
+            return JSONResponse({"error": "照片暂时无法读取"}, status_code=404, headers=headers)
+        return Response(data, media_type=mime, headers=headers)
 
 
     # ---- Bucket-level mutation endpoints (iter 1.4) ----

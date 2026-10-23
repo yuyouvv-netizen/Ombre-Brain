@@ -372,9 +372,9 @@ feel 桶自身：
 
 ### 3.8 `letter_write` / `letter_read` — 信件
 
-`letter_write(author, content, user_name="", title="", date="", ai_name="")` —— `author` 必填；`user` 表示用户侧，`ai`（或与 `ai_name` 相同）表示 AI 侧，也接受任意自定义署名字符串。写入 `letters/history/`，**硬编码** `importance=10` / `valence=0.5` / `arousal=0.3`（设计：信件不开放给用户调这三项），原文永久保留。**不接受 `why_remembered`**——信件本身就是「为什么记得」的载体。
+`letter_write(author, content, user_name="", title="", date="", ai_name="", media=None)` —— `author` 必填；`user` 表示用户侧，`ai`（或与 `ai_name` 相同）表示 AI 侧，也接受任意自定义署名字符串。写入 `letters/history/`，**硬编码** `importance=10` / `valence=0.5` / `arousal=0.3`（设计：信件不开放给用户调这三项），原文与可选照片永久保留。`media` 与 `hold` 使用同一套持久化格式。**不接受 `why_remembered`**——信件本身就是「为什么记得」的载体。
 
-`letter_read(query="", limit=10, author="", date_from="", date_to="")` —— 无 query 时按 `letter_date` 或 `created` 倒序；完整 letter id 可靠直读全文；其它语义候选必须达到 0.65。忘记事件时的推荐路径是 `breath_search`，它按段检索 letter。
+`letter_read(query="", limit=10, author="", date_from="", date_to="")` —— 无 query 时按 `letter_date` 或 `created` 倒序；完整 letter id 可靠直读全文；其它语义候选必须达到 0.65。返回信件正文时会把命中信件中的已存照片直接附为 MCP 图片块，最多 6 张 / 24 MiB；图片故障不影响文字。忘记事件时的推荐路径是 `breath_search`，它按段检索 letter。
 
 信件特性：永不衰减（`calculate_score` 固定 50）、永不合并、不参与压缩；普通 `breath` 不浮现（被 `feel/plan/letter` 过滤）；`/breath-hook`（SessionStart）末尾追加双方各最新一封。
 

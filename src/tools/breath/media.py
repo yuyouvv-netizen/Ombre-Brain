@@ -18,7 +18,11 @@ async def with_saved_images(text: str, entries: list, store):
             total += len(data)
             if total > 24 * 1024 * 1024:
                 raise ValueError("response limit")
-            content.append(TextContent(type="text", text=f"已存图片 {index}"))
+            label = " ".join(str(entry.get("_display_label") or "").split())[:300]
+            if not label:
+                title = store.image_title(entry)
+                label = f"已存图片 {index}：{title}"
+            content.append(TextContent(type="text", text=label))
             content.append(ImageContent(type="image", mimeType=mime, data=base64.b64encode(data).decode("ascii")))
         except (OSError, ValueError, TypeError):
             # Never expose local paths, file contents or base64 in error messages.
