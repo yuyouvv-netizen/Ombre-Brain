@@ -13,7 +13,6 @@ import pytest_asyncio
 #   - ordering invariants
 # ============================================================
 
-import math
 import pytest
 from datetime import datetime, timedelta
 
@@ -63,48 +62,13 @@ async def populated_env(test_config, bucket_mgr, decay_eng):
 # Time weight formula tests
 # ============================================================
 class TestTimeWeight:
-    """Verify continuous exponential freshness formula."""
+    """时间不再增加或降低保存权重。"""
 
-    def test_t0_is_2(self, decay_eng):
-        """t=0 → exactly 2.0"""
-        assert decay_eng._calc_time_weight(0.0) == pytest.approx(2.0)
-
-    def test_half_life_25h(self, decay_eng):
-        """Half-life at t=36*ln(2)≈24.9h (~1.04 days) → bonus halved → 1.5"""
-        half_life_days = 36.0 * math.log(2) / 24.0  # ≈1.039 days
-        assert decay_eng._calc_time_weight(half_life_days) == pytest.approx(1.5, rel=0.01)
-
-    def test_36h_is_e_inv(self, decay_eng):
-        """t=36h (1.5 days) → 1 + e^(-1) ≈ 1.368"""
-        assert decay_eng._calc_time_weight(1.5) == pytest.approx(1.368, rel=0.01)
-
-    def test_72h_near_floor(self, decay_eng):
-        """t=72h (3 days) → ≈1.135"""
-        w = decay_eng._calc_time_weight(3.0)
-        assert 1.1 < w < 1.2
-
-    def test_30d_near_1(self, decay_eng):
-        """t=30 days → very close to 1.0"""
-        w = decay_eng._calc_time_weight(30.0)
-        assert 1.0 <= w < 1.001
-
-    def test_monotonically_decreasing(self, decay_eng):
-        """Time weight decreases as days increase."""
-        prev = decay_eng._calc_time_weight(0.0)
-        for d in [0.5, 1.0, 2.0, 5.0, 10.0, 30.0]:
-            curr = decay_eng._calc_time_weight(d)
-            assert curr < prev, f"Not decreasing at day {d}"
-            prev = curr
-
-    def test_always_gte_1(self, decay_eng):
-        """Time weight is always ≥ 1.0."""
-        for d in [0, 0.01, 0.1, 1, 10, 100, 1000]:
-            assert decay_eng._calc_time_weight(d) >= 1.0
+    @pytest.mark.parametrize("days", [0, 0.01, 1, 30, 365, 10000])
+    def test_time_weight_is_constant(self, decay_eng, days):
+        assert decay_eng._calc_time_weight(days) == 1.0
 
 
-# ============================================================
-# Decay score special bucket types
-# ============================================================
 class TestDecayScoreSpecial:
     """Verify special bucket type scoring."""
 
@@ -143,18 +107,9 @@ class TestDecayScoreModifiers:
         meta.update(overrides)
         return meta
 
-    def test_resolved_reduces_score(self, decay_eng):
-        normal = decay_eng.calculate_score(self._base_meta())
-        resolved = decay_eng.calculate_score(self._base_meta(resolved=True))
-        assert resolved < normal
-        assert resolved == pytest.approx(normal * 0.05, rel=0.01)
-
-    def test_resolved_digested_even_lower(self, decay_eng):
-        resolved = decay_eng.calculate_score(self._base_meta(resolved=True))
-        both = decay_eng.calculate_score(self._base_meta(resolved=True, digested=True))
-        assert both < resolved
-        # resolved=0.05, both=0.02
-        assert both / resolved == pytest.approx(0.02 / 0.05, rel=0.01)
+    @pytest.mark.parametrize("state", [{}, {"resolved": True}, {"resolved": True, "digested": True}])
+    def test_explicit_status_does_not_reduce_value(self, decay_eng, state):
+        assert decay_eng.calculate_score(self._base_meta(**state)) == 7.0
 
     def test_arousal_does_not_change_memory_value(self, decay_eng):
         """Emotion describes the experience; it does not vote on importance."""

@@ -27,6 +27,16 @@ def test_bucket_reload_preserves_active_filter_and_page():
     assert "renderBuckets(allBuckets);" not in source
 
 
+def test_old_memory_style_and_archive_filter_do_not_imply_automatic_forgetting():
+    html = DASHBOARD.read_text(encoding="utf-8")
+    renderer = _dashboard_section("function _paintBuckets()", "function _localBucketMatches(")
+    assert "stale ? ' faded'" not in renderer
+    assert ".bucket-row.faded" not in html
+    assert "衰减运行中" not in html
+    assert "在线 · 稳定保存" in html
+    assert "b.type === 'archived' || b.score" not in html
+
+
 def test_filter_rebuild_restores_active_filter_without_listener_leaks():
     source = _dashboard_section("function buildFilters()", "function filterBuckets(")
 

@@ -60,13 +60,53 @@ async def test_decay_cycle_never_auto_resolves_letter(bucket_mgr, decay_eng):
 
 
 @pytest.mark.asyncio
-async def test_decay_cycle_still_auto_resolves_ordinary_dynamic_bucket(bucket_mgr, decay_eng):
-    """对照组：证明上面两条不是「自动结案分支根本没触发」这种伪通过。"""
+async def test_decay_cycle_preserves_ordinary_dynamic_bucket(bucket_mgr, decay_eng):
+    """普通桶也必须保持原文、状态和位置，不能因为时间自动结案。"""
     bid = await bucket_mgr.create(content="一件早就不重要的小事", importance=3)
     _backdate(bucket_mgr, bid, days_ago=60)
 
     stats = await decay_eng.run_decay_cycle()
 
     ordinary = await bucket_mgr.get(bid)
-    assert ordinary["metadata"].get("resolved") is True
-    assert stats["auto_resolved"] >= 1
+    assert ordinary["metadata"].get("resolved") is not True
+    assert ordinary["metadata"]["type"] == "dynamic"
+    assert ordinary["content"] == "一件早就不重要的小事"
+    assert stats["auto_resolved"] == 0
+    assert stats["archived"] == 0
+
+
+@pytest.mark.asyncio
+async def test_old_memory_keeps_bytes_and_can_surface_with_result_limit(bucket_mgr, decay_eng, monkeypatch):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    import tools._runtime as rt
+    from tools.breath.surface import surface_default
+
+    old = await bucket_mgr.create(content="放了十年的重要原文", importance=7)
+    _backdate(bucket_mgr, old, days_ago=3650)
+    path = Path(bucket_mgr._find_bucket_file(old))
+    before = path.read_bytes()
+    newer = await bucket_mgr.create(content="今天的一条普通记录", importance=3)
+    archived = await bucket_mgr.create(content="手动归档原文", importance=5)
+    await bucket_mgr.archive(archived)
+    # 即使保留旧部署里的极端参数，也不能自动改变状态。
+    decay_eng.decay_lambda = 99
+    decay_eng.threshold = 9999
+    for _ in range(2):
+        stats = await decay_eng.run_decay_cycle()
+        assert stats["archived"] == stats["auto_resolved"] == 0
+    assert path.read_bytes() == before
+    assert (await bucket_mgr.get(archived))["metadata"]["type"] == "archived"
+    assert decay_eng.calculate_score((await bucket_mgr.get(old))["metadata"]) == 7.0
+    assert decay_eng.calculate_score((await bucket_mgr.get(newer))["metadata"]) == 3.0
+
+    for key, value in {
+        "config": {"surfacing": {}}, "bucket_mgr": bucket_mgr, "decay_engine": decay_eng,
+        "logger": MagicMock(), "mark_op": None, "fire_webhook": None,
+    }.items():
+        monkeypatch.setattr(rt, key, value)
+    monkeypatch.setattr("tools.breath.surface.random.random", lambda: 1.0)
+    result = await surface_default(max_results=1, max_tokens=10000, tag_filter=[])
+    assert "放了十年的重要原文" in result
+    assert "今天的一条普通记录" not in result
+    assert "手动归档原文" not in result
