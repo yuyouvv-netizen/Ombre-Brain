@@ -11,6 +11,10 @@ web/buckets.py — 记忆桶管理 + 设置 + 锚点 + 自我认知读取
 ========================================
 """
 
+import base64
+import binascii
+import hashlib
+import json
 import math
 import threading
 from contextlib import AsyncExitStack
@@ -23,6 +27,11 @@ from ombrebrain.storage.media_store import MediaStore
 from . import _shared as sh
 
 logger = sh.logger
+
+
+def _photo_revision(entries) -> str:
+    """附件列表版本只用于比较，不向浏览器暴露服务器路径。"""
+    return hashlib.sha256(json.dumps(entries, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
 
 try:
     from utils import (  # type: ignore
@@ -195,6 +204,7 @@ def register(mcp) -> None:
         return JSONResponse({
             "id": bucket["id"],
             "metadata": meta,
+            "photos_revision": _photo_revision(meta.get("media") or []),
             "photos": [
                 {
                     "index": index,
@@ -236,6 +246,92 @@ def register(mcp) -> None:
             return JSONResponse({"error": "照片暂时无法读取"}, status_code=404, headers=headers)
         return Response(data, media_type=mime, headers=headers)
 
+
+    @mcp.custom_route("/api/bucket/{bucket_id}/photos", methods=["PUT"])
+    async def api_bucket_photos_save(request: Request) -> Response:
+        """普通记忆和信件共用的照片编辑；只接受原附件序号或上传数据。"""
+        from starlette.responses import JSONResponse
+        err = sh._require_auth(request)
+        if err:
+            return err
+        bucket_id = request.path_params["bucket_id"]
+        bucket = await sh.bucket_mgr.get(bucket_id)
+        if not bucket:
+            return JSONResponse({"error": "记忆不存在"}, status_code=404)
+        try:
+            raw = bytearray()
+            async for chunk in request.stream():
+                raw.extend(chunk)
+                if len(raw) > 34 * 1024 * 1024:
+                    return JSONResponse({"error": "照片太大，请分几次添加。"}, status_code=413)
+            body = json.loads(raw)
+            if not isinstance(body, dict) or not isinstance(body.get("photos"), list):
+                raise ValueError("照片列表格式不正确。")
+            existing = bucket.get("metadata", {}).get("media") or []
+            if body.get("revision") != _photo_revision(existing):
+                return JSONResponse({"error": "照片已发生变化，请重新打开后再保存。"}, status_code=409)
+            photos = body["photos"]
+            other = [entry for entry in existing if not MediaStore.is_image_entry(entry)]
+            if len(photos) + len(other) > 20:
+                raise ValueError("这条记忆最多保留 20 项附件。")
+            output, seen, uploads, total = [], set(), 0, 0
+            for item in photos:
+                if not isinstance(item, dict) or set(item) - {"index", "title", "note", "data_base64", "filename"}:
+                    raise ValueError("照片格式不正确；请通过选择照片上传。")
+                for key, limit in (("title", 200), ("note", 500)):
+                    if not isinstance(item.get(key, ""), str) or len(item.get(key, "")) > limit:
+                        raise ValueError("照片名字或说明太长。")
+                if "index" in item:
+                    index = item["index"]
+                    if type(index) is not int or index < 0 or index >= len(existing) or index in seen or "data_base64" in item:
+                        raise ValueError("照片序号无效。")
+                    if not MediaStore.is_image_entry(existing[index]):
+                        raise ValueError("这项附件不是照片。")
+                    seen.add(index)
+                    entry = dict(existing[index])
+                else:
+                    uploads += 1
+                    if uploads > 6:
+                        raise ValueError("一次最多添加六张照片。")
+                    encoded = item.get("data_base64")
+                    if not isinstance(encoded, str) or len(encoded) > 16 * 1024 * 1024:
+                        raise ValueError("照片太大或格式不正确。")
+                    data = base64.b64decode(encoded, validate=True)
+                    total += len(data)
+                    if not data or len(data) > 12 * 1024 * 1024 or total > 24 * 1024 * 1024:
+                        raise ValueError("单张照片最多 12 MiB，一次最多 24 MiB。")
+                    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+                        suffix, mime = ".png", "image/png"
+                    elif data.startswith(b"\xff\xd8\xff"):
+                        suffix, mime = ".jpg", "image/jpeg"
+                    elif data.startswith((b"GIF87a", b"GIF89a")):
+                        suffix, mime = ".gif", "image/gif"
+                    elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+                        suffix, mime = ".webp", "image/webp"
+                    else:
+                        raise ValueError("请选择 JPG、PNG、GIF 或 WebP 照片。")
+                    entry = {"data_base64": encoded, "filename": "photo" + suffix, "type": mime}
+                entry["title"] = item.get("title", "")
+                entry["note"] = item.get("note", "")
+                output.append(entry)
+            # 原附件直接保留；只持久化新上传，旧照片暂时丢失也不妨碍编辑关联。
+            prepared = []
+            for entry in output:
+                if "data_base64" in entry:
+                    prepared.extend(await sh.bucket_mgr.media_store.persist(bucket_id, [entry]))
+                else:
+                    prepared.append(entry)
+            ok = await sh.bucket_mgr.update(
+                bucket_id, media=other + prepared, _expected_media=existing, _media_prepared=True,
+            )
+            if not ok:
+                return JSONResponse({"error": "未能保存，记忆可能已被归档。"}, status_code=409)
+            return JSONResponse({"ok": True})
+        except (ValueError, TypeError, binascii.Error) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409 if str(exc).startswith("照片已发生变化") else 400)
+        except OSError:
+            logger.exception("后台照片保存失败")
+            return JSONResponse({"error": "照片保存失败，请稍后重试。"}, status_code=500)
 
     # ---- Bucket-level mutation endpoints (iter 1.4) ----
     # 桶维度变更端点：钉选/解钉、resolve toggle、归档、删除到档案

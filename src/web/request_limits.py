@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Awaitable, Callable
 
 
@@ -167,6 +168,16 @@ class ManagementRequestBodyLimitMiddleware(MCPRequestBodyLimitMiddleware):
             )
 
         super().__init__(app, max_bytes=max_bytes, path_matcher=should_limit)
+        self.photo_upload = MCPRequestBodyLimitMiddleware(
+            app, max_bytes=34 * 1024 * 1024,
+            path_matcher=lambda path: bool(re.fullmatch(r"/api/bucket/[^/]+/photos", str(path))),
+        )
+
+    async def __call__(self, scope: dict, receive: _Receive, send: _Send) -> None:
+        if re.fullmatch(r"/api/bucket/[^/]+/photos", str(scope.get("path", ""))):
+            await self.photo_upload(scope, receive, send)
+        else:
+            await super().__call__(scope, receive, send)
 
     async def _send_too_large(self, send: _Send) -> None:
         await self._send_json(
