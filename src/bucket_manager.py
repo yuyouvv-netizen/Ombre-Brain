@@ -2149,6 +2149,13 @@ class BucketManager:
         if not file_path:
             return False
 
+        if "_expected_media" in kwargs:
+            # 后台照片编辑使用同一个桶锁比较，防止覆盖模型刚追加的附件。
+            expected_media = kwargs.pop("_expected_media")
+            current_post = frontmatter.load(file_path)
+            if (current_post.get("media") or []) != expected_media:
+                raise ValueError("照片已发生变化，请重新打开后再保存。")
+
         # Normalize public/migration inputs at the storage boundary.  A quoted
         # YAML value such as "false" must never be persisted as true merely
         # because Python considers non-empty strings truthy.
@@ -2180,8 +2187,9 @@ class BucketManager:
             ) or [_DEFAULT_DOMAIN_NAME]
         if "media" in kwargs:
             # Miss: media 是整体覆盖写入（trace 的 media_replace）。传空列表即清空该字段。
+            prepared = kwargs.pop("_media_prepared", False)
             kwargs["media"] = self._normalize_media(
-                await self.media_store.persist(bucket_id, kwargs["media"])
+                kwargs["media"] if prepared else await self.media_store.persist(bucket_id, kwargs["media"])
             )
         if "media_append" in kwargs:
             # Miss: media_append 是追加写入（trace 的 media_append / hold 每次调用）。

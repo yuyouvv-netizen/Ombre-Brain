@@ -388,6 +388,26 @@ async def test_management_body_limit_rejects_public_auth_oversize():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path,size,expected", [
+    ("/api/bucket/example/photos", 1000, 204),
+    ("/api/bucket/example/photos", 34 * 1024 * 1024 + 1, 413),
+    ("/api/bucket/example/photos-extra", 1000, 413),
+    ("/api/bucket/example", 1000, 413),
+])
+async def test_photo_upload_limit_is_bounded_and_route_specific(path, size, expected):
+    import httpx
+    from starlette.responses import Response
+
+    async def app(scope, receive, send):
+        await Response(status_code=204)(scope, receive, send)
+
+    middleware = ManagementRequestBodyLimitMiddleware(app, max_bytes=10)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=middleware), base_url="http://test") as client:
+        response = await client.put(path, content=b"{}", headers={"Content-Length": str(size)})
+        assert response.status_code == expected
+
+
+@pytest.mark.asyncio
 async def test_chunked_limit_cannot_be_swallowed_by_route_json_handler():
     calls = []
     sent = []

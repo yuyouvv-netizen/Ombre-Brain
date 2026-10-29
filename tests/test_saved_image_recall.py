@@ -35,6 +35,72 @@ def test_photo_hint_keeps_body_and_id_without_file_paths():
     assert "_media/" not in rendered
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_type", ["dynamic", "letter"])
+async def test_dashboard_photo_edit_roundtrip(monkeypatch, bucket_mgr, bucket_type):
+    import httpx
+    from pathlib import Path
+
+    bid = await bucket_mgr.create(content="照片测试 [[原文]]", bucket_type=bucket_type, media=[
+        {"data_base64": base64.b64encode(b"voice").decode(), "filename": "voice.ogg"},
+    ])
+    original = await bucket_mgr.get(bid)
+    app = _photo_web_app(monkeypatch, bucket_mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        url = f"/api/bucket/{bid}/photos"
+        assert (await client.put(url, json={"photos": []})).status_code == 401
+        client.cookies.set("ombre_session", "photo-test-session")
+        detail = (await client.get(f"/api/bucket/{bid}")).json()
+        payload = {"revision": detail["photos_revision"], "photos": [{
+            "data_base64": base64.b64encode(PNG).decode(), "title": "合照", "note": "第一次",
+        }]}
+        assert (await client.put(url, json=payload)).status_code == 200
+        assert (await client.put(url, json=payload)).status_code == 409
+        detail = (await client.get(f"/api/bucket/{bid}")).json()
+        assert detail["photos"] == [{"index": 1, "title": "合照", "note": "第一次"}]
+        assert (await client.get(f"/api/bucket/{bid}/photo/1")).content == PNG
+        media = detail["metadata"]["media"]
+        stored = bucket_mgr.media_store.vault_dir / media[1]["path"]
+        payload = {"revision": detail["photos_revision"], "photos": [{"index": 1, "title": "改名", "note": ""}]}
+        assert (await client.put(url, json=payload)).status_code == 200
+        updated = await bucket_mgr.get(bid)
+        assert updated["metadata"]["media"][0] == media[0]
+        assert updated["metadata"]["media"][1]["title"] == "改名"
+        assert not updated["metadata"]["media"][1].get("note")
+        assert updated["content"] == original["content"]
+        assert updated["metadata"]["last_active"] == original["metadata"]["last_active"]
+        assert updated["metadata"]["activation_count"] == original["metadata"]["activation_count"]
+        detail = (await client.get(f"/api/bucket/{bid}")).json()
+        assert (await client.put(url, json={"revision": detail["photos_revision"], "photos": []})).status_code == 200
+        assert Path(stored).read_bytes() == PNG
+        assert (await bucket_mgr.get(bid))["metadata"]["media"] == [media[0]]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_photo_edit_rejects_invalid_inputs_and_concurrent_append(monkeypatch, bucket_mgr):
+    import httpx
+
+    bid = await bucket_mgr.create(content="不能被覆盖的原文")
+    app = _photo_web_app(monkeypatch, bucket_mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", cookies={"ombre_session": "photo-test-session"}) as client:
+        detail = (await client.get(f"/api/bucket/{bid}")).json()
+        valid = {"data_base64": base64.b64encode(PNG).decode()}
+        for photos in [None, {}, ["photo"], [{"path": "/etc/passwd"}], [{"index": True}], [{"index": 0}],
+                       [dict(valid, title=42)], [dict(valid, note="x" * 501)], [dict(valid, data_base64="!bad")],
+                       [dict(valid, data_base64=base64.b64encode(b"not-image").decode())], [valid] * 7]:
+            response = await client.put(f"/api/bucket/{bid}/photos", json={"revision": detail["photos_revision"], "photos": photos})
+            assert response.status_code == 400
+            assert not (await bucket_mgr.get(bid))["metadata"].get("media")
+        update = bucket_mgr.update
+
+        async def append_before_commit(bucket_id, **kwargs):
+            await update(bucket_id, media_append=[valid])
+            return await update(bucket_id, **kwargs)
+
+        monkeypatch.setattr(bucket_mgr, "update", append_before_commit)
+        response = await client.put(f"/api/bucket/{bid}/photos", json={"revision": detail["photos_revision"], "photos": []})
+        assert response.status_code == 409
+        assert len((await bucket_mgr.get(bid))["metadata"]["media"]) == 1
 def _photo_web_app(monkeypatch, manager):
     import time
     from starlette.applications import Starlette

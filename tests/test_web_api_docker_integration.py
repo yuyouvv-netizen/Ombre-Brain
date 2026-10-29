@@ -175,6 +175,23 @@ def test_desktop_management_api_first_run_and_authenticated_flow():
         assert unchanged_transport.status_code == 200
         assert unchanged_transport.json()["restarting"] is False
 
+        # 真实 HTTP 验证后台上传、重开、改名、移除，原文不能被照片编辑改写。
+        import base64
+        png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5nQAAAAASUVORK5CYII=")
+        letter = client.post("/api/letter", json={"author": "user", "content": "照片编辑测试原文"}).json()
+        bid = letter["id"]
+        detail = client.get(f"/api/bucket/{bid}").json()
+        photos_url = f"/api/bucket/{bid}/photos"
+        response = client.put(photos_url, json={"revision": detail["photos_revision"], "photos": [{"data_base64": base64.b64encode(png).decode(), "title": "测试照片"}]})
+        assert response.status_code == 200, response.text
+        assert client.get(f"/api/bucket/{bid}/photo/0").content == png
+        detail = client.get(f"/api/bucket/{bid}").json()
+        assert detail["content"] == "照片编辑测试原文"
+        assert client.put(photos_url, json={"revision": detail["photos_revision"], "photos": [{"index": 0, "title": "改名", "note": "说明"}]}).status_code == 200
+        detail = client.get(f"/api/bucket/{bid}").json()
+        assert detail["photos"][0]["title"] == "改名"
+        assert client.put(photos_url, json={"revision": detail["photos_revision"], "photos": []}).status_code == 200
+        assert client.get(f"/api/bucket/{bid}").json()["photos"] == []
         logout = client.post("/auth/logout")
         assert logout.status_code == 200
         assert client.get("/api/config").status_code == 401

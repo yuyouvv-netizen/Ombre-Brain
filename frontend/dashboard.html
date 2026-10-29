@@ -391,6 +391,11 @@
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
   .memory-photos { margin: 20px 0; }
+  .photo-editor-card { padding: 10px; border: 1px solid var(--border); border-radius: 12px; min-width: 0; }
+  .photo-editor-card img { width: 100%; height: 130px; object-fit: cover; border-radius: 8px; }
+  .photo-editor-card input, .photo-editor-card textarea { display: block; width: 100%; box-sizing: border-box; margin: 8px 0; padding: 8px; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+  #photo-editor button { min-height: 44px; cursor: pointer; }
+  #photo-editor-status { white-space: pre-wrap; color: var(--text-dim); }
   .memory-photos h3 { font-size: 13px; color: var(--text-dim); margin: 0 0 10px; }
   .memory-photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 12px; }
   .memory-photo { min-width: 0; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-solid); color: var(--text); text-align: left; cursor: pointer; font: inherit; }
@@ -2116,6 +2121,7 @@
 </div>
 
 <dialog id="memory-photo-dialog" class="memory-photo-dialog" aria-labelledby="memory-photo-heading" onclick="if(event.target===this)closeMemoryPhoto()" onclose="clearMemoryPhoto()">
+<!-- 查看照片与编辑照片分别保留自己的状态。 -->
   <div class="memory-photo-toolbar">
     <h3 id="memory-photo-heading">照片</h3>
     <button type="button" onclick="closeMemoryPhoto()" aria-label="关闭照片" autofocus>关闭</button>
@@ -4833,6 +4839,148 @@ async function searchBuckets(query) {
   renderBuckets(merged);
 }
 
+var photoEditor = null;
+
+function ensurePhotoEditor() {
+  if (document.getElementById('photo-editor')) return;
+  var dialog = document.createElement('dialog');
+  dialog.id = 'photo-editor';
+  dialog.className = 'memory-photo-dialog';
+  dialog.setAttribute('aria-labelledby', 'photo-editor-heading');
+  dialog.innerHTML = '<div class="memory-photo-toolbar"><h3 id="photo-editor-heading">编辑照片</h3><button type="button" onclick="closePhotoEditor()">取消</button></div>' +
+    '<p>一次最多添加六张。可给照片起个名字、写一句话；点保存后生效。</p>' +
+    '<fieldset id="photo-editor-fields" style="border:0;padding:0;margin:0;min-width:0">' +
+    '<label class="icon-btn" style="display:inline-block;cursor:pointer;padding:10px">选择照片<input id="photo-editor-files" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple onchange="addEditorPhotos(this)" style="display:block;max-width:100%;margin-top:8px"></label>' +
+    '<div id="photo-editor-grid" class="memory-photo-grid" style="margin:14px 0"></div>' +
+    '<button type="button" onclick="saveEditorPhotos()">保存照片</button></fieldset><p id="photo-editor-status" role="status" aria-live="polite"></p>';
+  dialog.addEventListener('cancel', function(event) { event.preventDefault(); closePhotoEditor(); });
+  document.body.appendChild(dialog);
+}
+
+async function editMemoryPhotos(id) {
+  ensurePhotoEditor();
+  if (photoEditor) return;
+  var state = {id: id, photos: [], busy: true, dirty: false};
+  photoEditor = state;
+  document.getElementById('photo-editor').showModal();
+  document.getElementById('photo-editor-grid').replaceChildren();
+  document.getElementById('photo-editor-fields').disabled = true;
+  document.getElementById('photo-editor-status').textContent = '正在读取照片…';
+  try {
+    var response = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id));
+    var data = await response.json();
+    if (!response.ok) throw new Error(data.error || '读取失败');
+    if (photoEditor !== state) return;
+    state.revision = data.photos_revision;
+    state.photos = (data.photos || []).map(function(photo) { return Object.assign({}, photo); });
+    renderEditorPhotos();
+    document.getElementById('photo-editor-status').textContent = '';
+  } catch (error) {
+    if (photoEditor === state) document.getElementById('photo-editor-status').textContent = error.message;
+  } finally {
+    if (photoEditor === state) { state.busy = false; document.getElementById('photo-editor-fields').disabled = !state.revision; }
+  }
+}
+
+function renderEditorPhotos() {
+  var state = photoEditor;
+  var grid = document.getElementById('photo-editor-grid');
+  grid.replaceChildren();
+  state.photos.forEach(function(photo, index) {
+    var card = document.createElement('div');
+    card.className = 'photo-editor-card';
+    var image = document.createElement('img');
+    image.alt = photo.title || '未命名照片';
+    image.src = photo.preview || BASE + '/api/bucket/' + encodeURIComponent(state.id) + '/photo/' + photo.index;
+    card.appendChild(image);
+    [['title', '照片名字', 200], ['note', '写一句话', 500]].forEach(function(field) {
+      var input = document.createElement(field[0] === 'note' ? 'textarea' : 'input');
+      input.value = photo[field[0]] || '';
+      input.placeholder = field[1];
+      input.setAttribute('aria-label', '第 ' + (index + 1) + ' 张：' + field[1]);
+      input.maxLength = field[2];
+      input.oninput = function() { photo[field[0]] = input.value; state.dirty = true; };
+      card.appendChild(input);
+    });
+    var remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = '移除照片';
+    remove.onclick = function() { state.photos.splice(index, 1); state.dirty = true; renderEditorPhotos(); };
+    card.appendChild(remove);
+    grid.appendChild(card);
+  });
+}
+
+async function addEditorPhotos(input) {
+  var state = photoEditor;
+  if (!state || state.busy) return;
+  var files = Array.from(input.files || []);
+  input.value = '';
+  var status = document.getElementById('photo-editor-status');
+  var pending = state.photos.filter(function(photo) { return photo.data_base64; });
+  if (files.length + pending.length > 6 || state.photos.length + files.length > 20) {
+    status.textContent = '一次最多添加六张，这条记忆最多保留 20 项附件。'; return;
+  }
+  if (files.some(function(file) { return file.size > 12 * 1024 * 1024 || !/^image\/(jpeg|png|gif|webp)$/.test(file.type); }) ||
+      files.reduce(function(total, file) { return total + file.size; }, pending.reduce(function(total, photo) { return total + photo.bytes; }, 0)) > 24 * 1024 * 1024) {
+    status.textContent = '请选择 JPG、PNG、GIF 或 WebP；单张最多 12 MiB，一次最多 24 MiB。'; return;
+  }
+  state.busy = true;
+  document.getElementById('photo-editor-fields').disabled = true;
+  status.textContent = '正在准备预览…';
+  try {
+    var added = await Promise.all(files.map(function(file) {
+      return new Promise(function(resolve, reject) {
+        var reader = new FileReader();
+        reader.onload = function() { resolve({data_base64: reader.result.split(',')[1], preview: reader.result, bytes: file.size, title: '', note: ''}); };
+        reader.onerror = function() { reject(new Error('照片读取失败，请重新选择。')); };
+        reader.readAsDataURL(file);
+      });
+    }));
+    state.photos.push.apply(state.photos, added);
+    state.dirty = true;
+    renderEditorPhotos();
+    status.textContent = '预览已准备好，点保存照片后生效。';
+  } catch (error) { status.textContent = error.message; }
+  finally { state.busy = false; document.getElementById('photo-editor-fields').disabled = false; }
+}
+
+function closePhotoEditor() {
+  if (photoEditor && photoEditor.busy) return;
+  if (photoEditor && photoEditor.dirty && !confirm('还没保存，放弃这次照片修改？')) return;
+  document.getElementById('photo-editor').close();
+  document.getElementById('photo-editor-grid').replaceChildren();
+  photoEditor = null;
+}
+
+async function saveEditorPhotos() {
+  var state = photoEditor;
+  if (!state || state.busy || !state.revision) return;
+  state.busy = true;
+  document.getElementById('photo-editor-fields').disabled = true;
+  var status = document.getElementById('photo-editor-status');
+  status.textContent = '正在保存照片…';
+  try {
+    var photos = state.photos.map(function(photo) {
+      var item = {title: photo.title || '', note: photo.note || ''};
+      if (photo.data_base64) item.data_base64 = photo.data_base64;
+      else item.index = photo.index;
+      return item;
+    });
+    var response = await fetch(BASE + '/api/bucket/' + encodeURIComponent(state.id) + '/photos', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({revision: state.revision, photos: photos}),
+    });
+    var data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || '保存失败');
+    state.busy = false;
+    state.dirty = false;
+    closePhotoEditor();
+    if (document.getElementById('detail-panel').classList.contains('open')) await showDetail(state.id);
+    if (typeof loadLetters === 'function') await loadLetters();
+  } catch (error) { status.textContent = error.message; }
+  finally { state.busy = false; document.getElementById('photo-editor-fields').disabled = false; }
+}
+
 function renderMemoryPhotos(bucketId, photos) {
   if (!Array.isArray(photos) || !photos.length) return '';
   var cards = photos.filter(function(photo) {
@@ -4958,6 +5106,7 @@ async function showDetail(id) {
       '</div>' +
       '<div class="detail-content">' + esc(displayContent) + '</div>' +
       renderMemoryPhotos(id, b.photos) +
+      '<button type="button" class="icon-btn" data-bucket-id="' + escAttr(id) + '" onclick="editMemoryPhotos(this.dataset.bucketId)">添加 / 编辑照片</button>' +
       renderEditForm(id, Object.assign({}, meta, {_content_for_edit: b.content}));
     return true;
   } catch (e) {
@@ -6150,6 +6299,7 @@ function startPlaceholderRotation() {
 
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') {
+    if (photoEditor) return;
     if (document.getElementById('memory-photo-dialog').open) {
       e.preventDefault();
       closeMemoryPhoto();
@@ -9214,6 +9364,8 @@ function _renderLetter(l) {
     </div>
     ${l.title ? `<div style="font-family:'Cormorant Garamond', serif;font-size:17px;font-weight:600;margin-bottom:8px;color:var(--text);">${esc(l.title)}</div>` : ''}
     <div style="white-space:pre-wrap;font-size:14px;line-height:1.75;color:var(--text);">${esc(l.content || '')}</div>
+    <button type="button" class="icon-btn" data-letter-id="${escAttr(l.id)}" onclick="showDetail(this.dataset.letterId)">查看照片</button>
+    <button type="button" class="icon-btn" data-letter-id="${escAttr(l.id)}" onclick="editMemoryPhotos(this.dataset.letterId)">添加 / 编辑照片</button>
     <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;font-size:11px;">
       <button data-letter-id="${escAttr(l.id)}" onclick="editLetter(this.dataset.letterId)" title="编辑" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="pencil" style="width:13px;height:13px;"></i></button>
       <button data-letter-id="${escAttr(l.id)}" onclick="deleteLetter(this.dataset.letterId)" title="删除" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--accent);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="trash-2" style="width:13px;height:13px;"></i></button>
