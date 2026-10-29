@@ -1,27 +1,10 @@
-"""
-========================================
-decay_engine.py — 记忆衰减引擎，模拟人类遗忘曲线
-========================================
+"""稳定记忆评分与检索索引维护。
 
-这个文件负责给每个桶算「现在还有多重」的权重分，然后把分数掉到阈值以下
-的桶搬到 archive。后台一个 asyncio 任务每隔 N 小时跑一次。
-
-关键行为：
-- 打分公式：Score = 稳定 Importance × 近期系数 × e^(-λ×days)
-- 情绪坐标与被检索次数不参与价值判断；它们不会把一条记忆越搜越重要
-- pinned / protected 桶不参与衰减、不被归档
-- ensure_started() 幂等启动后台循环；可被测试 monkeypatch 成 noop
-
-不做什么（边界）：
-- 不删除桶（只把分数低的搬到 archive）
-- 不做内容修改、不打标、不调用 LLM
-- 不决定「该不该 hold/grow」，只对已有桶打分
-
-对外暴露：DecayEngine 类（calculate_score / run_once / ensure_started）
-========================================
+普通记忆只按稳定重要度评分，不随时间、已解决或已消化状态降权。
+保留 DecayEngine 名称和周期统计字段兼容现有调用；后台只补齐索引，
+不自动结案、归档或恢复任何记忆。
 """
 
-import math
 import asyncio
 import logging
 from datetime import datetime
@@ -30,68 +13,13 @@ from utils import parse_iso_datetime
 
 logger = logging.getLogger("ombre_brain.decay")
 
-
-# ============================================================
-# 调参面板 / Tunable constants
-# ------------------------------------------------------------
-# rule.md §⑩：禁止裸魔法数字。下面这些常量原本散落在 calculate_score()
-# 和 run_decay_cycle() 各处，集中后：① 公式可读性大幅提升；
-# ② 任何调参改一处即可；③ 单元测试可直接 import 这些常量做断言。
-#
-# ⚠️ 改这些数字前先读 rule.md §1.0 哲学："记忆只会淡去，不会消失"。
-# decay 不是删除，是分数下沉。改 threshold/lambda 会直接影响"多少天后被遗忘"。
-# ============================================================
-
-# --- DecayEngine 默认值（被 config.yaml 的 decay.* 覆盖）---
-_DEFAULT_LAMBDA = 0.05            # 指数衰减率：每过一天分数 × e^(-λ)
-_DEFAULT_THRESHOLD = 0.3          # 低于此分数 → 归档
-_DEFAULT_CHECK_INTERVAL_HRS = 24  # 后台循环间隔（小时）
-
-# --- 锁分：某些桶不参与衰减 ---
-_SCORE_PINNED = 999.0    # pinned / protected / permanent 桶恒高分（永不归档）
-_SCORE_FEEL = 50.0       # feel / plan / letter 桶固定中分（生命周期由 status 控制）
-
-# --- 周期自愈：每轮衰减最多补多少条缺失向量（防一次性打爆 embedding API）---
-# 活跃桶落盘了但 embeddings.db 没它的向量 → breath 向量通道会漏掉它（permanent
-# 尤其常见，见 #6）。剩余的下一轮继续补。
-_BACKFILL_MAX_PER_CYCLE = 50
-
-# --- Freshness bonus：bonus = 1 + e^(-hours/HALF_LIFE) ---
-_FRESHNESS_HALF_LIFE_HRS = 36.0  # 36h 半衰：刚存 ×2.0，36h 后 ×1.5，72h 后 ≈×1.14
-_FRESHNESS_AMPLITUDE = 1.0       # bonus 上限增量（0 → 无加成；1 → 最多 ×2）
-
-# --- Resolved/digested 衰减加速因子 ---
-_FACTOR_RESOLVED_DIGESTED = 0.02  # 已处理 + 已写 feel → 加速淡化到背景
-_FACTOR_RESOLVED_ONLY = 0.05      # 仅已处理（未写 feel）→ 中度淡化
-
-# --- Auto-resolve 触发条件 ---
-_AUTO_RESOLVE_IMPORTANCE_MAX = 4   # 重要度 ≤ 4 才允许自动结案
-_AUTO_RESOLVE_DAYS_MIN = 30        # 且 30 天未被激活
-_AUTO_RESOLVE_FALLBACK_DAYS = 999  # 时间字段坏掉时，按"很久以前"对待，触发自动结案
-
-# --- Importance/time 兜底 ---
-_DEFAULT_IMPORTANCE = 5
-_DEFAULT_DAYS_FALLBACK = 30  # calculate_score 时间字段坏 → 按 30 天处理（保守）
-
-# --- 时间换算 ---
+_DEFAULT_DAYS_FALLBACK = 30
 _SECONDS_PER_DAY = 86400
 _SECONDS_PER_HOUR = 3600
-
+_BACKFILL_MAX_PER_CYCLE = 50
 
 def _days_since_active(meta: dict, fallback_days: float = _DEFAULT_DAYS_FALLBACK) -> float:
-    """从 metadata 解析"距上次激活的天数"。
-
-    抽出来的原因：原文件里 calculate_score / run_decay_cycle 各写了一遍
-    同样的 "fromisoformat → 求差 → 兜底" 三段式，且兜底值还不一样
-    （前者 30、后者 999）。统一成一个函数，由调用方传 fallback_days
-    决定坏数据怎么处理：
-      * calculate_score 用默认 30：保守地按"一个月没动"算分
-      * run_decay_cycle 的 auto-resolve 路径传 999：让坏数据顺利触发结案
-
-    边界（rule.md §⑨）：
-      * meta 不是 dict / 字段缺失 / 字符串无法解析 → 返回 fallback_days
-      * 永远返回 ≥ 0 的浮点数（防止时钟漂移产生负数）
-    """
+    """保留旧时间解析接口供诊断使用，不再参与评分或生命周期决策。"""
     if not isinstance(meta, dict):
         return fallback_days
     raw = meta.get("last_active") or meta.get("created") or ""
@@ -103,217 +31,63 @@ def _days_since_active(meta: dict, fallback_days: float = _DEFAULT_DAYS_FALLBACK
 
 
 class DecayEngine:
-    """
-    Memory decay engine — periodically scans all dynamic buckets,
-    calculates decay scores, auto-archives low-activity buckets
-    to simulate natural forgetting.
-    记忆衰减引擎 —— 定期扫描所有动态桶，
-    计算衰减得分，将低活跃桶自动归档，模拟自然遗忘。
-    """
+    """兼容原接口的稳定评分与索引维护服务。"""
 
     def __init__(self, config: dict, bucket_mgr):
-        # --- Load decay parameters / 加载衰减参数 ---
         decay_cfg = config.get("decay", {})
-        self.decay_lambda = decay_cfg.get("lambda", _DEFAULT_LAMBDA)
-        self.threshold = decay_cfg.get("threshold", _DEFAULT_THRESHOLD)
-        self.check_interval = decay_cfg.get("check_interval_hours", _DEFAULT_CHECK_INTERVAL_HRS)
-
+        # 旧参数只保留读取兼容性，不能重新启用时间降权或自动归档。
+        self.decay_lambda = decay_cfg.get("lambda", 0.05)
+        self.threshold = decay_cfg.get("threshold", 0.3)
+        self.check_interval = decay_cfg.get("check_interval_hours", 24)
         self.bucket_mgr = bucket_mgr
-
-        # --- Background task control / 后台任务控制 ---
         self._task: asyncio.Task | None = None
         self._running = False
 
     @property
     def is_running(self) -> bool:
-        """Whether the decay engine is running in the background.
-        衰减引擎是否正在后台运行。"""
         return self._running
 
-    # ---------------------------------------------------------
-    # Core: calculate decay score for a single bucket
-    # 核心：计算单个桶的衰减得分
-    #
-    # Higher score = more vivid memory; below threshold → archive
-    # 得分越高 = 记忆越鲜活，低于阈值则归档
-    # Permanent buckets never decay / 固化桶永远不衰减
-    # ---------------------------------------------------------
-    # ---------------------------------------------------------
-    # Freshness bonus: continuous exponential decay
-    # 新鲜度加成：连续指数衰减
-    # bonus = 1.0 + 1.0 × e^(-t/36), t in hours
-    # t=0 → 2.0×, t≈25h(半衰) → 1.5×, t≈72h → ≈1.14×, t→∞ → 1.0×
-    # ---------------------------------------------------------
     @staticmethod
     def _calc_time_weight(days_since: float) -> float:
-        """
-        Freshness bonus multiplier: 1.0 + e^(-t/36), t in hours.
-        新鲜度加成乘数：刚存入×2.0，~36小时半衰，72小时后趋近×1.0。
-        """
-        hours = days_since * 24.0
-        return 1.0 + _FRESHNESS_AMPLITUDE * math.exp(-hours / _FRESHNESS_HALF_LIFE_HRS)
+        """兼容旧调用，时间始终不影响记忆权重。"""
+        return 1.0
 
     def calculate_score(self, metadata: dict) -> float:
-        """
-        Calculate current activity score for a memory bucket.
-        计算一个记忆桶的当前活跃度得分。
-
-        ``importance`` is the user's stable judgement of meaning.  This method
-        only derives a temporary surfacing priority from importance and time;
-        arousal and activation_count are descriptive/diagnostic metadata, not
-        votes that silently change value.
-        """
+        """普通记忆按重要度排序；特殊类型保留原专用通道分值。"""
         if not isinstance(metadata, dict):
             return 0.0
-
-        # --- Pinned/protected buckets: never decay, importance locked to 10 ---
-        if metadata.get("pinned") or metadata.get("protected"):
-            return _SCORE_PINNED
-
-        # --- Permanent buckets never decay ---
-        if metadata.get("type") == "permanent":
-            return _SCORE_PINNED
-
-        # --- Feel buckets: never decay, fixed moderate score ---
-        if metadata.get("type") == "feel":
-            return _SCORE_FEEL
-
-        # --- Plan / letter buckets: never decay (status-driven, not time-driven) ---
-        # --- plan / letter 桶不衰减；plan 由 status 字段控制生命周期，letter 永久保存 ---
-        if metadata.get("type") in ("plan", "letter"):
-            return _SCORE_FEEL
-
+        if metadata.get("pinned") or metadata.get("protected") or metadata.get("type") == "permanent":
+            return 999.0
+        if metadata.get("type") in ("feel", "plan", "letter"):
+            return 50.0
         try:
-            importance = max(1, min(10, int(metadata.get("importance", _DEFAULT_IMPORTANCE))))
-        except (TypeError, ValueError):
-            importance = _DEFAULT_IMPORTANCE
-        # --- Days since last activation ---
-        days_since = _days_since_active(metadata, fallback_days=_DEFAULT_DAYS_FALLBACK)
-        time_weight = self._calc_time_weight(days_since)
-        base_score = (
-            importance
-            * math.exp(-self.decay_lambda * days_since)
-            * time_weight
-        )
+            return float(max(1, min(10, int(metadata.get("importance", 5)))))
+        except (TypeError, ValueError, OverflowError):
+            return 5.0
 
-        # --- Weight pool modifiers ---
-        # resolved + digested (has feel) → 加速淡化
-        # resolved only → 中度淡化
-        resolved = metadata.get("resolved", False)
-        digested = metadata.get("digested", False)  # set when feel is written for this memory
-        if resolved and digested:
-            resolved_factor = _FACTOR_RESOLVED_DIGESTED
-        elif resolved:
-            resolved_factor = _FACTOR_RESOLVED_ONLY
-        else:
-            resolved_factor = 1.0
-        return round(base_score * resolved_factor, 4)
-
-    # ---------------------------------------------------------
-    # Execute one decay cycle
-    # 执行一轮衰减周期
-    # Scan all dynamic buckets → score → archive those below threshold
-    # 扫描所有动态桶 → 算分 → 低于阈值的归档
-    # ---------------------------------------------------------
     async def run_decay_cycle(self) -> dict:
-        """
-        Execute one decay cycle: iterate dynamic buckets, archive those
-        scoring below threshold.
-        执行一轮衰减：遍历动态桶，归档得分低于阈值的桶。
-
-        Returns stats: {"checked": N, "archived": N, "lowest_score": X}
-        """
+        """只维护检索索引；不改原文、状态、激活时间或归档位置。"""
         try:
             buckets = await self.bucket_mgr.list_all(include_archive=False)
-        except Exception as e:
-            logger.error(f"Failed to list buckets for decay / 衰减周期列桶失败: {e}")
-            return {"checked": 0, "archived": 0, "lowest_score": 0, "error": str(e)}
-
-        checked = 0
-        archived = 0
-        auto_resolved = 0
-        lowest_score = float("inf")
-
-        demoted_orphans = 0
+        except Exception as exc:
+            logger.error("维护周期读取记忆失败: %s", exc)
+            return {"checked": 0, "archived": 0, "lowest_score": 0, "error": str(exc)}
+        scores = []
         for bucket in buckets:
             meta = bucket.get("metadata", {})
-
-            # Skip permanent / pinned / protected / feel / i / plan / letter buckets
-            # 跳过固化桶、钉选/保护桶、feel 桶和 i（自我认知）桶
-            # i 桶承诺永不衰减（tools/i/core.py 注释）——必须在此显式排除
-            # plan / letter 同样必须在此排除：calculate_score() 对它们恒定返回
-            # _SCORE_FEEL，本来就不会被下面的归档阈值判定动到，但下面的自动结案
-            # 分支跑在 calculate_score() 之前、不看 type，会直接把 plan/letter
-            # 也 resolved=True——plan 的生命周期只能由 status 字段驱动，letter
-            # 承诺永久保留原样，两者都不该被这条「重要度低+超期未解决」的通用
-            # 自动结案逻辑碰。
             if meta.get("type") in ("permanent", "feel", "i", "plan", "letter") or meta.get("pinned") or meta.get("protected"):
                 continue
-
-            checked += 1
-
-            # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
-            # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
-            if not meta.get("resolved", False):
-                imp = int(meta.get("importance") or _DEFAULT_IMPORTANCE)
-                # auto-resolve 路径上时间字段坏 → 按 999 天处理（加速会被结案）
-                days_since = _days_since_active(
-                    meta, fallback_days=_AUTO_RESOLVE_FALLBACK_DAYS
-                )
-                if imp <= _AUTO_RESOLVE_IMPORTANCE_MAX and days_since > _AUTO_RESOLVE_DAYS_MIN:
-                    try:
-                        await self.bucket_mgr.update(bucket["id"], resolved=True)
-                        meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
-                        auto_resolved += 1
-                        logger.info(
-                            f"Auto-resolved / 自动结案: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(imp={imp}, days={days_since:.0f})"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
-
             try:
-                score = self.calculate_score(meta)
-            except Exception as e:
-                logger.warning(
-                    f"Score calculation failed for {bucket.get('id', '?')} / "
-                    f"计算得分失败: {e}"
-                )
-                continue
-
-            lowest_score = min(lowest_score, score)
-
-            # --- Below threshold → archive (simulate forgetting) ---
-            # --- 低于阈值 → 归档（模拟遗忘）---
-            if score < self.threshold:
-                try:
-                    success = await self.bucket_mgr.archive(bucket["id"])
-                    if success:
-                        archived += 1
-                        logger.info(
-                            f"Decay archived / 衰减归档: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(score={score:.4f}, threshold={self.threshold})"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Archive failed for {bucket.get('id', '?')} / "
-                        f"归档失败: {e}"
-                    )
-
-        # --- Self-heal: 补齐缺失向量（周期性，详见 _self_heal_embeddings）---
-        backfilled_embeddings = await self._self_heal_embeddings(buckets)
-
+                scores.append(self.calculate_score(meta))
+            except Exception as exc:
+                logger.warning("维护周期评分失败: %s: %s", bucket.get("id"), exc)
         result = {
-            "checked": checked,
-            "archived": archived,
-            "auto_resolved": auto_resolved,
-            "demoted_orphans": demoted_orphans,
-            "backfilled_embeddings": backfilled_embeddings,
-            "lowest_score": lowest_score if checked > 0 else 0,
+            "checked": len(scores), "archived": 0, "auto_resolved": 0,
+            "demoted_orphans": 0,
+            "backfilled_embeddings": await self._self_heal_embeddings(buckets),
+            "lowest_score": min(scores, default=0),
         }
-        logger.info(f"Decay cycle complete / 衰减周期完成: {result}")
+        logger.info("稳定保存维护周期完成: %s", result)
         return result
 
     async def _self_heal_embeddings(self, buckets: list) -> int:
@@ -391,8 +165,7 @@ class DecayEngine:
         self._running = True
         self._task = asyncio.create_task(self._background_loop())
         logger.info(
-            f"Decay engine started, interval: {self.check_interval}h / "
-            f"衰减引擎已启动，检查间隔: {self.check_interval} 小时"
+            f"检索索引维护已启动，检查间隔: {self.check_interval} 小时"
         )
 
     async def stop(self) -> None:
@@ -405,11 +178,10 @@ class DecayEngine:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info("Decay engine stopped / 衰减引擎已停止")
+        logger.info("检索索引维护已停止")
 
     async def _background_loop(self) -> None:
-        """Background loop: run decay → sleep → repeat.
-        后台循环体：执行衰减 → 睡眠 → 重复。"""
+        """后台循环只补齐检索索引，再等待下一个周期。"""
         while self._running:
             try:
                 await self.run_decay_cycle()

@@ -329,7 +329,7 @@ feel 桶自身：
 - `hard_delete=True` → 仅当桶在创建时带有 `provenance.kind=test` 与 `erasable=true` 才物理删除；真实记忆、后补字段及普通 Dashboard 路径均不得越过此边界。Dashboard 普通模式支持多选/当前筛选全选的沉底、主动遗忘和归档，开发者模式才显示测试桶永久删除入口。
 - 其它字段：仅收集传入的（用 `-1`/空串作为「未传」哨兵）批量更新 frontmatter。
 - `pinned=1` 自动锁 importance=10 + 触发 `_move_bucket(permanent_dir)`。
-- `resolved=1` **不**自动归档（B-01 修复）；只更新 frontmatter，由 decay 引擎自然衰减。
+- `resolved=1` 只更新显式状态，不自动归档，也不降低稳定重要度分值。
 - `status` 仅接受 `active`/`resolved`/`abandoned`，主要用于 plan 桶。
 - `content="..."` 替换正文并重新生成 embedding。
 - `old_str/new_str` 对完整原文做逐字局部替换：必须成对提供、与 `content` 互斥，`new_str=""` 表示删除命中片段，但最终正文不得为空。匹配按所有起始位置计数（包含重叠命中），并与写入在同一把 `_bucket_turn` 跨进程锁内完成；仅唯一命中会提交，零命中或多命中均明确拒绝且不写盘，避免长桶并发编辑覆盖和歧义误改。最终正文仍执行 UTF-8 字节上限校验，并沿正常 content 更新路径重建 embedding；plan 桶在锁内基于最新 history 追加 edit change log，避免并发编辑丢日志。
@@ -1243,56 +1243,26 @@ docker compose -f deploy/docker-compose.yml up -d
 
 ---
 
-## 5. 衰减与评分公式
+## 5. 稳定评分与索引维护
 
-### 5.1 衰减分（decay_engine.calculate_score）
+### 5.1 记忆分值（decay_engine.calculate_score）
 
-```
-final_score = stable_importance
-              × e^(-λ × days_since)
-              × time_weight
-              × resolved_factor
-```
+普通记忆分值等于稳定重要度（1～10）。时间、情绪坐标、激活次数、
+resolved 和 digested 都不降低或提高分值。pinned/protected/permanent
+保留 999 分，feel/plan/letter 保留专用通道的 50 分。
+显式状态仍由既有候选策略决定可见性；不改变每次召回的数量与正文预算。
 
-`importance` 是用户可读、可改的稳定价值判断；`valence/arousal` 只描述体验，`activation_count` 只作诊断，两者都不再把一条记忆越读越重。
+### 5.2 不再自动结案
 
-**时间项**：
+run_decay_cycle() 只读取记忆并补齐检索索引，不因重要度低或时间久
+自动设置 resolved，也不刷新 last_active 或 activation_count。
 
-- `time_weight = 1.0 + e^(-hours/36)` —— t=0→×2.0，~36h 半衰，72h 后 ≈×1.14，∞→×1.0
+### 5.3 不再自动归档
 
-**修正因子**：
-
-| 状态 | 因子 |
-|---|---|
-| 未解决 | `resolved_factor = 1.0` |
-| `resolved=True` | `resolved_factor = 0.05` |
-| `resolved=True && digested=True` | `resolved_factor = 0.02` |
-| `arousal > 0.7 && !resolved` | `urgency_boost = 1.5` |
-
-**短路返回**（不走公式）：
-
-| 条件 | 返回值 |
-|---|---|
-| `pinned` 或 `protected` 或 `type=="permanent"` | 999.0 |
-| `type` 在 `("feel", "plan", "letter")` | 50.0 |
-
-(改动注意：activation_count 必须 `float()` 而非 `int()`，否则 `_time_ripple` 写入的 0.3 增量会被截断——B-03。)
-
-### 5.2 自动结案（auto-resolve）
-
-每个 `run_decay_cycle()` 中：
-
-```
-if not resolved && importance ≤ 4 && days_since > 30:
-    bucket_mgr.update(bucket_id, resolved=True)
-    meta["resolved"] = True   # ← 关键：本地 meta 同步刷新，下面 calculate_score 立即生效（B-08）
-```
-
-(改动注意：必须立即更新本地 `meta` dict，否则该桶在本轮 cycle 仍按未结案分计算，archive 判定要等下一轮。)
-
-### 5.3 自动归档
-
-`score < threshold(0.3)` → `bucket_mgr.archive()`：读 frontmatter 改 `type="archived"` → 写回 → `shutil.move()` 到 `archive/{primary_domain}/`。
+后台不执行 archive()，旧配置 decay.lambda 和 decay.threshold 只兼容
+读取，不再影响记忆。decay.check_interval_hours 继续控制索引维护周期。
+手动归档、主动遗忘与显式状态操作仍然有效；已有归档不自动恢复。
+Dashboard 不再把久未活跃的桶画成淡色虚线，归档筛选只看真实归档类型。
 
 ### 5.4 搜索评分（bucket_manager.search）
 
@@ -1331,7 +1301,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 
 | 类型 (`type`) | 目录 | importance | 衰减分 | 普通 breath 浮现 | 参与合并 | 参与 dream | 自动归档 |
 |---|---|---|---|---|---|---|---|
-| `dynamic` | `dynamic/{domain}/` | 1~10 | 公式计算 | ✅ | ✅ | ✅ | ✅ |
+| `dynamic` | `dynamic/{domain}/` | 1~10 | 稳定 importance | ✅ | ✅ | ✅ | ❌ |
 | `permanent`（可独立于 `pinned`） | `permanent/{domain}/` | 显式 permanent 为 1~10；pinned 锁 10 | 999 | 作为固化记忆展示 | ❌ | ❌ | ❌ |
 | `feel` | `feel/沉淀物/` | 5 | 50 | ❌（仅 `domain="feel"`） | ❌ | 仅参与结晶检测 | ❌ |
 | `plan` | `plans/active/` | 7 | 50 | ❌（仅 dream 末尾 active 段） | ❌ | dream 列出 | ❌ |
@@ -1370,9 +1340,9 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `embedding.model` | `gemini-embedding-001` | 云端模型名；本地则填 Ollama 模型名（如 `bge-m3`） |
 | `embedding.base_url` | （继承 dehydration） | 可独立配置 |
 | `embedding.api_key` | （继承 dehydration） | 可独立配置 |
-| `decay.lambda` | `0.05` | 衰减速率 λ |
-| `decay.threshold` | `0.3` | 归档分阈值 |
-| `decay.check_interval_hours` | `24` | 后台扫描间隔 |
+| `decay.lambda` | `0.05` | 旧参数，仅兼容读取，不再生效 |
+| `decay.threshold` | `0.3` | 旧参数，仅兼容读取，不再生效 |
+| `decay.check_interval_hours` | `24` | 检索索引维护间隔 |
 | `decay.emotion_weights.base` | `1.0` | 情感权重基值 |
 | `decay.emotion_weights.arousal_boost` | `0.8` | arousal 加成系数 |
 | `matching.fuzzy_threshold` | `50` | 搜索分下限 |
@@ -1432,9 +1402,9 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 |---|---|---|
 | `999.0` | `calculate_score` | pinned/protected/permanent 桶分数 |
 | `50.0` | `calculate_score` | feel/plan/letter 桶固定分 |
-| `36.0` (小时) | `_calc_time_weight` | 新鲜度半衰期 |
-| `0.05 / 0.02` | `calculate_score` | resolved / resolved+digested 因子 |
-| `4` / `30 天` | `run_decay_cycle` | auto-resolve 阈值 |
+| `1.0` | `_calc_time_weight` | 固定值，时间不改变记忆分值 |
+| `1～10` | `calculate_score` | 普通记忆稳定重要度 |
+| `50` | `_self_heal_embeddings` | 单周期最多补齐的索引数量 |
 
 ### 8.2 bucket_manager.py
 

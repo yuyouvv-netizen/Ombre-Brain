@@ -1314,14 +1314,6 @@
   }
   .bucket-row.dissolving { animation: ob-dissolve .6s cubic-bezier(.4,0,.6,1) forwards; pointer-events: none; }
 
-  /* —— ④ 久未浮现：稀疏虚线边框，传达「模糊、遥远」 —— */
-  .bucket-row.faded {
-    background: transparent !important;
-    box-shadow: none !important;
-    border: 1.5px dashed var(--border-strong) !important;
-    opacity: 0.66;
-  }
-  .bucket-row.faded:hover { opacity: 0.92; transform: translateY(-1px); box-shadow: 4px 4px 11px var(--shadow-dark-subtle), -3px -3px 8px var(--shadow-light) !important; }
 
   /* —— ⑤ feel 表情：hover 时轻轻点头 —— */
   @keyframes ob-bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2.5px)} }
@@ -1966,7 +1958,7 @@
         <option value="created_asc">最早创建优先</option>
       </select>
     </label>
-    <span class="bucket-sort-note" id="bucket-sort-note">按综合衰减分排列</span>
+    <span class="bucket-sort-note" id="bucket-sort-note">按重要度排列</span>
   </div>
   <div class="bucket-bulkbar">
     <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);height:32px;"><input id="bucket-select-all" type="checkbox" onchange="selectAllCurrentPage(this.checked)" style="accent-color:var(--accent);cursor:pointer;"> 全选当前页</label>
@@ -3801,7 +3793,7 @@ async function loadSettingsStatus() {
     el.innerHTML = `
       <b>版本</b>：${esc(d.version)}<br>
       <b>Bucket 总数</b>：${Number(d.buckets?.total ?? 0)} （永久:${Number(d.buckets?.permanent ?? 0)} / 动态:${Number(d.buckets?.dynamic ?? 0)} / 归档:${Number(d.buckets?.archive ?? 0)}）<br>
-      <b>衰减引擎</b>：${esc(d.decay_engine)}<br>
+      <b>检索索引维护</b>：${esc(d.decay_engine)}<br>
       <b>向量搜索</b>：${d.embedding_enabled ? '已启用' : '未启用'}<br>
     `;
     if (d.decay_engine === 'running' && window.ObPet) window.ObPet.react('decay');
@@ -4369,7 +4361,7 @@ function syncBucketSortControl() {
     ? '按首次记录时间倒序；最新记忆在前，未知时间排末尾'
     : bucketSort === 'created_asc'
       ? '按首次记录时间正序；最早记忆在前，未知时间排末尾'
-      : '按综合衰减分排列';
+      : '按重要度排列';
 }
 
 async function setBucketSort(value) {
@@ -4644,7 +4636,7 @@ function filterBuckets(buckets) {
   if (currentFilter === 'feel') return buckets.filter(function(b) { return b.type === 'feel'; });
   if (currentFilter === 'unresolved') return buckets.filter(function(b) { return !b.resolved && b.type !== 'permanent' && !b.pinned; });
   if (currentFilter === 'digested') return buckets.filter(function(b) { return b.digested; });
-  if (currentFilter === 'archived') return buckets.filter(function(b) { return b.type === 'archived' || b.score < 0.3; });
+  if (currentFilter === 'archived') return buckets.filter(function(b) { return b.type === 'archived'; });
   if (currentFilter.startsWith('domain:')) {
     var d = currentFilter.slice(7);
     return buckets.filter(function(b) { return (b.domain || []).includes(d); });
@@ -4754,9 +4746,7 @@ function _paintBuckets() {
     var timeTitle = chronologicalSort
       ? (shownTime ? '首次记录时间：' + formatExactBucketTime(shownTime) : '首次记录时间未知')
       : (shownTime ? '最近活跃时间：' + formatExactBucketTime(shownTime) : '最近活跃时间未知');
-    // 久未浮现（>45 天且非钉选/锚点/已遗忘）→ 稀疏虚线，视觉上「模糊、遥远」
-    var stale = !b.pinned && !b.anchor && !b.dont_surface && daysSince(activityTime) >= 45;
-    var rowCls = 'bucket-row' + (stale ? ' faded' : '');
+    var rowCls = 'bucket-row';
     var inlineStyle = b.dont_surface ? 'opacity:0.45;' : '';
     var rowClick = 'onclick="showDetail(this.dataset.id)"';
     var domainHtml = (b.domain || []).length
@@ -8456,7 +8446,7 @@ async function pollHeartbeat() {
     dot.style.background = '#3a9b5c';
     const idle = Math.floor((Date.now()/1000) - (d.last_op_ts || 0));
     var decaying = d.decay_engine === 'running';
-    txt.textContent = '在线 · ' + (decaying ? '衰减运行中' : '衰减停');
+    txt.textContent = '在线 · 稳定保存 · ' + (decaying ? '索引维护中' : '索引维护已停');
     txt.title = 'uptime ' + d.uptime_s + 's · 上次活跃 ' + idle + 's 前';
     dot.classList.add('breathing');   // 在线即呼吸，衰减状态只影响文字
   } catch (e) {

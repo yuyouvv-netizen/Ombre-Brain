@@ -672,25 +672,9 @@ def decay_engine(decay_config):
 
 
 class TestDecayEngineTimeWeight:
-    def test_t0_returns_2_0(self, decay_engine):
-        result = decay_engine._calc_time_weight(0.0)
-        assert abs(result - 2.0) < 0.01
-
-    def test_always_at_least_1_0(self, decay_engine):
-        for days in [0, 1, 7, 30, 365]:
-            assert decay_engine._calc_time_weight(float(days)) >= 1.0
-
-    def test_monotonically_decreasing(self, decay_engine):
-        values = [decay_engine._calc_time_weight(float(d)) for d in range(0, 30)]
-        for i in range(len(values) - 1):
-            assert values[i] >= values[i + 1]
-
-    def test_half_life_approximately_36h(self, decay_engine):
-        # At 36h / 24h ≈ 1.5 days, bonus should be ≈ 0.5 (halfway to floor)
-        # full bonus = 1.0, at t=36h: 1.0 + e^(-1) ≈ 1.368
-        result_36h = decay_engine._calc_time_weight(36.0 / 24.0)
-        expected = 1.0 + math.exp(-1.0)
-        assert abs(result_36h - expected) < 0.01
+    @pytest.mark.parametrize("days", [0, 1, 7, 30, 365, 10000])
+    def test_time_does_not_change_weight(self, decay_engine, days):
+        assert decay_engine._calc_time_weight(days) == 1.0
 
 
 class TestDecayEngineScore:
@@ -745,13 +729,13 @@ class TestDecayEngineScore:
         score = decay_engine.calculate_score(meta)
         assert score > 0.0
 
-    def test_recent_beats_old(self, decay_engine):
+    def test_old_and_recent_have_equal_value(self, decay_engine):
         recent_meta = self._base_meta()
         old_meta = self._base_meta()
         old_meta["last_active"] = (datetime.now() - timedelta(days=60)).isoformat()
         recent_score = decay_engine.calculate_score(recent_meta)
         old_score = decay_engine.calculate_score(old_meta)
-        assert recent_score > old_score
+        assert recent_score == old_score == 5.0
 
     def test_higher_importance_scores_higher(self, decay_engine):
         low_meta = self._base_meta()
@@ -760,13 +744,13 @@ class TestDecayEngineScore:
         high_meta["importance"] = 9
         assert decay_engine.calculate_score(high_meta) > decay_engine.calculate_score(low_meta)
 
-    def test_resolved_only_penalized(self, decay_engine):
+    def test_resolved_only_keeps_value(self, decay_engine):
         normal = self._base_meta()
         resolved = self._base_meta()
         resolved["resolved"] = True
-        assert decay_engine.calculate_score(resolved) < decay_engine.calculate_score(normal)
+        assert decay_engine.calculate_score(resolved) == decay_engine.calculate_score(normal)
 
-    def test_resolved_digested_more_penalized_than_resolved_only(self, decay_engine):
+    def test_resolved_digested_keeps_value(self, decay_engine):
         resolved_only = self._base_meta()
         resolved_only["resolved"] = True
         resolved_digested = self._base_meta()
@@ -774,7 +758,7 @@ class TestDecayEngineScore:
         resolved_digested["digested"] = True
         assert (
             decay_engine.calculate_score(resolved_digested)
-            < decay_engine.calculate_score(resolved_only)
+            == decay_engine.calculate_score(resolved_only)
         )
 
     def test_arousal_does_not_override_stable_importance(self, decay_engine):
@@ -791,11 +775,10 @@ class TestDecayEngineScore:
         urgent_resolved["resolved"] = True
         calm_unresolved = self._base_meta()
         calm_unresolved["arousal"] = 0.3
-        # Resolved high-arousal should score lower than calm unresolved
-        # because resolved_factor=0.05 offsets urgency
+        # 状态和情绪都不改变稳定重要度。
         score_urgent_resolved = decay_engine.calculate_score(urgent_resolved)
         score_calm = decay_engine.calculate_score(calm_unresolved)
-        assert score_urgent_resolved < score_calm
+        assert score_urgent_resolved == score_calm
 
     def test_bad_importance_falls_back(self, decay_engine):
         meta = self._base_meta()
@@ -827,7 +810,7 @@ class TestDecayEngineRunCycle:
         assert isinstance(result["archived"], int)
 
     @pytest.mark.asyncio
-    async def test_run_cycle_archives_low_score_bucket(self, decay_engine, bucket_mgr):
+    async def test_run_cycle_preserves_old_low_importance_bucket(self, decay_engine, bucket_mgr):
         import frontmatter as fm
         decay_engine.bucket_mgr = bucket_mgr
         decay_engine.threshold = 9999.0  # Set threshold very high to force archiving
@@ -844,7 +827,12 @@ class TestDecayEngineRunCycle:
             f.write(fm.dumps(post))
 
         result = await decay_engine.run_decay_cycle()
-        assert result["archived"] >= 1
+        assert result["archived"] == 0
+        assert result["auto_resolved"] == 0
+        saved = await bucket_mgr.get(bid)
+        assert saved["metadata"]["type"] == "dynamic"
+        assert not saved["metadata"].get("resolved")
+        assert saved["content"] == "low score bucket"
 
     @pytest.mark.asyncio
     async def test_run_cycle_skips_pinned(self, decay_engine, bucket_mgr):
