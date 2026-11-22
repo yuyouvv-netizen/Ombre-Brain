@@ -1829,6 +1829,64 @@
     color: var(--text);
     white-space: pre-wrap;
   }
+  .self-entry-menu {
+    position: relative;
+    flex: none;
+  }
+  .self-entry-menu summary {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    list-style: none;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .self-entry-menu summary::-webkit-details-marker { display: none; }
+  .self-entry-menu summary:hover,
+  .self-entry-menu[open] summary { background: var(--accent-glow); color: var(--accent); }
+  .self-entry-menu-actions {
+    position: absolute;
+    z-index: 1;
+    right: 0;
+    top: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 6px;
+    min-width: 94px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-solid);
+    box-shadow: 2px 4px 10px var(--shadow-dark-subtle);
+  }
+  .self-entry-menu-actions button,
+  .self-entry-editor-actions button { min-height: 40px; padding: 6px 14px; }
+  .self-entry-editor textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 160px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    background: var(--surface-solid);
+    font: inherit;
+    font-size: 16px;
+    line-height: 1.6;
+    resize: vertical;
+  }
+  .self-entry-editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .self-entry-confirm { font-size: 13px; }
+  .self-entry-status { margin: 0; color: var(--text-dim); font-size: 12px; }
+  .self-entry-status:empty { display: none; }
+  .self-entry-status.is-error { color: var(--negative); }
   .self-panel-empty {
     text-align: center;
     color: var(--text-light);
@@ -9696,6 +9754,7 @@ async function syncExistingHuman() {
 // ====== Self / I panel ======
 let _selfEntries = [];
 let _selfAspectFilter = '';
+let _selfListRevision = 0;
 
 async function openSelfPanel() {
   document.getElementById('self-panel').classList.add('open');
@@ -9717,14 +9776,19 @@ function setSelfFilter(btn) {
 }
 
 async function loadSelfEntries() {
+  const revision = ++_selfListRevision;
   const body = document.getElementById('self-panel-body');
   try {
     const res = await authFetch('/api/self');
+    if (revision !== _selfListRevision) return;
     if (!res || !res.ok) { body.innerHTML = '<div class="self-panel-empty">加载失败</div>'; return; }
-    _selfEntries = await res.json();
+    const entries = await res.json();
+    if (revision !== _selfListRevision) return;
+    _selfEntries = entries;
     document.getElementById('self-fab').classList.toggle('has-entries', _selfEntries.length > 0);
     renderSelfEntries();
   } catch (e) {
+    if (revision !== _selfListRevision) return;
     body.innerHTML = '<div class="self-panel-empty">' + esc(e.message) + '</div>';
   }
 }
@@ -9745,11 +9809,139 @@ function renderSelfEntries() {
     const aspectHtml = e.aspect
       ? '<span class="self-entry-aspect">' + esc(e.aspect) + '</span>'
       : '';
-    return '<div class="self-entry">'
-      + '<div class="self-entry-meta">' + aspectHtml + '<span class="self-entry-time">' + esc(ts) + '</span></div>'
-      + '<div class="self-entry-content">' + esc(e.content) + '</div>'
-      + '</div>';
+    return `<div class="self-entry" id="self-entry-${escAttr(e.id)}" data-entry-id="${escAttr(e.id)}">
+      <div class="self-entry-meta">
+        ${aspectHtml}<span class="self-entry-time">${esc(ts)}</span>
+        <details class="self-entry-menu">
+          <summary aria-label="条目操作"><span aria-hidden="true">···</span></summary>
+          <div class="self-entry-menu-actions">
+            <button type="button" class="btn-secondary" onclick="setSelfEntryEditing(this, true)">编辑</button>
+            <button type="button" class="btn-danger" onclick="setSelfEntryDeleting(this, true)">删除</button>
+          </div>
+        </details>
+      </div>
+      <div class="self-entry-confirm" hidden>
+        删除这条自我认知？它会移入删除档案。
+        <div class="self-entry-editor-actions">
+          <button type="button" class="btn-secondary" onclick="setSelfEntryDeleting(this, false)">取消</button>
+          <button type="button" class="btn-danger" onclick="deleteSelfEntry(this)">确认删除</button>
+        </div>
+      </div>
+      <p class="self-entry-status" role="status"></p>
+      <div class="self-entry-content">${esc(e.content)}</div>
+      <form class="self-entry-editor" hidden onsubmit="event.preventDefault(); saveSelfEntry(this)">
+        <textarea aria-label="编辑正文" required></textarea>
+        <div class="self-entry-editor-actions">
+          <button type="button" class="btn-secondary" onclick="setSelfEntryEditing(this, false)">取消</button>
+          <button type="submit" class="btn-primary">保存</button>
+        </div>
+      </form>
+    </div>`;
   }).join('');
+}
+
+function setSelfEntryEditing(control, editing) {
+  const card = control.closest('.self-entry');
+  const menu = card.querySelector('.self-entry-menu');
+  const form = card.querySelector('.self-entry-editor');
+  const content = card.querySelector('.self-entry-content');
+  const status = card.querySelector('.self-entry-status');
+  menu.open = false;
+  menu.hidden = editing;
+  form.hidden = !editing;
+  content.hidden = editing;
+  status.textContent = '';
+  if (editing) {
+    const input = form.querySelector('textarea');
+    input.value = content.textContent;
+    input.focus();
+  } else if (card.isConnected) {
+    menu.querySelector('summary').focus({ preventScroll: true });
+  }
+}
+
+function setSelfEntryDeleting(control, deleting) {
+  const card = control.closest('.self-entry');
+  const menu = card.querySelector('.self-entry-menu');
+  const confirmation = card.querySelector('.self-entry-confirm');
+  menu.open = false;
+  menu.hidden = deleting;
+  confirmation.hidden = !deleting;
+  card.querySelector('.self-entry-status').textContent = '';
+  const focusTarget = deleting ? confirmation.querySelector('button') : menu.querySelector('summary');
+  focusTarget.focus({ preventScroll: true });
+}
+
+async function changeSelfEntry(card, options, pendingLabel, failureLabel) {
+  const controls = card.querySelectorAll('button, textarea');
+  const status = card.querySelector('.self-entry-status');
+  controls.forEach(control => { control.disabled = true; });
+  status.textContent = pendingLabel;
+  status.classList.remove('is-error');
+  try {
+    const url = BASE + '/api/bucket/' + encodeURIComponent(card.dataset.entryId);
+    const suffix = options.method === 'DELETE' ? '?confirm=true' : '/edit';
+    const response = await fetch(url + suffix, options);
+    if (response.status === 401) {
+      checkAuth();
+      throw new Error('请重新登录后再试');
+    }
+    const data = await readJsonSafe(response);
+    if (!response.ok || !data.ok) throw new Error(data.error || '请稍后重试');
+    _selfListRevision++;
+    status.textContent = '';
+    return true;
+  } catch (error) {
+    status.textContent = failureLabel + '：' + error.message;
+    status.classList.add('is-error');
+    return false;
+  } finally {
+    controls.forEach(control => { control.disabled = false; });
+  }
+}
+
+async function saveSelfEntry(form) {
+  const input = form.querySelector('textarea');
+  const card = form.closest('.self-entry');
+  if (input.disabled) return;
+  const content = input.value.trim();
+  if (!content) {
+    const status = card.querySelector('.self-entry-status');
+    status.textContent = '正文不能为空';
+    status.classList.add('is-error');
+    input.focus();
+    return;
+  }
+  if (content === card.querySelector('.self-entry-content').textContent) {
+    setSelfEntryEditing(form, false);
+    return;
+  }
+  const saved = await changeSelfEntry(card, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  }, '保存中…', '保存失败');
+  if (!saved) return;
+  const id = card.dataset.entryId;
+  const entry = _selfEntries.find(e => e.id === id);
+  if (entry) entry.content = content;
+  const visibleCard = document.getElementById(card.id);
+  if (visibleCard) visibleCard.querySelector('.self-entry-content').textContent = content;
+  setSelfEntryEditing(form, false);
+}
+
+async function deleteSelfEntry(button) {
+  const card = button.closest('.self-entry');
+  const deleted = await changeSelfEntry(card, { method: 'DELETE' }, '删除中…', '删除失败');
+  if (!deleted) return;
+  _selfEntries = _selfEntries.filter(e => e.id !== card.dataset.entryId);
+  document.getElementById('self-fab').classList.toggle('has-entries', _selfEntries.length > 0);
+  const visibleCard = document.getElementById(card.id);
+  if (visibleCard) {
+    const list = visibleCard.parentElement;
+    visibleCard.remove();
+    if (!list.childElementCount) renderSelfEntries();
+  }
 }
 
 // 认证成功后检测是否有条目，给 FAB 加小圆点
@@ -9758,6 +9950,7 @@ async function initSelfFab() {
     const res = await authFetch('/api/self');
     if (res && res.ok) {
       const data = await res.json();
+      if (_selfListRevision) return;
       const hasEntries = Array.isArray(data) && data.length > 0;
       const fab = document.getElementById('self-fab');
       if (fab) fab.classList.toggle('has-entries', hasEntries);
